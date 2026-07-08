@@ -1,0 +1,16 @@
+[package]
+name = "psoxide-desktop"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "psoxide"
+path = "src/main.rs"
+
+[dependencies]
+psoxide-core = { path = "../psoxide-core" }
+psoxide-config = { path = "../psoxide-config" }
+pixels = "0.15"
+winit = "0.30"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }

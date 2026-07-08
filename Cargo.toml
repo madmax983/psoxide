@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/psoxide-core",
+    "crates/psoxide-config",
+    "crates/psoxide-desktop",
+    "crates/psoxide-proof",
+    "crates/psoxide-test-harness",
+]
+
+[profile.dev.package.psoxide-core]
+opt-level = 2
