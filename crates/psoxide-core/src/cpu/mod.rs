@@ -19,7 +19,7 @@ pub mod execute;
 
 pub use decode::{Instruction, decode};
 pub use engine::{COP0_BADVADDR, COP0_CAUSE, COP0_EPC, COP0_SR, Cpu, RESET_PC};
-pub use execute::{Bus, execute_instruction, step};
+pub use execute::{Bus, execute_instruction, poll_interrupt, step};
 
 use serde::{Deserialize, Serialize};
 
