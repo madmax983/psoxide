@@ -294,7 +294,7 @@ pub struct CoreSnapshot {
     /// CPU state.
     pub cpu: CpuSnapshot,
     /// Main RAM (2MB).
-    #[serde(with = "serde_big_array_ram")]
+    #[serde(deserialize_with = "deserialize_ram")]
     pub ram: Vec<u8>,
     /// Scratchpad (1KB).
     pub scratchpad: Vec<u8>,
@@ -302,25 +302,15 @@ pub struct CoreSnapshot {
     pub bios: Vec<u8>,
 }
 
-/// Serde helper for the large RAM buffer (stored as a `Vec<u8>`).
-mod serde_big_array_ram {
-    use serde::{Deserializer, Serializer, de::Error};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        serde_bytes_like(bytes, s)
+/// Deserializes the RAM buffer, rejecting snapshots whose length is not the
+/// expected 2MB. Serialization uses serde's default `Vec<u8>` encoding.
+fn deserialize_ram<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    use serde::de::Error;
+    let v: Vec<u8> = Vec::deserialize(d)?;
+    if v.len() != MAIN_RAM_SIZE {
+        return Err(D::Error::custom("ram snapshot has wrong length"));
     }
-
-    fn serde_bytes_like<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        s.collect_seq(bytes.iter().copied())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let v: Vec<u8> = serde::Deserialize::deserialize(d)?;
-        if v.len() != super::MAIN_RAM_SIZE {
-            return Err(D::Error::custom("ram snapshot has wrong length"));
-        }
-        Ok(v)
-    }
+    Ok(v)
 }
 
 /// The central PlayStation machine.
