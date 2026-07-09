@@ -38,6 +38,48 @@ fn gp0_fill_is_visible_in_framebuffer() {
 }
 
 #[test]
+fn textured_quad_is_visible_in_framebuffer() {
+    let mut core = PsxCore::new();
+    let gpu = core.gpu_mut();
+    gpu.gp1(0x0000_0000); // reset
+    gpu.gp1(0x0500_0000); // display area (0,0)
+    gpu.gp1(0x0800_0000); // 15bpp NTSC
+    gpu.gp1(0x0300_0000); // display enable
+
+    // Drawing area covers the whole visible frame.
+    gpu.gp0(0xE300_0000);
+    gpu.gp0(0xE400_0000 | 319u32 | (239u32 << 10));
+
+    // A 16×16 solid-green (BGR555 0x03E0) texture at off-screen page (0,256).
+    for u in 0..16u16 {
+        for v in 0..16u16 {
+            gpu.set_vram(u, 256 + v, 0x03E0);
+        }
+    }
+
+    // Raw textured flat quad (opcode 0x2D) covering (0,0)-(16,16). The texpage
+    // (15bpp, page_y=256 → tp 0x0110) rides in vertex 1's texcoord word.
+    for w in [
+        0x2D00_0000u32, // raw textured quad
+        0x0000_0000,    // v0 (0,0)
+        0x0000_0000,    // uv0 (0,0), clut unused
+        0x0000_0010,    // v1 (16,0)
+        0x0110_000F,    // texpage 0x0110 + uv1 (15,0)
+        0x0010_0010,    // v2 (16,16)
+        0x0000_0F0F,    // uv2 (15,15)
+        0x0010_0000,    // v3 (0,16)
+        0x0000_0F00,    // uv3 (0,15)
+    ] {
+        gpu.gp0(w);
+    }
+
+    let frame = core.framebuffer_rgba();
+    // An interior pixel of the quad samples the green texel.
+    let i = (4 * 320 + 4) * 4;
+    assert_eq!(&frame[i..i + 4], &expected_rgba(0, 0xFF, 0));
+}
+
+#[test]
 fn gpu_dma_linked_list_fills_visible_region() {
     let mut core = PsxCore::new();
     core.gpu_mut().gp1(0x0000_0000);

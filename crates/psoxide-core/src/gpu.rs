@@ -13,11 +13,13 @@
 //! `GPUSTAT`.
 //!
 //! VRAM is a 1024×512 array of 16-bit pixels (BGR555). The rasterizer supports
-//! flat/Gouraud triangles and quads, monochrome rectangles, flat lines, fills,
-//! and VRAM↔VRAM / CPU↔VRAM block transfers. Textured primitives are parsed
-//! (correct word counts, no FIFO desync) but rendered as flat shaded fills —
-//! real texture sampling is a documented gap. Poly-lines are parsed to their
-//! terminator and each segment is drawn flat with the first color.
+//! flat/Gouraud triangles and quads, textured triangles/quads/rectangles
+//! (4bpp/8bpp CLUT + 15bpp direct sampling, colour modulation, per-texel
+//! semi-transparency, and the texture window), monochrome/textured rectangles,
+//! flat lines, fills, and VRAM↔VRAM / CPU↔VRAM block transfers. It also honours
+//! all four semi-transparency blend modes, ordered dithering, the mask bit, and
+//! the top-left fill rule. Poly-lines are parsed to their terminator and each
+//! segment is drawn flat with the first color (a documented gap).
 
 use serde::{Deserialize, Serialize};
 
@@ -608,22 +610,34 @@ impl Gpu {
 
     fn draw_polygon(&mut self) {
         let cmd = self.cmd_buffer[0];
-        let shaded = cmd & 0x1000_0000 != 0;
+        let gouraud = cmd & 0x1000_0000 != 0;
         let quad = cmd & 0x0800_0000 != 0;
         let textured = cmd & 0x0400_0000 != 0;
+        // Bit 25 = semi-transparency (the primitive is a "semi-transparent"
+        // primitive); bit 24 = texture-blend mode, 0 = blended/modulated,
+        // 1 = raw texture (PSX-SPX: GP0 render-command bit layout). Bit 24 is
+        // only meaningful for textured primitives.
+        let semi = cmd & 0x0200_0000 != 0;
+        let raw = textured && (cmd & 0x0100_0000 != 0);
         let nv = if quad { 4 } else { 3 };
 
-        // Parse vertices and their colors from the accumulated buffer.
-        let mut verts: Vec<(i32, i32)> = Vec::with_capacity(nv);
-        let mut colors: Vec<u16> = Vec::with_capacity(nv);
-        let base_color = cmd;
+        // Parse vertices, per-vertex colours (Gouraud) and texcoords. For a
+        // textured polygon the CLUT lives in the high half of vertex 0's
+        // texcoord word and the texpage in the high half of vertex 1's.
+        let mut verts = [Vert::default(); 4];
+        let base_color = color_channels(cmd);
         let mut idx = 1usize;
-        for v in 0..nv {
-            let color_word = if shaded {
-                if v == 0 {
+        let mut clut_word = 0u32;
+        let mut page_word = 0u32;
+        // Parsing walks `cmd_buffer` sequentially (idx advances by vertex kind),
+        // so a plain index loop is clearer than zipping the vertex array.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..nv {
+            let (r, g, b) = if gouraud {
+                if i == 0 {
                     base_color
                 } else {
-                    let c = self.cmd_buffer[idx];
+                    let c = color_channels(self.cmd_buffer[idx]);
                     idx += 1;
                     c
                 }
@@ -632,77 +646,123 @@ impl Gpu {
             };
             let vword = self.cmd_buffer[idx];
             idx += 1;
+            let (mut u, mut v) = (0i32, 0i32);
             if textured {
-                idx += 1; // skip texcoord/palette/page word
+                let tword = self.cmd_buffer[idx];
+                idx += 1;
+                u = (tword & 0xFF) as i32;
+                v = ((tword >> 8) & 0xFF) as i32;
+                if i == 0 {
+                    clut_word = tword;
+                }
+                if i == 1 {
+                    page_word = tword;
+                }
             }
             let (vx, vy) = decode_vertex(vword);
-            verts.push((
-                vx + i32::from(self.draw_off_x),
-                vy + i32::from(self.draw_off_y),
-            ));
-            let (r, g, b) = color_channels(color_word);
-            colors.push(rgb_to_bgr555(r, g, b));
+            verts[i] = Vert {
+                x: vx + i32::from(self.draw_off_x),
+                y: vy + i32::from(self.draw_off_y),
+                r: i32::from(r),
+                g: i32::from(g),
+                b: i32::from(b),
+                u,
+                v,
+            };
         }
 
-        // Textured polygons are rendered flat (documented gap): use a neutral
-        // mid-gray if untextured shading is unavailable, else the vertex color.
-        self.raster_triangle(
-            verts[0], verts[1], verts[2], colors[0], colors[1], colors[2],
-        );
+        let tex = self.poly_texinfo(clut_word, page_word, textured);
+        let flags = PrimFlags {
+            textured,
+            raw,
+            semi,
+            gouraud,
+            dither_allowed: true,
+        };
+
+        // Quad split (0,1,2)+(0,2,3): the two triangles share edge 0-2, which is
+        // traversed in opposite directions once each is normalised to positive
+        // area, so the top-left fill rule covers the seam exactly once.
+        self.raster_triangle(verts[0], verts[1], verts[2], &flags, &tex);
         if quad {
-            self.raster_triangle(
-                verts[1], verts[2], verts[3], colors[1], colors[2], colors[3],
-            );
+            self.raster_triangle(verts[0], verts[2], verts[3], &flags, &tex);
         }
     }
 
-    /// Rasterizes a triangle with barycentric Gouraud interpolation, clipped to
-    /// the drawing area.
-    #[allow(clippy::too_many_arguments)]
-    fn raster_triangle(
-        &mut self,
-        a: (i32, i32),
-        b: (i32, i32),
-        c: (i32, i32),
-        ca: u16,
-        cb: u16,
-        cc: u16,
-    ) {
-        let min_x = a.0.min(b.0).min(c.0).max(i32::from(self.draw_x0));
-        let max_x = a.0.max(b.0).max(c.0).min(i32::from(self.draw_x1));
-        let min_y = a.1.min(b.1).min(c.1).max(i32::from(self.draw_y0));
-        let max_y = a.1.max(b.1).max(c.1).min(i32::from(self.draw_y1));
+    /// Builds texture-sampling state for a textured polygon from its CLUT
+    /// (vertex 0 texcoord word) and texpage (vertex 1 texcoord word).
+    fn poly_texinfo(&self, clut_word: u32, page_word: u32, textured: bool) -> TexInfo {
+        if !textured {
+            return TexInfo::default();
+        }
+        let clut = (clut_word >> 16) & 0xFFFF;
+        let tp = (page_word >> 16) & 0xFFFF;
+        TexInfo {
+            clut_x: ((clut & 0x3F) * 16) as u16,
+            clut_y: ((clut >> 6) & 0x1FF) as u16,
+            page_x: ((tp & 0xF) * 64) as u16,
+            page_y: (((tp >> 4) & 1) * 256) as u16,
+            semi_mode: ((tp >> 5) & 3) as u8,
+            depth: ((tp >> 7) & 3) as u8,
+        }
+    }
 
-        let area = edge(a, b, c);
+    /// Rasterizes a triangle with barycentric Gouraud/texture interpolation,
+    /// clipped to the drawing area and honouring the top-left fill rule.
+    fn raster_triangle(&mut self, a: Vert, b: Vert, c: Vert, flags: &PrimFlags, tex: &TexInfo) {
+        let (a, mut b, mut c) = (a, b, c);
+        let mut area = edge((a.x, a.y), (b.x, b.y), (c.x, c.y));
         if area == 0 {
             return; // degenerate
         }
+        // Normalise to positive area (CCW in screen space) so the barycentric
+        // weights are all non-negative inside and the top-left rule is uniform.
+        if area < 0 {
+            std::mem::swap(&mut b, &mut c);
+            area = -area;
+        }
+        let pa = (a.x, a.y);
+        let pb = (b.x, b.y);
+        let pc = (c.x, c.y);
 
-        // Unpack the three vertex colors for interpolation.
-        let (ra, ga, ba) = unpack_bgr555(ca);
-        let (rb, gb, bb) = unpack_bgr555(cb);
-        let (rc, gc, bc) = unpack_bgr555(cc);
+        let min_x = a.x.min(b.x).min(c.x).max(i32::from(self.draw_x0));
+        let max_x = a.x.max(b.x).max(c.x).min(i32::from(self.draw_x1));
+        let min_y = a.y.min(b.y).min(c.y).max(i32::from(self.draw_y0));
+        let max_y = a.y.max(b.y).max(c.y).min(i32::from(self.draw_y1));
+
+        // Top-left fill rule (PSX-SPX "Rasterization Topleft-rule"): a pixel that
+        // lies exactly on an edge is drawn only when that edge is a top or left
+        // edge, so shared edges between adjacent triangles are covered once (no
+        // double blend for semi-transparent primitives, no gaps).
+        let tl_bc = is_top_left(pb, pc);
+        let tl_ca = is_top_left(pc, pa);
+        let tl_ab = is_top_left(pa, pb);
 
         for y in min_y..=max_y {
             for x in min_x..=max_x {
                 let p = (x, y);
-                let w0 = edge(b, c, p);
-                let w1 = edge(c, a, p);
-                let w2 = edge(a, b, p);
-                // Inside test works for either winding.
-                let inside = (w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0);
+                let w0 = edge(pb, pc, p); // weight of vertex a
+                let w1 = edge(pc, pa, p); // weight of vertex b
+                let w2 = edge(pa, pb, p); // weight of vertex c
+                let inside = (w0 > 0 || (w0 == 0 && tl_bc))
+                    && (w1 > 0 || (w1 == 0 && tl_ca))
+                    && (w2 > 0 || (w2 == 0 && tl_ab));
                 if !inside {
                     continue;
                 }
-                let (l0, l1, l2) = (
-                    w0 as f32 / area as f32,
-                    w1 as f32 / area as f32,
-                    w2 as f32 / area as f32,
-                );
-                let r = (l0 * ra as f32 + l1 * rb as f32 + l2 * rc as f32) as u8;
-                let g = (l0 * ga as f32 + l1 * gb as f32 + l2 * gc as f32) as u8;
-                let bl = (l0 * ba as f32 + l1 * bb as f32 + l2 * bc as f32) as u8;
-                self.plot_clipped(x, y, pack5(r, g, bl));
+                let aa = i64::from(area);
+                let interp = |va: i32, vb: i32, vc: i32| -> i32 {
+                    ((i64::from(w0) * i64::from(va)
+                        + i64::from(w1) * i64::from(vb)
+                        + i64::from(w2) * i64::from(vc))
+                        / aa) as i32
+                };
+                let r8 = interp(a.r, b.r, c.r);
+                let g8 = interp(a.g, b.g, c.g);
+                let b8 = interp(a.b, b.b, c.b);
+                let u = interp(a.u, b.u, c.u);
+                let v = interp(a.v, b.v, c.v);
+                self.shade_and_plot(x, y, r8, g8, b8, u, v, flags, tex);
             }
         }
     }
@@ -711,10 +771,32 @@ impl Gpu {
         let cmd = self.cmd_buffer[0];
         let size = (cmd >> 27) & 0x3;
         let textured = cmd & 0x0400_0000 != 0;
+        let semi = cmd & 0x0200_0000 != 0;
+        let raw = textured && (cmd & 0x0100_0000 != 0);
         let xy = self.cmd_buffer[1];
         let (vx, vy) = decode_vertex(xy);
         let x0 = vx + i32::from(self.draw_off_x);
         let y0 = vy + i32::from(self.draw_off_y);
+
+        // Textured rects carry their CLUT in the high half of the (single)
+        // texcoord word; the texpage comes from the latched GP0(E1) state. The
+        // texcoord low/second byte give the top-left U/V, stepping per pixel.
+        let (u0, v0, tex) = if textured {
+            let tword = self.cmd_buffer[2];
+            let clut = (tword >> 16) & 0xFFFF;
+            let tex = TexInfo {
+                clut_x: ((clut & 0x3F) * 16) as u16,
+                clut_y: ((clut >> 6) & 0x1FF) as u16,
+                page_x: u16::from(self.tex_page_x) * 64,
+                page_y: u16::from(self.tex_page_y) * 256,
+                semi_mode: self.semi_transparency,
+                depth: self.tex_depth,
+            };
+            ((tword & 0xFF) as i32, ((tword >> 8) & 0xFF) as i32, tex)
+        } else {
+            (0, 0, TexInfo::default())
+        };
+
         // If textured, cmd_buffer[2] is the texcoord/clut; size word follows.
         let (w, h) = match size {
             1 => (1i32, 1i32),
@@ -727,12 +809,187 @@ impl Gpu {
             }
         };
         let (r, g, b) = color_channels(cmd);
-        let color = rgb_to_bgr555(r, g, b);
+        // Rectangles are never dithered on real hardware (PSX-SPX), even when a
+        // textured rect is colour-modulated — hence dither_allowed = false.
+        let flags = PrimFlags {
+            textured,
+            raw,
+            semi,
+            gouraud: false,
+            dither_allowed: false,
+        };
         for row in 0..h {
             for col in 0..w {
-                self.plot_clipped(x0 + col, y0 + row, color);
+                self.shade_and_plot(
+                    x0 + col,
+                    y0 + row,
+                    i32::from(r),
+                    i32::from(g),
+                    i32::from(b),
+                    u0 + col,
+                    v0 + row,
+                    &flags,
+                    &tex,
+                );
             }
         }
+    }
+
+    /// Samples a texel at texture-space `(u, v)`, applying the texture window and
+    /// the CLUT/direct-colour decode for the active texture depth. Returns the
+    /// raw BGR555 texel, or `None` when the texel is `0x0000` (fully transparent
+    /// — such texels are skipped even for opaque primitives, per PSX-SPX).
+    fn sample_texel(&self, u: i32, v: i32, tex: &TexInfo) -> Option<u16> {
+        // Texture window (GP0 E2): masked bits are replaced by the offset so a
+        // sub-region tiles. mask_x = win bits0-4, off_x = bits10-14 (×8), etc.
+        let mask_x = u32::from(self.tex_window_mask_x) * 8;
+        let mask_y = u32::from(self.tex_window_mask_y) * 8;
+        let off_x = (u32::from(self.tex_window_off_x) & u32::from(self.tex_window_mask_x)) * 8;
+        let off_y = (u32::from(self.tex_window_off_y) & u32::from(self.tex_window_mask_y)) * 8;
+        let uu = (((u as u32) & 0xFF) & !mask_x) | off_x;
+        let vv = (((v as u32) & 0xFF) & !mask_y) | off_y;
+        let uu = uu as u16;
+        let vv = vv as u16;
+
+        // `vram_at` wraps X with 0x3FF and Y with 0x1FF, so raw sums are fine.
+        let texel = match tex.depth {
+            0 => {
+                // 4bpp CLUT: four texels per VRAM halfword.
+                let hw = self.vram_at(
+                    tex.page_x.wrapping_add(uu >> 2),
+                    tex.page_y.wrapping_add(vv),
+                );
+                let index = (hw >> ((uu & 3) * 4)) & 0xF;
+                self.vram_at(tex.clut_x.wrapping_add(index), tex.clut_y)
+            }
+            1 => {
+                // 8bpp CLUT: two texels per halfword.
+                let hw = self.vram_at(
+                    tex.page_x.wrapping_add(uu >> 1),
+                    tex.page_y.wrapping_add(vv),
+                );
+                let index = (hw >> ((uu & 1) * 8)) & 0xFF;
+                self.vram_at(tex.clut_x.wrapping_add(index), tex.clut_y)
+            }
+            _ => {
+                // 15bpp direct (depth 2; depth 3 is treated as 15bpp).
+                self.vram_at(tex.page_x.wrapping_add(uu), tex.page_y.wrapping_add(vv))
+            }
+        };
+        if texel == 0 { None } else { Some(texel) }
+    }
+
+    /// Shades one candidate pixel — texture sampling, colour modulation,
+    /// dithering — then blends (semi-transparency) and writes it to VRAM.
+    #[allow(clippy::too_many_arguments)]
+    fn shade_and_plot(
+        &mut self,
+        x: i32,
+        y: i32,
+        r8: i32,
+        g8: i32,
+        b8: i32,
+        u: i32,
+        v: i32,
+        flags: &PrimFlags,
+        tex: &TexInfo,
+    ) {
+        // Per-channel values carried at ~8-bit precision so dithering can act
+        // before the final 5-bit quantize.
+        let (cr, cg, cb);
+        let force_msb;
+        let do_semi;
+        let semi_mode;
+        if flags.textured {
+            let texel = match self.sample_texel(u, v, tex) {
+                Some(t) => t,
+                None => return, // transparent texel — pixel skipped entirely
+            };
+            let (tr, tg, tb) = unpack5(texel);
+            force_msb = texel & 0x8000 != 0;
+            semi_mode = tex.semi_mode;
+            // PSX-SPX: bit 25 marks the primitive semi-transparent; for textured
+            // primitives the per-texel STP bit (bit 15) additionally gates the
+            // blend. (Opaque textured prims still store STP into bit 15.)
+            do_semi = flags.semi && force_msb;
+            if flags.raw {
+                // Raw texture: no modulation — expand the 5-bit texel to 8-bit.
+                cr = i32::from(tr) << 3;
+                cg = i32::from(tg) << 3;
+                cb = i32::from(tb) << 3;
+            } else {
+                // Modulate: out5 = min(0x1F, tex5*col8 >> 7). Computed here as
+                // (tex5*col8) >> 4 to keep ~8-bit precision for dithering;
+                // ((tex5*col8) >> 4) >> 3 == (tex5*col8) >> 7 (col8 0x80 = 1.0).
+                cr = (i32::from(tr) * r8) >> 4;
+                cg = (i32::from(tg) * g8) >> 4;
+                cb = (i32::from(tb) * b8) >> 4;
+            }
+        } else {
+            cr = r8;
+            cg = g8;
+            cb = b8;
+            force_msb = false;
+            do_semi = flags.semi;
+            semi_mode = self.semi_transparency;
+        }
+
+        // Dithering applies to Gouraud shading and modulated textures only — not
+        // to raw textures or flat untextured fills, and never to rectangles
+        // (dither_allowed = false there) (PSX-SPX "Dithering").
+        let dither = self.dither
+            && flags.dither_allowed
+            && (flags.gouraud || (flags.textured && !flags.raw));
+        let (r5, g5, b5) = if dither {
+            let d = DITHER_MATRIX[(y & 3) as usize][(x & 3) as usize];
+            (quant(cr + d), quant(cg + d), quant(cb + d))
+        } else {
+            (quant(cr), quant(cg), quant(cb))
+        };
+        self.write_pixel(x, y, r5, g5, b5, do_semi, semi_mode, force_msb);
+    }
+
+    /// Writes a shaded 5-bit-per-channel pixel to VRAM, applying the drawing-area
+    /// clip, semi-transparency blending against the destination, and the mask
+    /// bit (GP0 E6): check-mask skips destinations whose bit 15 is set; set-mask
+    /// (or a set texel STP) forces bit 15 on the written pixel.
+    #[allow(clippy::too_many_arguments)]
+    fn write_pixel(
+        &mut self,
+        x: i32,
+        y: i32,
+        r5: u8,
+        g5: u8,
+        b5: u8,
+        semi: bool,
+        semi_mode: u8,
+        force_msb: bool,
+    ) {
+        if x < i32::from(self.draw_x0)
+            || x > i32::from(self.draw_x1)
+            || y < i32::from(self.draw_y0)
+            || y > i32::from(self.draw_y1)
+        {
+            return;
+        }
+        if x < 0 || y < 0 || x >= VRAM_WIDTH as i32 || y >= VRAM_HEIGHT as i32 {
+            return;
+        }
+        let idx = Self::vram_index(x as u16, y as u16);
+        let bg = self.vram[idx];
+        if self.mask_check && (bg & 0x8000) != 0 {
+            return; // check-mask-before-draw: destination is masked
+        }
+        let (fr, fg, fb) = if semi {
+            blend(semi_mode, unpack5(bg), (r5, g5, b5))
+        } else {
+            (r5, g5, b5)
+        };
+        let mut out = pack555(fr, fg, fb);
+        if self.mask_set || force_msb {
+            out |= 0x8000;
+        }
+        self.vram[idx] = out;
     }
 
     fn draw_single_line(&mut self) {
@@ -941,19 +1198,106 @@ fn edge(a: (i32, i32), b: (i32, i32), c: (i32, i32)) -> i32 {
     (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
 }
 
-/// Unpacks a BGR555 pixel into 8-bit-per-channel R/G/B.
+/// Unpacks a BGR555 pixel into 5-bit-per-channel R/G/B (0..=31).
 #[inline]
-fn unpack_bgr555(p: u16) -> (u8, u8, u8) {
-    let r = ((p & 0x1F) << 3) as u8;
-    let g = (((p >> 5) & 0x1F) << 3) as u8;
-    let b = (((p >> 10) & 0x1F) << 3) as u8;
-    (r, g, b)
+fn unpack5(p: u16) -> (u8, u8, u8) {
+    (
+        (p & 0x1F) as u8,
+        ((p >> 5) & 0x1F) as u8,
+        ((p >> 10) & 0x1F) as u8,
+    )
 }
 
-/// Packs 8-bit R/G/B back into BGR555.
+/// Packs 5-bit-per-channel R/G/B (0..=31) into BGR555 (mask bit cleared).
 #[inline]
-fn pack5(r: u8, g: u8, b: u8) -> u16 {
-    rgb_to_bgr555(r, g, b)
+fn pack555(r: u8, g: u8, b: u8) -> u16 {
+    (u16::from(b & 0x1F) << 10) | (u16::from(g & 0x1F) << 5) | u16::from(r & 0x1F)
+}
+
+/// Clamps an ~8-bit component to `[0, 255]` and quantizes it to 5 bits (0..=31).
+#[inline]
+fn quant(v: i32) -> u8 {
+    (v.clamp(0, 255) >> 3) as u8
+}
+
+/// Blends foreground `f` over background `b` (5-bit components) using one of the
+/// four PSX semi-transparency modes (PSX-SPX "Semi Transparency"):
+/// `0: B/2+F/2`, `1: B+F`, `2: B-F`, `3: B+F/4` (with clamping).
+#[inline]
+fn blend(mode: u8, b: (u8, u8, u8), f: (u8, u8, u8)) -> (u8, u8, u8) {
+    let ch = |bg: u8, fg: u8| -> u8 {
+        match mode {
+            0 => (bg >> 1) + (fg >> 1),
+            1 => (u16::from(bg) + u16::from(fg)).min(0x1F) as u8,
+            2 => bg.saturating_sub(fg),
+            3 => (u16::from(bg) + u16::from(fg >> 2)).min(0x1F) as u8,
+            _ => fg,
+        }
+    };
+    (ch(b.0, f.0), ch(b.1, f.1), ch(b.2, f.2))
+}
+
+/// Whether a directed edge `start → end` is a top or left edge under the PSX
+/// top-left fill rule, given positive-area (CCW, Y-down) triangles. A left edge
+/// goes downward (`dy > 0`); a top edge is horizontal moving left
+/// (`dy == 0 && dx > 0`).
+#[inline]
+fn is_top_left(start: (i32, i32), end: (i32, i32)) -> bool {
+    let dx = end.0 - start.0;
+    let dy = end.1 - start.1;
+    dy > 0 || (dy == 0 && dx > 0)
+}
+
+/// The 4×4 signed ordered-dither matrix (PSX-SPX "Dithering"), indexed
+/// `[y & 3][x & 3]`, added to each ~8-bit component before the 5-bit quantize.
+const DITHER_MATRIX: [[i32; 4]; 4] = [
+    [-4, 0, -3, 1],
+    [2, -2, 3, -1],
+    [-3, 1, -4, 0],
+    [3, -1, 2, -2],
+];
+
+/// A rasterizer vertex: screen position, 8-bit vertex colour, and texcoords.
+#[derive(Clone, Copy, Default)]
+struct Vert {
+    x: i32,
+    y: i32,
+    r: i32,
+    g: i32,
+    b: i32,
+    u: i32,
+    v: i32,
+}
+
+/// Per-primitive shading flags shared by every pixel of a primitive.
+struct PrimFlags {
+    /// The primitive samples a texture.
+    textured: bool,
+    /// Raw texture (bit 24) — skip colour modulation.
+    raw: bool,
+    /// Semi-transparent primitive (bit 25).
+    semi: bool,
+    /// Gouraud-shaded (enables dithering).
+    gouraud: bool,
+    /// Whether dithering may apply (false for rectangles).
+    dither_allowed: bool,
+}
+
+/// Texture-sampling state (CLUT + texpage) resolved for a textured primitive.
+#[derive(Default)]
+struct TexInfo {
+    /// CLUT (palette) top-left X in VRAM pixels.
+    clut_x: u16,
+    /// CLUT top-left Y in VRAM pixels.
+    clut_y: u16,
+    /// Texture-page base X in VRAM pixels.
+    page_x: u16,
+    /// Texture-page base Y in VRAM pixels.
+    page_y: u16,
+    /// Texture colour depth: 0 = 4bpp CLUT, 1 = 8bpp CLUT, 2/3 = 15bpp direct.
+    depth: u8,
+    /// Semi-transparency blend mode for this primitive.
+    semi_mode: u8,
 }
 
 #[cfg(test)]
@@ -1103,7 +1447,7 @@ mod tests {
         );
         // Near v0 the pixel should be reddish (r channel dominant).
         let p = gpu.vram_at(1, 1);
-        let (r, g, b) = unpack_bgr555(p);
+        let (r, g, b) = unpack5(p);
         assert!(
             r > g && r > b,
             "expected red-dominant near v0, got {r},{g},{b}"
@@ -1237,5 +1581,279 @@ mod tests {
         assert_ne!(gpu.gpustat() & (1 << 24), 0);
         gpu.gp1(0x0200_0000); // ack
         assert!(!gpu.irq);
+    }
+
+    // ── Textured rendering ───────────────────────────────────────────────
+
+    /// Sets the drawing area to cover the top-left 128×128 of VRAM.
+    fn open_draw_area(gpu: &mut Gpu) {
+        gpu.gp0(0xE300_0000); // draw area TL (0,0)
+        gpu.gp0(0xE400_0000 | 127u32 | (127u32 << 10)); // BR (127,127)
+    }
+
+    #[test]
+    fn textured_rect_4bpp_clut_decode() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        // Texpage: base (0, 256), 4bpp CLUT (depth 0).
+        gpu.gp0(0xE100_0010);
+        // Texture halfword at (0,256): nibbles [t3 t2 t1 t0] = index 2,1,2,1.
+        gpu.set_vram(0, 256, 0x2121);
+        // CLUT at (0,300): entry 1 = red, entry 2 = green.
+        gpu.set_vram(1, 300, 0x001F);
+        gpu.set_vram(2, 300, 0x03E0);
+        // CLUT selector: clut_x=0, clut_y=300 → field 300<<6 = 0x4B00.
+        // Raw textured variable rect (opcode 0x65) at (10,10), 4×1.
+        feed(
+            &mut gpu,
+            &[
+                0x6500_0000, // raw textured rect
+                0x000A_000A, // vertex (10,10)
+                0x4B00_0000, // texcoord u=0 v=0, clut=0x4B00
+                0x0001_0004, // size 4×1
+            ],
+        );
+        assert_eq!(gpu.vram_at(10, 10), 0x001F, "u0 -> clut[1] red");
+        assert_eq!(gpu.vram_at(11, 10), 0x03E0, "u1 -> clut[2] green");
+        assert_eq!(gpu.vram_at(12, 10), 0x001F, "u2 -> clut[1] red");
+        assert_eq!(gpu.vram_at(13, 10), 0x03E0, "u3 -> clut[2] green");
+    }
+
+    #[test]
+    fn textured_rect_8bpp_clut_decode() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        // Texpage base (0,256), 8bpp CLUT (depth 1 → bit7).
+        gpu.gp0(0xE100_0090);
+        // Halfword at (0,256): low byte = index 1, high byte = index 2.
+        gpu.set_vram(0, 256, 0x0201);
+        gpu.set_vram(1, 300, 0x001F); // clut[1] red
+        gpu.set_vram(2, 300, 0x03E0); // clut[2] green
+        feed(
+            &mut gpu,
+            &[
+                0x6500_0000, // raw textured rect
+                0x000A_000A, // vertex (10,10)
+                0x4B00_0000, // clut=0x4B00
+                0x0001_0002, // size 2×1
+            ],
+        );
+        assert_eq!(gpu.vram_at(10, 10), 0x001F, "u0 -> clut[1]");
+        assert_eq!(gpu.vram_at(11, 10), 0x03E0, "u1 -> clut[2]");
+    }
+
+    #[test]
+    fn textured_rect_15bpp_direct_sample() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        // Texpage base (0,256), 15bpp direct (depth 2 → bit8).
+        gpu.gp0(0xE100_0110);
+        gpu.set_vram(0, 256, 0x1234);
+        gpu.set_vram(1, 256, 0x03E0);
+        feed(
+            &mut gpu,
+            &[
+                0x6500_0000, // raw textured rect
+                0x000A_000A, // vertex (10,10)
+                0x0000_0000, // texcoord u=0 v=0 (clut unused for 15bpp)
+                0x0001_0002, // size 2×1
+            ],
+        );
+        assert_eq!(gpu.vram_at(10, 10), 0x1234);
+        assert_eq!(gpu.vram_at(11, 10), 0x03E0);
+    }
+
+    #[test]
+    fn transparent_texel_is_skipped() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        gpu.gp0(0xE100_0110); // 15bpp
+        gpu.set_vram(0, 256, 0x0000); // fully transparent texel
+        gpu.set_vram(10, 10, 0x7FFF); // pre-existing pixel
+        feed(
+            &mut gpu,
+            &[0x6500_0000, 0x000A_000A, 0x0000_0000, 0x0001_0001],
+        );
+        // The 0x0000 texel is skipped even for an opaque primitive.
+        assert_eq!(gpu.vram_at(10, 10), 0x7FFF);
+    }
+
+    #[test]
+    fn textured_triangle_interpolates_uv() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        // A 4×4 texture patch at page base (0,256): distinct colour per column.
+        for u in 0..4u16 {
+            for v in 0..4u16 {
+                gpu.set_vram(u, 256 + v, 0x0008 * (u + 1));
+            }
+        }
+        // For a textured polygon the texpage is in vertex 1's texcoord word high
+        // half (same layout as GP0 E1 low half): 15bpp, page_y=1 → tp = 0x0110.
+        feed(
+            &mut gpu,
+            &[
+                0x2500_0000, // raw textured flat triangle
+                0x0000_0000, // v0 (0,0)
+                0x0000_0000, // v0 clut (unused) + uv (0,0)
+                0x0000_0010, // v1 (16,0)
+                0x0110_0003, // v1 texpage=0x0110 + uv (3,0)
+                0x0010_0000, // v2 (0,16)
+                0x0000_0300, // v2 uv (0,3)
+            ],
+        );
+        // Interior pixels sample non-zero texels from the patch.
+        assert_ne!(gpu.vram_at(2, 2), 0);
+    }
+
+    #[test]
+    fn semi_transparency_all_four_modes() {
+        // B (background) and F (foreground) as 5-bit components.
+        let bg = pack555(20, 10, 4);
+        let f8 = 0x00C0_8040u32; // R=0x40,G=0x80,C=0xC0 → F5 = (8,16,24)
+        let cases = [
+            (0u32, (14u8, 13u8, 14u8)),
+            (1, (28, 26, 28)),
+            (2, (12, 0, 0)),
+            (3, (22, 14, 10)),
+        ];
+        for (mode, expect) in cases {
+            let mut gpu = Gpu::new();
+            open_draw_area(&mut gpu);
+            gpu.gp0(0xE100_0000 | (mode << 5)); // latch semi mode via E1
+            gpu.set_vram(10, 10, bg);
+            // Untextured semi-transparent 1×1 rect (opcode 0x6A).
+            feed(&mut gpu, &[0x6A00_0000 | f8, 0x000A_000A]);
+            assert_eq!(
+                gpu.vram_at(10, 10),
+                pack555(expect.0, expect.1, expect.2),
+                "semi mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn modulation_neutral_and_half() {
+        // 15bpp texel with all channels = 16.
+        let texel = pack555(16, 16, 16);
+        // Neutral colour 0x80 leaves the texel unchanged.
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        gpu.gp0(0xE100_0110);
+        gpu.set_vram(0, 256, texel);
+        feed(&mut gpu, &[0x6C80_8080, 0x000A_000A, 0x0000_0000]); // modulated 1×1
+        assert_eq!(gpu.vram_at(10, 10), pack555(16, 16, 16));
+
+        // Colour 0x40 halves each channel.
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        gpu.gp0(0xE100_0110);
+        gpu.set_vram(0, 256, texel);
+        feed(&mut gpu, &[0x6C40_4040, 0x000A_000A, 0x0000_0000]);
+        assert_eq!(gpu.vram_at(10, 10), pack555(8, 8, 8));
+
+        // Raw texture (opcode bit24) ignores the colour entirely.
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        gpu.gp0(0xE100_0110);
+        gpu.set_vram(0, 256, texel);
+        feed(&mut gpu, &[0x6D40_4040, 0x000A_000A, 0x0000_0000]);
+        assert_eq!(gpu.vram_at(10, 10), pack555(16, 16, 16));
+    }
+
+    #[test]
+    fn texture_window_masks_uv() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        gpu.gp0(0xE100_0110); // 15bpp, base (0,256)
+        gpu.set_vram(0, 256, 0x1234); // texel at u=0
+        gpu.set_vram(8, 256, 0x5678); // texel at u=8
+        // Texture window mask_x = 1 (×8 = 8): u=8 wraps to u=0.
+        gpu.gp0(0xE200_0001);
+        feed(
+            &mut gpu,
+            &[0x6500_0000, 0x000A_000A, 0x0000_0008, 0x0001_0001], // raw, u=8
+        );
+        assert_eq!(gpu.vram_at(10, 10), 0x1234, "u=8 masked back to u=0");
+    }
+
+    #[test]
+    fn mask_bit_check_and_set() {
+        // check-mask: a destination with bit15 set is not overwritten.
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        gpu.gp0(0xE600_0002); // check-mask-before-draw
+        gpu.set_vram(10, 10, 0xBEEF); // bit15 set
+        feed(&mut gpu, &[0x6800_00FF, 0x000A_000A]); // opaque 1×1 red rect
+        assert_eq!(gpu.vram_at(10, 10), 0xBEEF, "masked pixel preserved");
+
+        // set-mask: written pixels get bit15 forced on.
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        gpu.gp0(0xE600_0001); // set-mask-while-drawing
+        feed(&mut gpu, &[0x6800_00FF, 0x000A_000A]);
+        assert_ne!(gpu.vram_at(10, 10) & 0x8000, 0, "written pixel masked");
+    }
+
+    #[test]
+    fn textured_stp_texel_blends_when_semi() {
+        // A texel with the STP bit set, on a semi-transparent primitive, blends.
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        gpu.gp0(0xE100_0110); // 15bpp, semi mode 0 (average)
+        let texel = 0x8000 | pack555(16, 16, 16); // STP set
+        gpu.set_vram(0, 256, texel);
+        gpu.set_vram(10, 10, pack555(8, 8, 8)); // background
+        // Semi-transparent raw textured 1×1 rect (opcode 0x67).
+        feed(
+            &mut gpu,
+            &[0x6700_0000, 0x000A_000A, 0x0000_0000, 0x0001_0001],
+        );
+        // Mode 0: (bg/2 + fg/2) = (4+8) = 12 per channel; STP forces bit15.
+        assert_eq!(gpu.vram_at(10, 10), 0x8000 | pack555(12, 12, 12));
+    }
+
+    #[test]
+    fn dither_applies_to_gouraud_only_when_enabled() {
+        // With dithering enabled, a flat mid-grey Gouraud triangle gains a
+        // spatially-varying low bit; the same fill without dithering is uniform.
+        let build = |dither: bool| -> Gpu {
+            let mut gpu = Gpu::new();
+            open_draw_area(&mut gpu);
+            // E1: dither bit (9) optionally set.
+            gpu.gp0(0xE100_0000 | (u32::from(dither) << 9));
+            // Gouraud triangle, all three vertices colour 0x83 (just above a
+            // 5-bit boundary) so dithering can push some pixels up/down. The
+            // right triangle (0,0)-(40,0)-(0,40) keeps row y=4 well inside.
+            feed(
+                &mut gpu,
+                &[
+                    0x3083_8383, // gouraud tri, colour0 = 0x83 grey
+                    0x0000_0000, // v0 (0,0)
+                    0x0083_8383, // colour1
+                    0x0000_0028, // v1 (40,0)
+                    0x0083_8383, // colour2
+                    0x0028_0000, // v2 (0,40)
+                ],
+            );
+            gpu
+        };
+        let plain = build(false);
+        let dithered = build(true);
+        // Undithered: every interior pixel on the row is identical.
+        assert_eq!(
+            plain.vram_at(10, 4),
+            plain.vram_at(11, 4),
+            "no dither → uniform"
+        );
+        // Dithered: at least one interior pixel differs from another on the row.
+        let mut varies = false;
+        for x in 6..30u16 {
+            if dithered.vram_at(x, 4) != dithered.vram_at(6, 4) {
+                varies = true;
+                break;
+            }
+        }
+        assert!(varies, "dither → spatial variation");
     }
 }
