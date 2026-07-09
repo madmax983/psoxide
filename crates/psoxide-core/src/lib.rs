@@ -13,6 +13,7 @@ pub mod bus;
 pub mod cpu;
 pub mod dma;
 pub mod gpu;
+pub mod iostubs;
 pub mod irq;
 pub mod timers;
 
