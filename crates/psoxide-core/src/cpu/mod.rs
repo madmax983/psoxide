@@ -21,6 +21,7 @@ pub use decode::{Instruction, decode};
 pub use engine::{COP0_BADVADDR, COP0_CAUSE, COP0_EPC, COP0_SR, Cpu, RESET_PC};
 pub use execute::{Bus, execute_instruction, poll_interrupt, step};
 
+use crate::gte::Gte;
 use serde::{Deserialize, Serialize};
 
 /// Serializable snapshot of the CPU register file and control state.
@@ -38,6 +39,8 @@ pub struct CpuSnapshot {
     pub lo: u32,
     /// Coprocessor-0 registers (indexed 0..=31).
     pub cop0: [u32; 32],
+    /// Coprocessor-2 (GTE) geometry-transformation engine state.
+    pub gte: Gte,
     /// Pending load delay: `(register, value)`.
     pub pending_load: (u8, u32),
     /// Retired instruction/cycle count.
