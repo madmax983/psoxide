@@ -14,7 +14,10 @@ use crate::bus::{
     mask_region,
 };
 use crate::cpu::execute::Bus;
-use crate::cpu::{Cpu, CpuSnapshot, step};
+use crate::cpu::{Cpu, CpuSnapshot, poll_interrupt, step};
+use crate::dma::Dma;
+use crate::gpu::Gpu;
+use crate::irq::{Irq, IrqLine};
 
 /// Placeholder framebuffer width in pixels.
 pub const FRAME_WIDTH: usize = 320;
@@ -245,11 +248,71 @@ impl Memory {
     }
 }
 
-/// Adapter that lets the CPU drive [`Memory`] through the [`Bus`] trait.
-/// Loads/stores are little-endian and decompose into byte accesses so that
-/// region routing lives in one place.
+/// Adapter that lets the CPU drive [`Memory`] and the memory-mapped peripherals
+/// (GPU, DMA, interrupt controller) through the [`Bus`] trait.
+///
+/// RAM / BIOS / scratchpad accesses decompose into byte accesses so region
+/// routing lives in [`Memory`]. Accesses that land in [`BusRegion::IoPorts`]
+/// are intercepted here and routed to the peripheral registers instead.
 struct CoreBus<'a> {
     mem: &'a mut Memory,
+    gpu: &'a mut Gpu,
+    dma: &'a mut Dma,
+    irq: &'a mut Irq,
+}
+
+impl CoreBus<'_> {
+    /// Returns `true` if the physical address falls in the I/O register window.
+    #[inline]
+    fn is_io(phys: u32) -> bool {
+        matches!(map_region(phys), BusRegion::IoPorts)
+    }
+
+    fn io_read32(&mut self, phys: u32) -> u32 {
+        match phys {
+            0x1F80_1810 => self.gpu.gpuread(),
+            0x1F80_1814 => self.gpu.gpustat(),
+            0x1F80_1070 => self.irq.read_stat(),
+            0x1F80_1074 => self.irq.read_mask(),
+            0x1F80_1080..=0x1F80_10FF => self.dma.read32(phys),
+            // Timer registers (0x1F80_1100..=0x1F80_112F) are stubbed read-as-0.
+            _ => 0,
+        }
+    }
+
+    fn io_write32(&mut self, phys: u32, val: u32) {
+        match phys {
+            0x1F80_1810 => self.gpu.gp0(val),
+            0x1F80_1814 => self.gpu.gp1(val),
+            0x1F80_1070 => self.irq.write_stat(val),
+            0x1F80_1074 => self.irq.write_mask(val),
+            0x1F80_1080..=0x1F80_10FF => {
+                self.dma.write32(phys, val, self.mem, self.gpu, self.irq);
+            }
+            // Timers and other I/O ports are stubbed (ignored).
+            _ => {}
+        }
+    }
+
+    fn io_read16(&mut self, phys: u32) -> u16 {
+        match phys {
+            0x1F80_1070 => self.irq.read_stat() as u16,
+            0x1F80_1074 => self.irq.read_mask() as u16,
+            _ => 0,
+        }
+    }
+
+    fn io_write16(&mut self, phys: u32, val: u16) {
+        match phys {
+            // Acknowledge only the low half; preserve the (unused) high bits.
+            0x1F80_1070 => self.irq.write_stat(u32::from(val) | 0xFFFF_0000),
+            0x1F80_1074 => {
+                let hi = self.irq.read_mask() & 0xFFFF_0000;
+                self.irq.write_mask(hi | u32::from(val));
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Bus for CoreBus<'_> {
@@ -257,9 +320,17 @@ impl Bus for CoreBus<'_> {
         self.mem.read8(addr)
     }
     fn load16(&mut self, addr: u32) -> u16 {
+        let phys = mask_region(addr);
+        if Self::is_io(phys) {
+            return self.io_read16(phys);
+        }
         u16::from_le_bytes([self.mem.read8(addr), self.mem.read8(addr.wrapping_add(1))])
     }
     fn load32(&mut self, addr: u32) -> u32 {
+        let phys = mask_region(addr);
+        if Self::is_io(phys) {
+            return self.io_read32(phys);
+        }
         u32::from_le_bytes([
             self.mem.read8(addr),
             self.mem.read8(addr.wrapping_add(1)),
@@ -271,11 +342,21 @@ impl Bus for CoreBus<'_> {
         self.mem.write8(addr, value);
     }
     fn store16(&mut self, addr: u32, value: u16) {
+        let phys = mask_region(addr);
+        if Self::is_io(phys) {
+            self.io_write16(phys, value);
+            return;
+        }
         let b = value.to_le_bytes();
         self.mem.write8(addr, b[0]);
         self.mem.write8(addr.wrapping_add(1), b[1]);
     }
     fn store32(&mut self, addr: u32, value: u32) {
+        let phys = mask_region(addr);
+        if Self::is_io(phys) {
+            self.io_write32(phys, value);
+            return;
+        }
         let b = value.to_le_bytes();
         self.mem.write8(addr, b[0]);
         self.mem.write8(addr.wrapping_add(1), b[1]);
@@ -300,6 +381,12 @@ pub struct CoreSnapshot {
     pub scratchpad: Vec<u8>,
     /// BIOS image.
     pub bios: Vec<u8>,
+    /// GPU state (VRAM + registers).
+    pub gpu: Gpu,
+    /// DMA controller state.
+    pub dma: Dma,
+    /// Interrupt controller state.
+    pub irq: Irq,
 }
 
 /// Deserializes the RAM buffer, rejecting snapshots whose length is not the
@@ -318,6 +405,9 @@ fn deserialize_ram<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D:
 pub struct PsxCore {
     cpu: Cpu,
     mem: Memory,
+    gpu: Gpu,
+    dma: Dma,
+    irq: Irq,
     paused: bool,
     controllers: [u16; 2],
 }
@@ -335,9 +425,36 @@ impl PsxCore {
         Self {
             cpu: Cpu::new(),
             mem: Memory::new(),
+            gpu: Gpu::new(),
+            dma: Dma::new(),
+            irq: Irq::new(),
             paused: false,
             controllers: [0; 2],
         }
+    }
+
+    /// Returns a shared reference to the GPU.
+    #[must_use]
+    pub fn gpu(&self) -> &Gpu {
+        &self.gpu
+    }
+
+    /// Returns a mutable reference to the GPU (for test harnesses that drive
+    /// GP0/GP1 directly).
+    pub fn gpu_mut(&mut self) -> &mut Gpu {
+        &mut self.gpu
+    }
+
+    /// Returns a shared reference to the interrupt controller.
+    #[must_use]
+    pub fn irq(&self) -> &Irq {
+        &self.irq
+    }
+
+    /// Returns a shared reference to the DMA controller.
+    #[must_use]
+    pub fn dma(&self) -> &Dma {
+        &self.dma
     }
 
     /// Returns whether stepping is paused.
@@ -405,6 +522,9 @@ impl PsxCore {
                 for _ in 0..STEPS_PER_FRAME {
                     self.step_cpu();
                 }
+                // Once per frame: advance the interlace field and raise VBlank.
+                self.gpu.field = !self.gpu.field;
+                self.irq.set(IrqLine::VBlank);
             }
             Command::SetControllerState { port, buttons } => {
                 if let Some(slot) = self.controllers.get_mut(port as usize) {
@@ -440,24 +560,82 @@ impl PsxCore {
     }
 
     fn step_cpu(&mut self) {
-        let mut bus = CoreBus { mem: &mut self.mem };
+        // Deliver a pending, unmasked hardware interrupt at the instruction
+        // boundary before fetching the next instruction. With reset state
+        // (interrupts disabled) this is a no-op.
+        if poll_interrupt(&mut self.cpu, self.irq.pending()) {
+            self.cpu.cycles = self.cpu.cycles.wrapping_add(1);
+            return;
+        }
+        let mut bus = CoreBus {
+            mem: &mut self.mem,
+            gpu: &mut self.gpu,
+            dma: &mut self.dma,
+            irq: &mut self.irq,
+        };
         step(&mut self.cpu, &mut bus);
     }
 
-    /// Returns a freshly allocated placeholder RGBA framebuffer.
+    /// Renders the current display area from VRAM to a 320×240 RGBA buffer.
     ///
-    /// GPU emulation is not yet implemented; this renders a deterministic
-    /// gradient so the desktop frontend has something to display.
+    /// The display start position is read from the GPU (GP1 0x05). When the
+    /// display is disabled the frame is all black. 15bpp (BGR555) mode is fully
+    /// supported; 24bpp mode (used by the Sony boot logo) is best-effort,
+    /// unpacking the packed 24-bit byte stream from the VRAM row.
     #[must_use]
     pub fn framebuffer_rgba(&self) -> Vec<u8> {
         let mut frame = vec![0u8; FRAME_RGBA_BYTES];
-        for y in 0..FRAME_HEIGHT {
-            for x in 0..FRAME_WIDTH {
-                let i = (y * FRAME_WIDTH + x) * 4;
-                frame[i] = (x * 255 / FRAME_WIDTH) as u8;
-                frame[i + 1] = (y * 255 / FRAME_HEIGHT) as u8;
-                frame[i + 2] = 0x40;
-                frame[i + 3] = 0xFF;
+        if !self.gpu.display_enabled {
+            // All black, opaque.
+            for px in frame.chunks_exact_mut(4) {
+                px[3] = 0xFF;
+            }
+            return frame;
+        }
+
+        let vx = self.gpu.display_vram_x;
+        let vy = self.gpu.display_vram_y;
+
+        if self.gpu.color_depth_24 {
+            // 24bpp: each output row is 320 pixels = 960 bytes = 480 u16 words.
+            for oy in 0..FRAME_HEIGHT {
+                let row_y = vy.wrapping_add(oy as u16);
+                for ox in 0..FRAME_WIDTH {
+                    // Byte offset of this pixel within the VRAM row.
+                    let byte = ox * 3;
+                    let word0 = self.gpu.vram_at(vx.wrapping_add((byte / 2) as u16), row_y);
+                    let word1 = self
+                        .gpu
+                        .vram_at(vx.wrapping_add((byte / 2 + 1) as u16), row_y);
+                    let bytes = [
+                        word0 as u8,
+                        (word0 >> 8) as u8,
+                        word1 as u8,
+                        (word1 >> 8) as u8,
+                    ];
+                    let sub = byte % 2;
+                    let r = bytes[sub];
+                    let g = bytes[sub + 1];
+                    let b = bytes[sub + 2];
+                    let i = (oy * FRAME_WIDTH + ox) * 4;
+                    frame[i] = r;
+                    frame[i + 1] = g;
+                    frame[i + 2] = b;
+                    frame[i + 3] = 0xFF;
+                }
+            }
+        } else {
+            // 15bpp BGR555.
+            for oy in 0..FRAME_HEIGHT {
+                let row_y = vy.wrapping_add(oy as u16);
+                for ox in 0..FRAME_WIDTH {
+                    let p = self.gpu.vram_at(vx.wrapping_add(ox as u16), row_y);
+                    let i = (oy * FRAME_WIDTH + ox) * 4;
+                    frame[i] = ((p & 0x1F) << 3) as u8;
+                    frame[i + 1] = (((p >> 5) & 0x1F) << 3) as u8;
+                    frame[i + 2] = (((p >> 10) & 0x1F) << 3) as u8;
+                    frame[i + 3] = 0xFF;
+                }
             }
         }
         frame
@@ -473,6 +651,9 @@ impl PsxCore {
             ram: self.mem.ram.to_vec(),
             scratchpad: self.mem.scratchpad.to_vec(),
             bios: self.mem.bios.clone(),
+            gpu: self.gpu.clone(),
+            dma: self.dma.clone(),
+            irq: self.irq.clone(),
         }
     }
 
@@ -488,6 +669,9 @@ impl PsxCore {
             self.mem.scratchpad.copy_from_slice(&snap.scratchpad);
         }
         self.mem.bios = snap.bios.clone();
+        self.gpu = snap.gpu.clone();
+        self.dma = snap.dma.clone();
+        self.irq = snap.irq.clone();
     }
 }
 
@@ -618,5 +802,125 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: CoreSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn gp0_write_via_bus_reaches_gpu() {
+        let mut core = PsxCore::new();
+        {
+            let mut bus = CoreBus {
+                mem: &mut core.mem,
+                gpu: &mut core.gpu,
+                dma: &mut core.dma,
+                irq: &mut core.irq,
+            };
+            // Fill red 16x16 at (0,0) through the GP0 port.
+            bus.store32(0x1F80_1810, 0x0200_00FF);
+            bus.store32(0x1F80_1810, 0x0000_0000);
+            bus.store32(0x1F80_1810, 0x0010_0010);
+        }
+        assert_eq!(
+            core.gpu.vram_at(0, 0),
+            crate::gpu::rgb_to_bgr555(0xFF, 0, 0)
+        );
+    }
+
+    #[test]
+    fn gpustat_read_via_bus_has_ready_bits() {
+        let mut core = PsxCore::new();
+        let val = {
+            let mut bus = CoreBus {
+                mem: &mut core.mem,
+                gpu: &mut core.gpu,
+                dma: &mut core.dma,
+                irq: &mut core.irq,
+            };
+            bus.load32(0x1F80_1814)
+        };
+        assert_ne!(val, 0);
+        assert_ne!(val & (1 << 26), 0);
+        assert_ne!(val & (1 << 28), 0);
+    }
+
+    #[test]
+    fn irq_registers_via_bus() {
+        let mut core = PsxCore::new();
+        let mut bus = CoreBus {
+            mem: &mut core.mem,
+            gpu: &mut core.gpu,
+            dma: &mut core.dma,
+            irq: &mut core.irq,
+        };
+        bus.store32(0x1F80_1074, 0x1); // I_MASK = VBlank
+        assert_eq!(bus.load32(0x1F80_1074), 0x1);
+    }
+
+    #[test]
+    fn framebuffer_reflects_vram_when_enabled() {
+        let mut core = PsxCore::new();
+        core.gpu.display_enabled = true;
+        core.gpu.color_depth_24 = false;
+        // White pixel at display origin (0,0).
+        core.gpu.set_vram(0, 0, 0x7FFF);
+        let frame = core.framebuffer_rgba();
+        assert_eq!(frame.len(), FRAME_RGBA_BYTES);
+        assert_eq!(&frame[0..4], &[0xF8, 0xF8, 0xF8, 0xFF]);
+    }
+
+    #[test]
+    fn framebuffer_black_when_display_disabled() {
+        let mut core = PsxCore::new();
+        core.gpu.display_enabled = false;
+        core.gpu.set_vram(0, 0, 0x7FFF);
+        let frame = core.framebuffer_rgba();
+        assert_eq!(&frame[0..4], &[0, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn save_load_round_trips_gpu_vram() {
+        let mut core = PsxCore::new();
+        core.gpu.set_vram(3, 3, 0x1234);
+        core.irq.set(IrqLine::VBlank);
+        let snap = core.save_state();
+        let mut other = PsxCore::new();
+        other.load_state(&snap);
+        assert_eq!(other.gpu.vram_at(3, 3), 0x1234);
+        assert_eq!(other.irq.read_stat(), snap.irq.read_stat());
+    }
+
+    #[test]
+    fn step_frame_raises_vblank_and_toggles_field() {
+        let mut core = PsxCore::new();
+        let field_before = core.gpu.field;
+        core.execute(Command::StepFrame).unwrap();
+        assert_ne!(core.gpu.field, field_before);
+        assert_ne!(core.irq.read_stat() & 0x1, 0, "VBlank bit should be set");
+    }
+
+    #[test]
+    fn hardware_interrupt_taken_when_enabled() {
+        let mut core = PsxCore::new();
+        core.set_pc(0);
+        // Enable interrupts: IEc (bit 0) and IM for the hardware line (bit 10),
+        // clearing BEV so the handler vectors to RAM.
+        core.cpu.cop0[crate::cpu::COP0_SR] = 0x1 | (1 << 10);
+        core.irq.write_mask(1 << IrqLine::VBlank.bit());
+        core.irq.set(IrqLine::VBlank);
+        assert!(core.irq.pending());
+        core.execute(Command::StepCpu).unwrap();
+        assert_eq!(core.pc(), 0x8000_0080, "interrupt should vector to handler");
+    }
+
+    #[test]
+    fn hardware_interrupt_not_taken_when_disabled() {
+        let mut core = PsxCore::new();
+        core.set_pc(0);
+        // Interrupts globally disabled (reset SR has IEc=0).
+        core.irq.write_mask(1 << IrqLine::VBlank.bit());
+        core.irq.set(IrqLine::VBlank);
+        assert!(core.irq.pending());
+        core.execute(Command::StepCpu).unwrap();
+        // No interrupt: PC simply advanced past the (zero/NOP) instruction.
+        assert_eq!(core.pc(), 0x4);
     }
 }
