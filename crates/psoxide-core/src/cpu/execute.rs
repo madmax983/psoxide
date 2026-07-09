@@ -529,10 +529,17 @@ fn enter_exception(cpu: &mut Cpu, cause: u32) {
 }
 
 /// Restore-from-exception: pops the SR mode/interrupt-enable stack.
+///
+/// On the R3000 `rfe` pops the current pair off the 3-deep kernel/interrupt
+/// stack in `SR` bits 0..=5: `IEc/KUc ← IEp/KUp` and `IEp/KUp ← IEo/KUo`. The
+/// *old* pair (`IEo/KUo`, bits 4..=5) is **left unchanged** — it is not
+/// zero-filled. Preserving it is required for nested-exception correctness and
+/// is exactly what Amidog's `rfe`/`syscall`/`break` return-value checks assert.
 fn rfe(cpu: &mut Cpu) {
-    let mode = cpu.cop0[COP0_SR] & 0x3F;
-    cpu.cop0[COP0_SR] &= !0x3F;
-    cpu.cop0[COP0_SR] |= mode >> 2;
+    let stack = cpu.cop0[COP0_SR] & 0x3F;
+    // bits 1:0 ← bits 3:2, bits 3:2 ← bits 5:4 (`stack >> 2`); bits 5:4 kept.
+    let restored = (stack & 0x30) | (stack >> 2);
+    cpu.cop0[COP0_SR] = (cpu.cop0[COP0_SR] & !0x3F) | restored;
 }
 
 #[cfg(test)]
@@ -995,6 +1002,22 @@ mod tests {
         execute_instruction(&mut cpu, &mut bus, Instruction::Rfe);
         // Pop restores the low four bits.
         assert_eq!(cpu.cop0[COP0_SR] & 0xF, 0b1101);
+    }
+
+    #[test]
+    fn rfe_preserves_old_interrupt_mode_pair() {
+        // The R3000 `rfe` pops the stack but leaves the *old* pair (SR bits
+        // 5:4, IEo/KUo) unchanged rather than zero-filling it. Amidog's rfe /
+        // syscall / break return-value checks assert exactly this.
+        let mut cpu = Cpu::new();
+        let mut bus = TestBus::new();
+        // IEo=1, KUo=1 in the old slot; current/previous slots clear.
+        cpu.cop0[COP0_SR] = 0b11_0000;
+        execute_instruction(&mut cpu, &mut bus, Instruction::Rfe);
+        // bits 1:0 ← bits 3:2 (0), bits 3:2 ← bits 5:4 (0b11), bits 5:4 kept.
+        assert_eq!(cpu.cop0[COP0_SR] & 0x3F, 0b11_1100);
+        // In particular the old pair is preserved, not cleared.
+        assert_eq!(cpu.cop0[COP0_SR] & 0x30, 0x30);
     }
 
     #[test]
