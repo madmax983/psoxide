@@ -6,14 +6,17 @@
 //! These gates prove the real-PS-EXE execution path works end-to-end — a
 //! regression guard for the sideloader, the syscall/`printf` HLE, and the timer
 //! interrupt path. They intentionally do **not** assert a full byte-for-byte
-//! match against the shipped `psx.log`: each suite still exercises hardware
-//! psoxide has not implemented yet (the BIOS exception-dispatch chain that
-//! invokes program-registered handlers, instruction/data bus-error exceptions,
-//! the coprocessor-unusable exception, cycle-accurate access timing, and the
-//! JOY / SIO / SPU / CD-ROM / MDEC peripherals). See `tests/README.md` and
-//! `tests/fixtures/ps1-tests/README.md` for the blocker details. The `psx.log`
-//! goldens are vendored so these gates can be tightened to a golden diff as that
-//! hardware lands.
+//! match against the shipped `psx.log`: several suites still exercise hardware
+//! psoxide has not implemented yet (instruction/data bus-error exceptions,
+//! cycle-accurate access timing, and the JOY / SIO / SPU / CD-ROM / MDEC
+//! peripherals). The BIOS exception-dispatch chain that invokes
+//! program-registered handlers is HLE'd by the harness (see `src/lib.rs`), and
+//! the decoder now surfaces COP1/COP3/LWCx/SWCx (and unassigned COP0 commands)
+//! as distinct coprocessor ops with correct Coprocessor-Unusable behaviour, so
+//! `cpu/cop` passes in full against its golden. See `tests/README.md` and
+//! `tests/fixtures/ps1-tests/README.md` for the remaining blocker details. The
+//! `psx.log` goldens are vendored so these gates can be tightened to a golden
+//! diff as that hardware lands.
 
 use psoxide_test_harness::Harness;
 use std::path::PathBuf;
@@ -40,17 +43,47 @@ fn run_exe(rel: &str, budget: usize) -> String {
 fn cop_runs_to_completion_and_reports_passes() {
     let tty = run_exe("cpu/cop/cop.exe", 1_000_000);
     assert!(tty.contains("cpu/cop"), "cop header missing:\n{tty}");
-    // The coprocessor-enabled paths pass today. The "Disabled" cases still need
-    // the BIOS exception-dispatch chain (to run the program's registered handler)
-    // plus the coprocessor-unusable exception, so they are not asserted here.
-    assert!(
-        tty.contains("pass - testCop0Enabled"),
-        "expected testCop0Enabled to pass:\n{tty}"
-    );
-    assert!(
-        tty.contains("pass - testCop2Enabled"),
-        "expected testCop2Enabled to pass:\n{tty}"
-    );
+
+    // Every `cpu/cop` case now passes, matching the vendored `psx.log` golden.
+    // The decoder surfaces COP1/COP3/LWCx/SWCx (and unassigned COP0 commands) as
+    // distinct coprocessor ops, so:
+    //   * the coprocessor-*enabled* and *invalid-opcode* cases stay no-ops and
+    //     raise no exception (a usable coprocessor op must not trap);
+    //   * the *disabled* cases raise the real Coprocessor-Unusable exception
+    //     (ExcCode 0x0B) with CAUSE.CE = the coprocessor number, which the
+    //     program-registered "unresolved exception" handler observes via the
+    //     BIOS exception-dispatch chain the harness HLEs;
+    //   * `testDisabledCoprocessorThrowsCoprocessorUnusable` sees the exception
+    //     *type* is 0x0B (previously it saw the reserved-instruction 0x0A).
+    // COP0 register ops (MFC0) keep their kernel-mode usability exemption, so
+    // `testCop0Disabled` correctly raises nothing in kernel mode, while
+    // `testSwc0Disabled` still traps because coprocessor load/stores are gated
+    // purely by SR.CU0 (no kernel-mode exemption).
+    for case in [
+        "testCop0Disabled",
+        "testCop0Enabled",
+        "testCop0InvalidOpcode",
+        "testSwc0Disabled",
+        "testSwc0Enabled",
+        "testCop1Disabled",
+        "testCop1Enabled",
+        "testCop2Disabled",
+        "testCop2Enabled",
+        "testCop2InvalidOpcode",
+        "testSwc2Disabled",
+        "testSwc2Enabled",
+        "testCop3Disabled",
+        "testCop3Enabled",
+        "testSwc3Disabled",
+        "testSwc3Enabled",
+        "testDisabledCoprocessorThrowsCoprocessorUnusable",
+    ] {
+        assert!(
+            tty.contains(&format!("pass - {case}")),
+            "expected {case} to pass:\n{tty}"
+        );
+    }
+
     assert!(
         tty.contains("Done."),
         "cop did not run to completion:\n{tty}"
@@ -61,11 +94,41 @@ fn cop_runs_to_completion_and_reports_passes() {
 fn code_in_io_executes_code_from_ram() {
     let tty = run_exe("cpu/code-in-io/code-in-io.exe", 1_000_000);
     assert!(tty.contains("cpu/code-in-io"), "header missing:\n{tty}");
-    // Executing code out of main RAM works; the scratchpad/MDEC/IO cases need
-    // instruction bus-error exceptions that psoxide does not model yet.
+
+    // Instruction Bus-Error (ExcCode 0x06) is now modelled: a code fetch from a
+    // region that does not respond to a code-fetch bus cycle raises IBE, which
+    // the program-registered "unresolved exception" handler observes (via the
+    // BIOS exception-dispatch chain the harness HLEs), returning to `$ra`.
+    //   * testCodeInRam        — main RAM is a legal code source (no exception).
+    //   * testCodeInScratchpad — the D-cache scratchpad bus-errors on fetch.
+    //   * testCodeInMDEC       — the MDEC I/O port bus-errors on fetch.
+    //   * testCodeInInterrupts — the interrupt I/O port bus-errors on fetch.
+    //   * testCodeInDMA0 / testCodeInDMAControl — the DMA register block responds
+    //     to code fetch (no exception); psoxide backs those registers, so the
+    //     copied `jr $ra` is read back and executes.
+    for case in [
+        "testCodeInRam",
+        "testCodeInScratchpad",
+        "testCodeInMDEC",
+        "testCodeInInterrupts",
+        "testCodeInDMA0",
+        "testCodeInDMAControl",
+    ] {
+        assert!(
+            tty.contains(&format!("pass - {case}")),
+            "expected {case} to pass:\n{tty}"
+        );
+    }
+
+    // testCodeInSPU is the one remaining case: on hardware the SPU register block
+    // also responds to code fetch (no exception), but psoxide does not yet back
+    // the SPU register file, so the copied code cannot be read back. It therefore
+    // still faults rather than executing — it needs the SPU device stubs (a
+    // separate device-register workstream), not more CPU work. The suite runs to
+    // completion either way.
     assert!(
-        tty.contains("pass - testCodeInRam"),
-        "expected testCodeInRam to pass:\n{tty}"
+        tty.contains("Done."),
+        "code-in-io did not run to completion:\n{tty}"
     );
 }
 

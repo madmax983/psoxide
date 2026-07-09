@@ -100,6 +100,39 @@ proptest! {
     }
 
     #[test]
+    fn delayed_load_never_clobbers_following_write(mem_val in any::<u32>(), imm in any::<u16>()) {
+        // A load into $t0 immediately followed by a register write into $t0 must
+        // never let the (later-committing) load overwrite the write: on the
+        // R3000 the delay-slot instruction's own writeback wins.
+        //   lw    $t0, 0($t1)        ; $t1 preset to 0x400; queues $t0 = mem_val
+        //   addiu $t0, $zero, imm    ; delay slot writes $t0 = sign_extend(imm)
+        //   nop                      ; commit point
+        let mut bus = FlatBus::new();
+        bus.mem[0x400..0x404].copy_from_slice(&mem_val.to_le_bytes());
+        let program = [
+            (0x23u32 << 26) | (9 << 21) | (8 << 16), // lw $t0,0($t1)
+            (0x09u32 << 26) | (8 << 16) | u32::from(imm), // addiu $t0,$zero,imm
+            0,                                       // nop
+        ];
+        for (i, &w) in program.iter().enumerate() {
+            let base = i * 4;
+            bus.mem[base..base + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut cpu = Cpu::new();
+        cpu.pc = 0;
+        cpu.next_pc = 4;
+        cpu.cop0[engine::COP0_SR] = 0;
+        cpu.regs[9] = 0x400;
+        cpu.out_regs[9] = 0x400;
+        for _ in 0..program.len() {
+            step(&mut cpu, &mut bus);
+        }
+        // $t0 holds the ADDIU result regardless of what the load fetched.
+        let expected = imm as i16 as i32 as u32;
+        prop_assert_eq!(cpu.reg(8), expected);
+    }
+
+    #[test]
     fn memory_query_never_panics(addr in any::<u32>(), len in 0u32..64) {
         let core = PsxCore::new();
         let result = core.query(CoreQuery::Memory { addr, len });
