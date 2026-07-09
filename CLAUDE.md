@@ -39,10 +39,6 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 - SPU (audio — stubbed silent)
 - CD-ROM
 - Hardware timers (0x1F80_1100..0x1F80_112F read-as-0 / write-ignored stubs)
-- PSX-EXE side-loading (`LoadExe` is accepted as a no-op)
-- DMA (7 channels)
-- Interrupts beyond the cop0 exception path
-- Hardware timers
 - PSX-EXE side-loading (core `Command::LoadExe` is accepted as a no-op; the
   test harness has a standalone PS-EXE sideloader, `Harness::load_exe`, used for
   CPU tests)
