@@ -37,12 +37,25 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   sources (sysclk, sysclk/8, approximated dotclock/hblank), target/overflow IRQ
   delivery (Timer0/1/2 → I_STAT bits 4/5/6), one-shot vs repeat, read-clears the
   reached-flags. Ticked once per CPU cycle at the top of `step_cpu`
+- I/O device stubs (`iostubs.rs`) — write-then-read-back register files that
+  cover the memory-mapped regions a real BIOS touches during boot but for which
+  no real emulation exists yet: memory-control (0x1F80_1000..0x1F80_1023 + the
+  RAM_SIZE register at 0x1F80_1060), cache-control (0xFFFE_0130), SIO0 /
+  joypad (0x1F80_1040..0x1F80_105F, "no controller attached" defaults), CD-ROM
+  status/response/data/interrupt ports (0x1F80_1800..0x1F80_1803, reports "no
+  disc, not busy"), and the SPU register window (0x1F80_1C00..0x1F80_1FFF).
+  No side effects, no DMA/IRQ delivery — the goal is only that BIOS init
+  sequences do not FIFO-desync or panic on unmapped-region reads. SPUSTAT is
+  synthesized to mirror the low six bits of SPUCNT the way real hardware does
 
 ## Not Yet Implemented
 
 - GTE (cop2) — decoded but ignored
-- SPU (audio — stubbed silent)
-- CD-ROM
+- SPU (audio — register-file stub in `iostubs.rs` reads back what the BIOS
+  writes but produces no audio; there is no envelope, voice, or reverb engine)
+- CD-ROM (register-file stub in `iostubs.rs` reports "no disc, not busy" so
+  BIOS status polls do not wedge; no commands are executed, no disc image is
+  loaded, no CD IRQ is delivered)
 - Coprocessor-unusable exception (ExcCode 0x0B) and instruction/data bus-error
   exceptions (ExcCode 0x06) — coprocessor and unmapped accesses do not trap yet
 - BIOS exception-dispatch chain — the core exception path (vectors/EPC/rfe/
@@ -113,8 +126,14 @@ pwsh scripts/verus-check.ps1
 
 ## Milestones
 
-1. CPU interpreter passes instruction tests **[current target]**
-2. BIOS boots to shell/logo with GPU rendering
+1. CPU interpreter passes instruction tests **[tier-1 gate wired]**
+2. BIOS boots to shell/logo with GPU rendering **[in progress]** —
+   the memory-mapped device windows the BIOS touches during startup have
+   read-back-sane stubs (`iostubs.rs`); the `PSOXIDE_BIOS`-gated smoke test
+   in `crates/psoxide-test-harness/tests/bios_smoke.rs` runs 180 frames and
+   asserts tiered progress (PC advance, display enable / VRAM touch, and a
+   framebuffer color-distribution check). No boot claim is made without a
+   real BIOS image driving the gated test to green
 3. Boots a real game from a disc image
 
 Test resources: Amidog PSX CPU/GTE tests, JaCzekanski `ps1-tests`, PeterLemon PSX demos.

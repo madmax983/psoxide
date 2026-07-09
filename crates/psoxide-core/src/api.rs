@@ -17,6 +17,7 @@ use crate::cpu::execute::Bus;
 use crate::cpu::{Cpu, CpuSnapshot, poll_interrupt, step};
 use crate::dma::Dma;
 use crate::gpu::Gpu;
+use crate::iostubs::{CACHE_CTRL_REG, CacheCtrl, CdRom, MemCtrl, Sio0, Spu};
 use crate::irq::{Irq, IrqLine};
 use crate::timers::{TIMERS_BASE, TIMERS_END, Timers};
 
@@ -261,6 +262,11 @@ struct CoreBus<'a> {
     dma: &'a mut Dma,
     irq: &'a mut Irq,
     timers: &'a mut Timers,
+    memctrl: &'a mut MemCtrl,
+    cache_ctrl: &'a mut CacheCtrl,
+    sio0: &'a mut Sio0,
+    cdrom: &'a mut CdRom,
+    spu: &'a mut Spu,
 }
 
 impl CoreBus<'_> {
@@ -278,6 +284,10 @@ impl CoreBus<'_> {
             0x1F80_1074 => self.irq.read_mask(),
             0x1F80_1080..=0x1F80_10FF => self.dma.read32(phys),
             TIMERS_BASE..=TIMERS_END => self.timers.read32(phys),
+            _ if MemCtrl::contains(phys) => self.memctrl.read32(phys),
+            _ if Sio0::contains(phys) => self.sio0.read32(phys),
+            _ if CdRom::contains(phys) => self.cdrom.read32(phys),
+            _ if Spu::contains(phys) => self.spu.read32(phys),
             _ => 0,
         }
     }
@@ -292,6 +302,10 @@ impl CoreBus<'_> {
                 self.dma.write32(phys, val, self.mem, self.gpu, self.irq);
             }
             TIMERS_BASE..=TIMERS_END => self.timers.write32(phys, val),
+            _ if MemCtrl::contains(phys) => self.memctrl.write32(phys, val),
+            _ if Sio0::contains(phys) => self.sio0.write32(phys, val),
+            _ if CdRom::contains(phys) => self.cdrom.write32(phys, val),
+            _ if Spu::contains(phys) => self.spu.write32(phys, val),
             // Other I/O ports are stubbed (ignored).
             _ => {}
         }
@@ -302,6 +316,10 @@ impl CoreBus<'_> {
             0x1F80_1070 => self.irq.read_stat() as u16,
             0x1F80_1074 => self.irq.read_mask() as u16,
             TIMERS_BASE..=TIMERS_END => self.timers.read16(phys),
+            _ if MemCtrl::contains(phys) => self.memctrl.read32(phys & !0x3) as u16,
+            _ if Sio0::contains(phys) => self.sio0.read16(phys),
+            _ if CdRom::contains(phys) => self.cdrom.read16(phys),
+            _ if Spu::contains(phys) => self.spu.read16(phys),
             _ => 0,
         }
     }
@@ -315,6 +333,27 @@ impl CoreBus<'_> {
                 self.irq.write_mask(hi | u32::from(val));
             }
             TIMERS_BASE..=TIMERS_END => self.timers.write16(phys, val),
+            _ if Sio0::contains(phys) => self.sio0.write16(phys, val),
+            _ if CdRom::contains(phys) => self.cdrom.write16(phys, val),
+            _ if Spu::contains(phys) => self.spu.write16(phys, val),
+            _ => {}
+        }
+    }
+
+    fn io_read8(&mut self, phys: u32) -> u8 {
+        match phys {
+            _ if Sio0::contains(phys) => self.sio0.read8(phys),
+            _ if CdRom::contains(phys) => self.cdrom.read8(phys),
+            _ if Spu::contains(phys) => self.spu.read8(phys),
+            _ => 0,
+        }
+    }
+
+    fn io_write8(&mut self, phys: u32, val: u8) {
+        match phys {
+            _ if Sio0::contains(phys) => self.sio0.write8(phys, val),
+            _ if CdRom::contains(phys) => self.cdrom.write8(phys, val),
+            _ if Spu::contains(phys) => self.spu.write8(phys, val),
             _ => {}
         }
     }
@@ -322,6 +361,10 @@ impl CoreBus<'_> {
 
 impl Bus for CoreBus<'_> {
     fn load8(&mut self, addr: u32) -> u8 {
+        let phys = mask_region(addr);
+        if Self::is_io(phys) {
+            return self.io_read8(phys);
+        }
         self.mem.read8(addr)
     }
     fn load16(&mut self, addr: u32) -> u16 {
@@ -336,6 +379,9 @@ impl Bus for CoreBus<'_> {
         if Self::is_io(phys) {
             return self.io_read32(phys);
         }
+        if phys == CACHE_CTRL_REG {
+            return self.cache_ctrl.read32();
+        }
         u32::from_le_bytes([
             self.mem.read8(addr),
             self.mem.read8(addr.wrapping_add(1)),
@@ -344,6 +390,11 @@ impl Bus for CoreBus<'_> {
         ])
     }
     fn store8(&mut self, addr: u32, value: u8) {
+        let phys = mask_region(addr);
+        if Self::is_io(phys) {
+            self.io_write8(phys, value);
+            return;
+        }
         self.mem.write8(addr, value);
     }
     fn store16(&mut self, addr: u32, value: u16) {
@@ -360,6 +411,10 @@ impl Bus for CoreBus<'_> {
         let phys = mask_region(addr);
         if Self::is_io(phys) {
             self.io_write32(phys, value);
+            return;
+        }
+        if phys == CACHE_CTRL_REG {
+            self.cache_ctrl.write32(value);
             return;
         }
         let b = value.to_le_bytes();
@@ -395,6 +450,21 @@ pub struct CoreSnapshot {
     /// Hardware timer / root-counter state.
     #[serde(default)]
     pub timers: Timers,
+    /// Memory-control register stub.
+    #[serde(default)]
+    pub memctrl: MemCtrl,
+    /// Cache-control register stub.
+    #[serde(default)]
+    pub cache_ctrl: CacheCtrl,
+    /// SIO0 / joypad register stub.
+    #[serde(default)]
+    pub sio0: Sio0,
+    /// CD-ROM register stub.
+    #[serde(default)]
+    pub cdrom: CdRom,
+    /// SPU register file stub.
+    #[serde(default)]
+    pub spu: Spu,
 }
 
 /// Deserializes the RAM buffer, rejecting snapshots whose length is not the
@@ -417,6 +487,11 @@ pub struct PsxCore {
     dma: Dma,
     irq: Irq,
     timers: Timers,
+    memctrl: MemCtrl,
+    cache_ctrl: CacheCtrl,
+    sio0: Sio0,
+    cdrom: CdRom,
+    spu: Spu,
     paused: bool,
     controllers: [u16; 2],
 }
@@ -438,6 +513,11 @@ impl PsxCore {
             dma: Dma::new(),
             irq: Irq::new(),
             timers: Timers::new(),
+            memctrl: MemCtrl::new(),
+            cache_ctrl: CacheCtrl::new(),
+            sio0: Sio0::new(),
+            cdrom: CdRom::new(),
+            spu: Spu::new(),
             paused: false,
             controllers: [0; 2],
         }
@@ -626,6 +706,11 @@ impl PsxCore {
             dma: &mut self.dma,
             irq: &mut self.irq,
             timers: &mut self.timers,
+            memctrl: &mut self.memctrl,
+            cache_ctrl: &mut self.cache_ctrl,
+            sio0: &mut self.sio0,
+            cdrom: &mut self.cdrom,
+            spu: &mut self.spu,
         };
         step(&mut self.cpu, &mut bus);
     }
@@ -709,6 +794,11 @@ impl PsxCore {
             dma: self.dma.clone(),
             irq: self.irq.clone(),
             timers: self.timers.clone(),
+            memctrl: self.memctrl.clone(),
+            cache_ctrl: self.cache_ctrl.clone(),
+            sio0: self.sio0.clone(),
+            cdrom: self.cdrom.clone(),
+            spu: self.spu.clone(),
         }
     }
 
@@ -728,6 +818,11 @@ impl PsxCore {
         self.dma = snap.dma.clone();
         self.irq = snap.irq.clone();
         self.timers = snap.timers.clone();
+        self.memctrl = snap.memctrl.clone();
+        self.cache_ctrl = snap.cache_ctrl.clone();
+        self.sio0 = snap.sio0.clone();
+        self.cdrom = snap.cdrom.clone();
+        self.spu = snap.spu.clone();
     }
 }
 
@@ -870,6 +965,11 @@ mod tests {
                 dma: &mut core.dma,
                 irq: &mut core.irq,
                 timers: &mut core.timers,
+                memctrl: &mut core.memctrl,
+                cache_ctrl: &mut core.cache_ctrl,
+                sio0: &mut core.sio0,
+                cdrom: &mut core.cdrom,
+                spu: &mut core.spu,
             };
             // Fill red 16x16 at (0,0) through the GP0 port.
             bus.store32(0x1F80_1810, 0x0200_00FF);
@@ -892,6 +992,11 @@ mod tests {
                 dma: &mut core.dma,
                 irq: &mut core.irq,
                 timers: &mut core.timers,
+                memctrl: &mut core.memctrl,
+                cache_ctrl: &mut core.cache_ctrl,
+                sio0: &mut core.sio0,
+                cdrom: &mut core.cdrom,
+                spu: &mut core.spu,
             };
             bus.load32(0x1F80_1814)
         };
@@ -909,6 +1014,11 @@ mod tests {
             dma: &mut core.dma,
             irq: &mut core.irq,
             timers: &mut core.timers,
+            memctrl: &mut core.memctrl,
+            cache_ctrl: &mut core.cache_ctrl,
+            sio0: &mut core.sio0,
+            cdrom: &mut core.cdrom,
+            spu: &mut core.spu,
         };
         bus.store32(0x1F80_1074, 0x1); // I_MASK = VBlank
         assert_eq!(bus.load32(0x1F80_1074), 0x1);
