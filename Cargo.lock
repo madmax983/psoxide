@@ -1500,6 +1500,7 @@ dependencies = [
  "pixels",
  "psoxide-config",
  "psoxide-core",
+ "psoxide-test-harness",
  "winit",
 ]
 

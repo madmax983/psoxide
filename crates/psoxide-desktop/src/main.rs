@@ -41,6 +41,10 @@ enum CliCommand {
         /// Optional PSX-EXE to side-load (currently a stub).
         #[arg(long)]
         exe: Option<PathBuf>,
+        /// Optional disc image to mount: a `.cue` sheet (parsed with its BIN
+        /// tracks) or a raw MODE2/2352 `.bin` (single data track).
+        #[arg(long)]
+        disc: Option<PathBuf>,
         /// Window scale factor.
         #[arg(long, default_value = "2")]
         scale: u32,
@@ -61,9 +65,10 @@ fn main() -> Result<()> {
         CliCommand::Run {
             bios,
             exe,
+            disc,
             scale,
             config,
-        } => cmd_run(&bios, exe.as_deref(), scale, &config),
+        } => cmd_run(&bios, exe.as_deref(), disc.as_deref(), scale, &config),
         CliCommand::Info { bios } => cmd_info(&bios),
     }
 }
@@ -81,7 +86,13 @@ fn cmd_info(bios_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(bios_name: &str, exe: Option<&Path>, scale: u32, config_path: &Path) -> Result<()> {
+fn cmd_run(
+    bios_name: &str,
+    exe: Option<&Path>,
+    disc: Option<&Path>,
+    scale: u32,
+    config_path: &Path,
+) -> Result<()> {
     let config = PsxConfig::load(config_path).unwrap_or_default();
     let bios_path = config.resolve_disc(bios_name);
     let bios_data = fs::read(&bios_path)
@@ -96,6 +107,13 @@ fn cmd_run(bios_name: &str, exe: Option<&Path>, scale: u32, config_path: &Path) 
             .with_context(|| format!("failed to read EXE: {}", exe_path.display()))?;
         core.execute(Command::LoadExe(exe_data))
             .map_err(|e| anyhow::anyhow!("failed to load EXE: {e}"))?;
+    }
+
+    if let Some(disc_path) = disc {
+        let disc = psoxide_test_harness::disc::load_disc(disc_path)
+            .with_context(|| format!("failed to load disc: {}", disc_path.display()))?;
+        core.execute(Command::LoadDisc(disc))
+            .map_err(|e| anyhow::anyhow!("failed to mount disc: {e}"))?;
     }
 
     let event_loop = EventLoop::new().context("failed to create event loop")?;

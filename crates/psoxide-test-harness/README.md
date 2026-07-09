@@ -75,6 +75,36 @@ The four `ps1-tests` CPU binaries these gates use are **vendored** (MIT) under
 attribution and per-file SHA1s. They now run every `cargo test`; the gates assert
 end-to-end execution, not (yet) a full golden match.
 
+## CD-ROM gate (synthetic fixtures, no external assets)
+
+- **`src/disc.rs`** — a dependency-free (`std`-only) CUE/BIN parser. `parse_cue`
+  reads a `.cue` sheet, loads its `FILE "…bin" BINARY` tracks (`MODE1/2/2352`
+  and `AUDIO`), and converts each `INDEX 01 mm:ss:ff` to a track `start_lba`
+  (`(mm*60+ss)*75+ff`, plus the file's sector offset) — no pregap is subtracted
+  here, matching how `cdrom.rs` maps `lba*2352` into the raw image. `load_disc`
+  also accepts a bare `.bin` as a single MODE2/2352 data track. Malformed sheets
+  and missing BINs return a `DiscError`, never panic. Reused by the desktop
+  `--disc` flag.
+- **`tests/cdrom.rs`** — the end-to-end integration gate. It generates a tiny
+  synthetic MODE2/2352 BIN + `.cue` at runtime (each sector's 2048-byte user
+  area tagged with a 4-byte magic + the sector number; **no real/game disc data
+  is committed**), parses it through `disc::parse_cue`, mounts it via
+  `Command::LoadDisc`, and then drives the **assembled** core at the register
+  level: Setmode → Setloc(sector 2) → ReadN, ticking until the per-sector INT1
+  fires and asserting the CD interrupt reached `I_STAT` bit 2. It reads the 2048
+  bytes back through the data FIFO (BFRD) and again via **DMA channel 3** into
+  RAM, checking the delivered pattern both ways, plus GetTN, the GetID SCEA
+  (disc) / INT5 (no-disc) responses, and the CUE parser's track/audio/error
+  handling. Tick loops are bounded so a bug fails fast instead of hanging CI.
+- **ps1-tests `cdrom` binaries are deliberately NOT vendored as a gate.** None is
+  cleanly headless against psoxide's approximate-timing controller: `timing`
+  measures exact per-sector cycle counts (psoxide is ~1 cycle/instruction),
+  `terminal`/`volume-regs`/`disc-swap` need interactive serial / gamepad / lid
+  (shell-open) input, and `getloc` needs INT2/3/5-ack HLE the CPU-test loop does
+  not provide. The synthetic-fixture integration test above plus the `cdrom.rs`
+  unit tests cover the controller instead. (`getloc` is the natural first vendor
+  candidate if that INT-ack HLE is added later.)
+
 ## Amidog `psxtest_cpu` (env-gated, NOT vendored)
 
 Amidog `psxtest_cpu` is **CC BY-NC-SA 3.0** (non-commercial + share-alike), which

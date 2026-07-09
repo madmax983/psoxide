@@ -182,13 +182,24 @@ fn io_access_bitwidth_runs_to_completion() {
     }
 
     // Guard the aggregate count so device-accuracy work can only raise it: at
-    // least 28 of the 67 golden lines match today. The remaining rows need
+    // least 27 of the 67 golden lines match today. The remaining rows need
     // per-device narrow-access width semantics psoxide does not model yet — DMA
     // register 32-bit-only reads, JOY/SIO/IRQ/timer/CDROM/GPU/MDEC/SPU
     // width-adaptation, expansion open-bus, and a real BIOS image for the BIOS
     // row (see the test-harness README). None of these are data bus errors: the
     // only `io-access-bitwidth` traps are the misaligned-word address errors
     // above.
+    //
+    // The `CDROM_STAT` golden rows are among the width-adaptation ones psoxide
+    // does not reproduce: a real CD-ROM is an 8-bit device that mirrors the
+    // addressed status byte across a 16/32-bit read, whereas the controller
+    // composes the read from the four consecutive ports (status/response/data/
+    // flag). The sweep's decomposed multi-byte writes also latch a command byte
+    // into `0x1F80_1801`, so `BUSYSTS` reads set for the command-latency window.
+    // The inert pre-controller stub matched one of these rows by accident (it
+    // dropped those writes and never went busy); the real controller does not,
+    // which is a faithful-model change, not a bus regression. Accurate
+    // narrow-access CD reads + brief `BUSYSTS` timing would raise this back.
     let golden = String::from_utf8(fixture("cpu/io-access-bitwidth/psx.log")).unwrap();
     let matched = golden
         .lines()
@@ -196,8 +207,8 @@ fn io_access_bitwidth_runs_to_completion() {
         .filter(|l| produced.contains(l))
         .count();
     assert!(
-        matched >= 28,
-        "io-access-bitwidth golden match regressed: {matched} < 28"
+        matched >= 27,
+        "io-access-bitwidth golden match regressed: {matched} < 27"
     );
 }
 

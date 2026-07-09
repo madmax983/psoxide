@@ -629,6 +629,52 @@ impl PsxCore {
         self.irq.set(IrqLine::VBlank);
     }
 
+    /// Builds a transient [`CoreBus`] borrowing every peripheral, for one-off
+    /// bus accesses that are not part of a CPU instruction step.
+    fn core_bus(&mut self) -> CoreBus<'_> {
+        CoreBus {
+            mem: &mut self.mem,
+            gpu: &mut self.gpu,
+            dma: &mut self.dma,
+            irq: &mut self.irq,
+            timers: &mut self.timers,
+            memctrl: &mut self.memctrl,
+            cache_ctrl: &mut self.cache_ctrl,
+            sio0: &mut self.sio0,
+            cdrom: &mut self.cdrom,
+            spu: &mut self.spu,
+        }
+    }
+
+    /// Performs an 8-bit store through the full system bus, routing to device
+    /// registers exactly as a CPU `sb` would.
+    ///
+    /// This is the frontend/integration seam for driving memory-mapped
+    /// peripherals (e.g. the CD-ROM controller at `0x1F80_1800..=0x1F80_1803`)
+    /// without hand-assembling guest code.
+    pub fn store8(&mut self, addr: u32, value: u8) {
+        self.core_bus().store8(addr, value);
+    }
+
+    /// Performs a 32-bit store through the full system bus (device routing
+    /// included), exactly as a CPU `sw` would. Used to program the DMA and
+    /// interrupt-controller register files from a frontend/test.
+    pub fn store32(&mut self, addr: u32, value: u32) {
+        self.core_bus().store32(addr, value);
+    }
+
+    /// Performs an 8-bit load through the full system bus, popping device FIFOs
+    /// exactly as a CPU `lb` would.
+    pub fn load8(&mut self, addr: u32) -> u8 {
+        self.core_bus().load8(addr)
+    }
+
+    /// Performs a 32-bit load through the full system bus (device routing
+    /// included), exactly as a CPU `lw` would.
+    pub fn load32(&mut self, addr: u32) -> u32 {
+        self.core_bus().load32(addr)
+    }
+
     /// Executes a single command.
     ///
     /// # Errors

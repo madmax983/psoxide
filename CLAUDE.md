@@ -28,8 +28,29 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   lines, VRAM↔VRAM and CPU↔VRAM transfers. `framebuffer_rgba()` renders the real
   display area from VRAM (15bpp full; 24bpp best-effort)
 - DMA (`dma.rs`): register file for all 7 channels; channel 2 (GPU: linked-list
-  + block, both directions) and channel 6 (OTC) execute synchronously and raise
-  the DMA interrupt via DICR
+  + block, both directions), channel 3 (CD-ROM: device→RAM block copy pulling
+  sector words from the CD data FIFO), and channel 6 (OTC) execute synchronously
+  and raise the DMA interrupt via DICR
+- CD-ROM (`cdrom.rs`): a real sub-controller at 0x1F80_1800..0x1F80_1803 (not
+  the old read-back stub). Index-banked register file with parameter/response/
+  data FIFOs; a command state machine (Getstat, Setloc, Play, ReadN/ReadS,
+  MotorOn, Stop, Pause, Init, Mute/Demute, Setfilter, Setmode, Getparam,
+  GetlocL/GetlocP, GetTN/GetTD, SeekL/SeekP, Test, GetID, ReadTOC); and an
+  ordered INT1–INT5 response queue that latches only after the previous
+  interrupt is acknowledged, raising the CD interrupt (`IrqLine::CdRom` →
+  I_STAT bit 2) when enabled by the IE register. Timing is approximate: first/
+  second response latency `FIRST_RESP_DELAY`/`SECOND_RESP_DELAY` (50_000 CPU
+  cycles each) and a per-sector read period `READ_PERIOD_SINGLE` 451_584 /
+  `READ_PERIOD_DOUBLE` 225_792 cycles (1x/2x), ticked from `Cdrom::tick` in the
+  step loop. Discs are BIN/CUE MODE2/2352 images mounted via
+  `Command::LoadDisc(Disc)` / ejected via `Command::EjectDisc`; a sector's user
+  data (2048 bytes at raw offset 24, or 2340 at offset 12 when Setmode bit5 is
+  set) is delivered to the CPU through the data FIFO (BFRD request) and to RAM
+  through DMA channel 3. MSF↔LBA use a 150-sector pregap; per-sector reads emit
+  INT1, and GetID reports the SCEA data-disc response (INT2) or the no-disc
+  error (INT5). The frontend/harness `disc` module (psoxide-test-harness) parses
+  `.cue` sheets + their `.bin` tracks into a core `Disc`; the desktop `--disc`
+  flag mounts one at startup
 - Interrupt controller (`irq.rs`): I_STAT/I_MASK; VBlank raised once per
   `StepFrame`
 - Hardware timers (`timers.rs`): the three root counters at
@@ -41,25 +62,34 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   cover the memory-mapped regions a real BIOS touches during boot but for which
   no real emulation exists yet: memory-control (0x1F80_1000..0x1F80_1023 + the
   RAM_SIZE register at 0x1F80_1060), cache-control (0xFFFE_0130), SIO0 /
-  joypad (0x1F80_1040..0x1F80_105F, "no controller attached" defaults), CD-ROM
-  status/response/data/interrupt ports (0x1F80_1800..0x1F80_1803, reports "no
-  disc, not busy"), and the SPU register window (0x1F80_1C00..0x1F80_1FFF).
-  No side effects, no DMA/IRQ delivery — the goal is only that BIOS init
-  sequences do not FIFO-desync or panic on unmapped-region reads. SPUSTAT is
-  synthesized to mirror the low six bits of SPUCNT the way real hardware does
+  joypad (0x1F80_1040..0x1F80_105F, "no controller attached" defaults), and the
+  SPU register window (0x1F80_1C00..0x1F80_1FFF). No side effects, no DMA/IRQ
+  delivery — the goal is only that BIOS init sequences do not FIFO-desync or
+  panic on unmapped-region reads. SPUSTAT is synthesized to mirror the low six
+  bits of SPUCNT the way real hardware does. (The CD-ROM ports
+  0x1F80_1800..0x1F80_1803 are no longer a stub here — see the real `cdrom.rs`
+  controller above)
 
 ## Not Yet Implemented
 
 - GTE (cop2) — decoded but ignored
 - SPU (audio — register-file stub in `iostubs.rs` reads back what the BIOS
   writes but produces no audio; there is no envelope, voice, or reverb engine)
-- CD-ROM (register-file stub in `iostubs.rs` reports "no disc, not busy" so
-  BIOS status polls do not wedge; no commands are executed, no disc image is
-  loaded, no CD IRQ is delivered)
-- Coprocessor-unusable exception (ExcCode 0x0B) and instruction/data bus-error
-  exceptions (ExcCode 0x06) — coprocessor and unmapped accesses do not trap yet
-- SPU (audio — stubbed silent)
-- CD-ROM
+- CD-ROM audio + fine timing (the controller in `cdrom.rs` is real — see
+  "Hardware Emulated"): what stays stubbed is XA-ADPCM / CD-DA audio playback
+  (Play/Setfilter/Mute are accepted but decode no samples and drive no SPU),
+  subchannel Q beyond the GetlocL/GetlocP position bytes, and cycle-accurate
+  seek/read timing (the read/response latencies are approximate constants, not
+  measured mechanics). Narrow (8/16-bit) reads of the CD ports compose from the
+  four consecutive ports rather than mirroring the addressed 8-bit register, and
+  BUSYSTS is held for the whole command-latency window — both visible in the
+  ps1-tests `io-access-bitwidth` `CDROM_STAT` rows. The upstream JaCzekanski
+  ps1-tests `cdrom` binaries are **not** vendored as a gate: none are cleanly
+  headless against an approximate-timing controller (`timing` measures exact
+  cycle counts, `terminal`/`volume-regs`/`disc-swap` need interactive serial /
+  gamepad / lid-open input, `getloc` needs INT-ack HLE the CPU-test loop lacks);
+  CD-ROM is covered instead by `cdrom.rs` unit tests + the synthetic-fixture
+  integration test `crates/psoxide-test-harness/tests/cdrom.rs`
 - Coprocessor-unusable exception (ExcCode 0x0B): implemented for every
   coprocessor op. The decoder gives COP1 (0x11), COP3 (0x13), the LWCx/SWCx
   coprocessor load/stores (0x30-0x33 / 0x38-0x3B), and unassigned COP0 commands
@@ -112,7 +142,8 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 - 24bpp display output is best-effort
 - Semi-transparency, dithering, and the mask bit are stored in GPUSTAT but not
   applied during rasterization
-- DMA channels other than 2 (GPU) and 6 (OTC) are register-only (no transfer)
+- DMA channels other than 2 (GPU), 3 (CD-ROM), and 6 (OTC) are register-only
+  (no transfer)
 - Interrupt delivery uses the single cop0 IP2 line; VBlank timing is one pulse
   per `StepFrame` rather than cycle-accurate
 
@@ -169,6 +200,11 @@ pwsh scripts/verus-check.ps1
    asserts tiered progress (PC advance, display enable / VRAM touch, and a
    framebuffer color-distribution check). No boot claim is made without a
    real BIOS image driving the gated test to green
-3. Boots a real game from a disc image
+3. Boots a real game from a disc image **[in progress]** — a real CD-ROM
+   controller (`cdrom.rs`) now mounts BIN/CUE MODE2/2352 discs via
+   `Command::LoadDisc`, executes the BIOS/runtime command set, and delivers
+   sectors through the data FIFO and DMA channel 3 (see the CD-ROM entry under
+   "Hardware Emulated"). Still needed for an actual game boot: the BIOS kernel /
+   CD-ROM boot path and SPU audio
 
 Test resources: Amidog PSX CPU/GTE tests, JaCzekanski `ps1-tests`, PeterLemon PSX demos.

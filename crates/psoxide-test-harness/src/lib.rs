@@ -8,6 +8,8 @@
 //! PeterLemon PSX demos) would live under `tests/roms/` and be driven through
 //! [`Harness::load_bios`]. See `README.md`.
 
+pub mod disc;
+
 use psoxide_core::{
     COP0_CAUSE, COP0_EPC, COP0_SR, Command, CoreQuery, CpuSnapshot, PsxCore, QueryResult,
 };
@@ -113,6 +115,16 @@ impl Harness {
     /// Propagates [`psoxide_core::CoreError`] on a wrong-sized image.
     pub fn load_bios(&mut self, image: Vec<u8>) -> Result<(), psoxide_core::CoreError> {
         self.core.execute(Command::LoadBios(image))
+    }
+
+    /// Inserts a disc into the CD-ROM drive (`Command::LoadDisc`).
+    pub fn load_disc(&mut self, disc: psoxide_core::Disc) {
+        let _ = self.core.execute(Command::LoadDisc(disc));
+    }
+
+    /// Ejects the currently inserted disc, if any (`Command::EjectDisc`).
+    pub fn eject_disc(&mut self) {
+        let _ = self.core.execute(Command::EjectDisc);
     }
 
     /// Runs `n` CPU instructions.
