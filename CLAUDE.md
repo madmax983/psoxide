@@ -53,10 +53,17 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 - Instruction/data bus-error exceptions (ExcCode 0x06) — unmapped accesses do
   not trap yet
 - BIOS exception-dispatch chain — the core exception path (vectors/EPC/rfe/
-  syscall) is complete, but there is no BIOS kernel to dispatch a program's
-  registered exception/interrupt handlers. The test harness HLEs the minimal
-  BIOS handler (syscall EnterCriticalSection/ExitCriticalSection, interrupt ack)
-  for side-loaded CPU tests; it does not run program-registered handlers
+  syscall) is complete, but there is no BIOS kernel in psoxide-core to dispatch a
+  program's registered exception/interrupt handlers. The test harness HLEs the
+  minimal BIOS handler (syscall EnterCriticalSection/ExitCriticalSection,
+  interrupt ack) for side-loaded CPU tests, and now also HLEs the
+  **exception-dispatch chain** for programs that register an "unresolved
+  exception" handler via the A0[0x40]/RAM-0x300 hook (as the ps1-tests runtime
+  does): it stands up the kernel Process/Thread globals (`*(*(Process**)0x108)`),
+  saves context to the TCB, runs the registered handler, and resumes at the
+  handler's chosen return PC. This makes the `cpu/cop` "Disabled" cases observe
+  their traps. This is harness test-infra only — psoxide-core still has no BIOS
+  kernel
 - PSX-EXE side-loading (core `Command::LoadExe` is accepted as a no-op; the
   test harness has a standalone PS-EXE sideloader, `Harness::load_exe`, used for
   CPU tests. The core no-op is retained to avoid duplicating the harness
