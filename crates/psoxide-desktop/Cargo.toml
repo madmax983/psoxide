@@ -13,5 +13,6 @@ psoxide-core = { path = "../psoxide-core" }
 psoxide-config = { path = "../psoxide-config" }
 pixels = "0.15"
 winit = "0.30"
+gilrs = "0.11"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

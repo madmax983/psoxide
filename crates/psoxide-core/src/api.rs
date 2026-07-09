@@ -712,6 +712,9 @@ impl PsxCore {
                 if let Some(slot) = self.controllers.get_mut(port as usize) {
                     *slot = buttons;
                 }
+                // Feed the held buttons into the SIO0 pad so a transfer reads
+                // them out. `set_buttons` ignores out-of-range ports.
+                self.sio0.set_buttons(port as usize, buttons);
             }
             Command::Pause => self.paused = true,
             Command::Resume => self.paused = false,
@@ -749,6 +752,10 @@ impl PsxCore {
         // Advance the CD-ROM controller so a queued command response can latch
         // and raise its interrupt this cycle.
         self.cdrom.tick(1, &mut self.irq);
+
+        // Advance the SIO0 controller ACK timer by the same cycle, so a
+        // scheduled controller /ACK can raise IRQ7 at this instruction boundary.
+        self.sio0.tick(1, &mut self.irq);
 
         // Deliver a pending, unmasked hardware interrupt at the instruction
         // boundary before fetching the next instruction. With reset state

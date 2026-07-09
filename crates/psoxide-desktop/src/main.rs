@@ -7,14 +7,17 @@
 //! psoxide info scph1001.bin
 //! ```
 //!
-//! The PSX has no GPU emulation yet, so the window shows a placeholder
-//! gradient framebuffer. Audio is a silent no-op stub.
+//! The GPU is rendered via `framebuffer_rgba()` into a Pixels surface.
+//! Input is driven by the keyboard and, when present, a gamepad (via gilrs);
+//! both feed digital-pad state to controller port 0. Audio is a silent no-op
+//! stub.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use gilrs::{Button as PadButton, EventType, Gilrs};
 use pixels::{Pixels, SurfaceTexture};
 use psoxide_config::PsxConfig;
 use psoxide_core::{Button, Command, FRAME_HEIGHT, FRAME_WIDTH, PsxCore};
@@ -116,6 +119,15 @@ fn cmd_run(
             .map_err(|e| anyhow::anyhow!("failed to mount disc: {e}"))?;
     }
 
+    // Gamepad input via gilrs (optional — keyboard still works without one).
+    let gilrs = match Gilrs::new() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("Warning: gamepad support unavailable: {e}");
+            None
+        }
+    };
+
     let event_loop = EventLoop::new().context("failed to create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
@@ -125,6 +137,7 @@ fn cmd_run(
         buttons: 0,
         window: None,
         pixels: None,
+        gilrs,
     };
     event_loop.run_app(&mut app).context("event loop error")?;
     Ok(())
@@ -136,6 +149,8 @@ struct App {
     buttons: u16,
     window: Option<Window>,
     pixels: Option<Pixels<'static>>,
+    /// Gamepad input context (`None` when unavailable).
+    gilrs: Option<Gilrs>,
 }
 
 fn key_to_button(key: KeyCode) -> Option<Button> {
@@ -154,6 +169,33 @@ fn key_to_button(key: KeyCode) -> Option<Button> {
         KeyCode::ShiftRight => Some(Button::Select),
         _ => None,
     }
+}
+
+/// Maps a gilrs gamepad button to a PSX digital-pad button.
+///
+/// Standard SNES/PS-style layout:
+/// - D-pad Up/Down/Left/Right → Up/Down/Left/Right
+/// - South → Cross (✕), East → Circle (○), West → Square (□), North → Triangle (△)
+/// - Left trigger (or bumper) → L1, Right trigger (or bumper) → R1
+/// - Start → Start, Select → Select
+///
+/// Returns `None` for buttons with no PSX equivalent.
+fn pad_button_to_psx(button: PadButton) -> Option<Button> {
+    Some(match button {
+        PadButton::DPadUp => Button::Up,
+        PadButton::DPadDown => Button::Down,
+        PadButton::DPadLeft => Button::Left,
+        PadButton::DPadRight => Button::Right,
+        PadButton::South => Button::Cross,
+        PadButton::East => Button::Circle,
+        PadButton::West => Button::Square,
+        PadButton::North => Button::Triangle,
+        PadButton::LeftTrigger | PadButton::LeftTrigger2 => Button::L1,
+        PadButton::RightTrigger | PadButton::RightTrigger2 => Button::R1,
+        PadButton::Start => Button::Start,
+        PadButton::Select => Button::Select,
+        _ => return None,
+    })
 }
 
 impl ApplicationHandler for App {
@@ -225,6 +267,35 @@ impl ApplicationHandler for App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Drain gamepad events into the port-0 button bitfield, mirroring the
+        // keyboard path's whole-bitfield `SetControllerState` update.
+        if let Some(gilrs) = &mut self.gilrs {
+            let mut changed = false;
+            while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
+                let (pad_button, pressed) = match event {
+                    EventType::ButtonPressed(b, _) => (b, true),
+                    EventType::ButtonReleased(b, _) => (b, false),
+                    _ => continue,
+                };
+                if let Some(button) = pad_button_to_psx(pad_button) {
+                    if pressed {
+                        self.buttons |= button.bit_mask();
+                    } else {
+                        self.buttons &= !button.bit_mask();
+                    }
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = self.core.execute(Command::SetControllerState {
+                    port: 0,
+                    buttons: self.buttons,
+                });
+            }
         }
     }
 }

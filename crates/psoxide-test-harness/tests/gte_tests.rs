@@ -11,14 +11,22 @@
 //!
 //! The companion `gte-fuzz` binary is *not* vendored here: it is an interactive
 //! program whose "VALID CMD FUZZ" golden (`gte_valid_*.log`) is only produced
-//! when the user presses **Start** on a controller. The headless harness has no
-//! controller-input HLE (the SIO0/joypad stub reports "no controller attached"),
-//! so the binary defaults to its single-command mode and blocks on `VSync`
-//! before ever reaching the valid-command phase the golden captures. Driving it
-//! would require a controller-injection feature orthogonal to the GTE. The
-//! `gte/test-all` gate already exercises all 1150 vectors on-device, and the
-//! out-of-band replay harness cross-checks the same vectors directly against
-//! `psoxide_core::Gte`.
+//! when the user presses **Start** on a controller. The SIO0/joypad stub now
+//! models the real digital-pad serial protocol and clocks out button input set
+//! via `Command::SetControllerState` (see `tests/sio0_joypad.rs`), so a headless
+//! driver *could* script the Start press the fuzzer waits on. Full headless
+//! `gte-fuzz` still is not wired for two concrete reasons: (1) the `gte-fuzz`
+//! binary is not vendored in `tests/fixtures/` (nor is Amidog `psxtest_gte`,
+//! which is CC BY-NC-SA), so there is nothing to drive; and (2) even with the
+//! binary present, its pass criterion is a golden-log capture of the
+//! valid-command phase gated on `VSync`/VBlank timing rather than a TTY
+//! `pass -`/`Done.` marker the harness can assert, so it needs the out-of-band
+//! golden-replay path rather than an in-tree gate. Should the binary be
+//! vendored later, a driver would `SetControllerState { port: 0, buttons:
+//! Start }`, pump `run_hle` with periodic `raise_vblank()`, and diff the
+//! captured TTY against `gte_valid_*.log`. Meanwhile the `gte/test-all` gate
+//! already exercises all 1150 vectors on-device, and the out-of-band replay
+//! harness cross-checks the same vectors directly against `psoxide_core::Gte`.
 
 use psoxide_test_harness::Harness;
 use std::path::PathBuf;
