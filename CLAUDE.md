@@ -9,7 +9,10 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   - Extract framebuffer: `core.framebuffer_rgba()` (renders the GPU display area from VRAM, 320x240 RGBA)
   - All state serializable for snapshots (`save_state`/`load_state`)
 - **psoxide-config**: TOML config, `PsxConfig::load_or_default()`
-- **psoxide-desktop**: CLI frontend. Winit + Pixels. Silent audio stub.
+- **psoxide-desktop**: CLI frontend. Winit + Pixels; the GPU is rendered via
+  `framebuffer_rgba()` (no placeholder gradient). Keyboard and gilrs gamepad input
+  both drive controller port 0 through `Command::SetControllerState`. Silent audio
+  stub.
 - **psoxide-proof**: Verus proof scaffold (checked out-of-band; see below).
 - **psoxide-test-harness**: Program/ROM-based integration tests.
 
@@ -66,8 +69,10 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   cover the memory-mapped regions a real BIOS touches during boot but for which
   no real emulation exists yet: memory-control (0x1F80_1000..0x1F80_1023 + the
   RAM_SIZE register at 0x1F80_1060), cache-control (0xFFFE_0130), SIO0 /
-  joypad (0x1F80_1040..0x1F80_105F, "no controller attached" defaults), and the
-  SPU register window (0x1F80_1C00..0x1F80_1FFF). No side effects, no DMA/IRQ
+  joypad (0x1F80_1040..0x1F80_105F — now implements the digital-pad serial
+  protocol, clocking out real controller input set via
+  `Command::SetControllerState`), and the SPU register window
+  (0x1F80_1C00..0x1F80_1FFF). No side effects, no DMA/IRQ
   delivery — the goal is only that BIOS init sequences do not FIFO-desync or
   panic on unmapped-region reads. SPUSTAT is synthesized to mirror the low six
   bits of SPUCNT the way real hardware does. (The CD-ROM ports
