@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub mod disc;
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PsxConfig {

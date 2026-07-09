@@ -244,20 +244,21 @@ impl Cdrom {
         }
     }
 
-    /// Reads a 16-bit value (composed from two byte reads, little-endian).
+    /// Reads a 16-bit value. The CD-ROM registers are 8-bit; a wider read
+    /// reflects the single addressed register mirrored across the access width
+    /// (the byte-lane is replicated on the data bus), *not* a word composed from
+    /// the four adjacent ports. The addressed port is read only once, so any
+    /// FIFO-popping side effect happens a single time.
     pub fn read16(&mut self, phys: u32) -> u16 {
-        let lo = self.read8(phys);
-        let hi = self.read8(phys.wrapping_add(1));
-        u16::from_le_bytes([lo, hi])
+        let b = self.read8(phys);
+        u16::from_le_bytes([b, b])
     }
 
-    /// Reads a 32-bit value (composed from four byte reads, little-endian).
+    /// Reads a 32-bit value, mirroring the single addressed 8-bit register
+    /// across all four byte lanes (see [`Cdrom::read16`]).
     pub fn read32(&mut self, phys: u32) -> u32 {
-        let b0 = self.read8(phys);
-        let b1 = self.read8(phys.wrapping_add(1));
-        let b2 = self.read8(phys.wrapping_add(2));
-        let b3 = self.read8(phys.wrapping_add(3));
-        u32::from_le_bytes([b0, b1, b2, b3])
+        let b = self.read8(phys);
+        u32::from_le_bytes([b, b, b, b])
     }
 
     /// Pops four bytes from the data FIFO as a little-endian word (for DMA).
@@ -317,19 +318,24 @@ impl Cdrom {
         }
     }
 
-    /// Writes a 16-bit value (decomposed into two byte writes).
+    /// Writes a 16-bit value. As an 8-bit device, the CD-ROM latches each byte
+    /// of a wider store into the *same* addressed register in ascending order
+    /// (the memory controller issues repeated byte cycles to the one port); the
+    /// high byte therefore lands last. This is not a write spread across the
+    /// four adjacent ports — spreading it would spuriously latch the second byte
+    /// as a command/parameter and leave BUSYSTS set.
     pub fn write16(&mut self, phys: u32, val: u16) {
-        self.write8(phys, val as u8);
-        self.write8(phys.wrapping_add(1), (val >> 8) as u8);
-    }
-
-    /// Writes a 32-bit value (decomposed into four byte writes).
-    pub fn write32(&mut self, phys: u32, val: u32) {
         let b = val.to_le_bytes();
         self.write8(phys, b[0]);
-        self.write8(phys.wrapping_add(1), b[1]);
-        self.write8(phys.wrapping_add(2), b[2]);
-        self.write8(phys.wrapping_add(3), b[3]);
+        self.write8(phys, b[1]);
+    }
+
+    /// Writes a 32-bit value, latching all four bytes into the single addressed
+    /// register in ascending order (see [`Cdrom::write16`]).
+    pub fn write32(&mut self, phys: u32, val: u32) {
+        for b in val.to_le_bytes() {
+            self.write8(phys, b);
+        }
     }
 
     /// The status/index register byte (`0x1F80_1800` read).

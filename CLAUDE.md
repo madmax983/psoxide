@@ -48,9 +48,9 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   set) is delivered to the CPU through the data FIFO (BFRD request) and to RAM
   through DMA channel 3. MSF↔LBA use a 150-sector pregap; per-sector reads emit
   INT1, and GetID reports the SCEA data-disc response (INT2) or the no-disc
-  error (INT5). The frontend/harness `disc` module (psoxide-test-harness) parses
-  `.cue` sheets + their `.bin` tracks into a core `Disc`; the desktop `--disc`
-  flag mounts one at startup
+  error (INT5). The `disc` module (psoxide-config) parses `.cue` sheets + their
+  `.bin` tracks into a core `Disc`; the desktop `--disc` flag mounts one at
+  startup and the CD-ROM integration test uses it as a dev-dependency
 - Interrupt controller (`irq.rs`): I_STAT/I_MASK; VBlank raised once per
   `StepFrame`
 - Hardware timers (`timers.rs`): the three root counters at

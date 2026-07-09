@@ -110,7 +110,7 @@ fn cmd_run(
     }
 
     if let Some(disc_path) = disc {
-        let disc = psoxide_test_harness::disc::load_disc(disc_path)
+        let disc = psoxide_config::disc::load_disc(disc_path)
             .with_context(|| format!("failed to load disc: {}", disc_path.display()))?;
         core.execute(Command::LoadDisc(disc))
             .map_err(|e| anyhow::anyhow!("failed to mount disc: {e}"))?;

@@ -5,7 +5,7 @@
 //! system bus routing to `0x1F80_1800..=0x1F80_1803`, the per-cycle
 //! `Cdrom::tick` in the step loop, the CD interrupt landing on `I_STAT` bit 2,
 //! and DMA channel 3 pulling a sector out of the data FIFO into main RAM — all
-//! from a disc mounted through the CUE/BIN parser in [`psoxide_test_harness::disc`].
+//! from a disc mounted through the CUE/BIN parser in [`psoxide_config::disc`].
 //!
 //! No real BIOS is needed. The CPU runs a tiny self-looping program in RAM so
 //! that each `StepCpu` advances (and ticks) the CD-ROM controller without the
@@ -15,9 +15,9 @@
 
 use std::path::PathBuf;
 
+use psoxide_config::disc::{SECTOR_RAW, parse_cue};
 use psoxide_core::IrqLine;
 use psoxide_test_harness::Harness;
-use psoxide_test_harness::disc::{SECTOR_RAW, parse_cue};
 
 // ---- CD-ROM register map (physical) --------------------------------------
 
@@ -229,10 +229,7 @@ fn cue_parser_rejects_missing_bin() {
     std::fs::write(&cue, "FILE \"nope.bin\" BINARY\n  TRACK 01 MODE2/2352\n").unwrap();
     let err = parse_cue(&cue).expect_err("missing bin must error, not panic");
     // It should be an I/O error naming the missing file.
-    assert!(matches!(
-        err,
-        psoxide_test_harness::disc::DiscError::Io { .. }
-    ));
+    assert!(matches!(err, psoxide_config::disc::DiscError::Io { .. }));
     std::fs::remove_dir_all(&dir).ok();
 }
 

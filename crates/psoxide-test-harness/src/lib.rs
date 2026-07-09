@@ -8,8 +8,6 @@
 //! PeterLemon PSX demos) would live under `tests/roms/` and be driven through
 //! [`Harness::load_bios`]. See `README.md`.
 
-pub mod disc;
-
 use psoxide_core::{
     COP0_CAUSE, COP0_EPC, COP0_SR, Command, CoreQuery, CpuSnapshot, PsxCore, QueryResult,
 };
