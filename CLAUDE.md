@@ -30,7 +30,9 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 - DMA (7 channels)
 - Interrupts beyond the cop0 exception path
 - Hardware timers
-- PSX-EXE side-loading (`LoadExe` is accepted as a no-op)
+- PSX-EXE side-loading (core `Command::LoadExe` is accepted as a no-op; the
+  test harness has a standalone PS-EXE sideloader, `Harness::load_exe`, used for
+  CPU tests)
 
 ## Patterns
 
@@ -71,7 +73,7 @@ pwsh scripts/verus-check.ps1
 
 ## Test Tiers
 
-1. CPU instruction tests (Amidog `psxtest_cpu`, JaCzekanski `ps1-tests`) — gate before GPU
+1. CPU instruction tests **[tier-1 gate wired]** — PS-EXE sideloader + BIOS TTY HLE in psoxide-test-harness; always-on gate = synthetic PS-EXE self-test + spec-derived MIPS corner tests (`cpu_semantics.rs`). External reference suites (Amidog `psxtest_cpu` — CC BY-NC-SA, not vendored; JaCzekanski `ps1-tests` — MIT) are env-gated drivers pending timer/IRQ + BIOS syscall/exception handling to run end-to-end (see `crates/psoxide-test-harness/README.md`).
 2. GPU rendering tests — golden-frame comparison
 3. Full boot: BIOS boots to the shell/logo, then a real game boots from a disc image
 
