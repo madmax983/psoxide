@@ -9,10 +9,9 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   - Extract framebuffer: `core.framebuffer_rgba()` (renders the GPU display area from VRAM, 320x240 RGBA)
   - All state serializable for snapshots (`save_state`/`load_state`)
 - **psoxide-config**: TOML config, `PsxConfig::load_or_default()`
-- **psoxide-desktop**: CLI frontend. Winit + Pixels; the GPU is rendered via
-  `framebuffer_rgba()` (no placeholder gradient). Keyboard and gilrs gamepad input
-  both drive controller port 0 through `Command::SetControllerState`. Silent audio
-  stub.
+- **psoxide-desktop**: CLI frontend. Winit + Pixels + rodio (SPU audio
+  playback; falls back to silent if no audio device). Keyboard and gilrs gamepad
+  input both drive controller port 0 through `Command::SetControllerState`.
 - **psoxide-proof**: Verus proof scaffold (checked out-of-band; see below).
 - **psoxide-test-harness**: Program/ROM-based integration tests.
 
@@ -36,8 +35,22 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   24bpp best-effort)
 - DMA (`dma.rs`): register file for all 7 channels; channel 2 (GPU: linked-list
   + block, both directions), channel 3 (CD-ROM: device→RAM block copy pulling
-  sector words from the CD data FIFO), and channel 6 (OTC) execute synchronously
-  and raise the DMA interrupt via DICR
+  sector words from the CD data FIFO), channel 4 (SPU: bidirectional block copy
+  between main RAM and SPU sample RAM), and channel 6 (OTC) execute
+  synchronously and raise the DMA interrupt via DICR
+- SPU (`spu.rs`): a real 24-voice audio engine at 0x1F80_1C00..0x1F80_1FFF with
+  512KB sample RAM. ADPCM block decode (16-byte → 28-sample, shift + 4-tap
+  filter, LoopStart/LoopEnd/LoopRepeat + ENDX), the integer PSX-SPX ADSR
+  envelope (linear/exponential attack/decay/sustain/release), a 12-bit
+  fractional pitch counter with linear interpolation and pitch modulation
+  (PMON), a noise LFSR (NON) clocked from SPUCNT, per-voice + main stereo
+  volume, key-on/key-off, and the IRQ-on-address unit (`IrqLine::Spu` → I_STAT
+  bit 9). `Spu::tick` (in the step loop) emits one interleaved-stereo 44.1kHz
+  `i16` sample every 768 CPU cycles into a queue drained by
+  `PsxCore::drain_audio`; the desktop plays it through rodio. Transfers arrive
+  via the CPU transfer FIFO (0x1DA8) or DMA channel 4. Stubbed/simplified:
+  reverb DSP (registers stored + read back, no processing), CD-DA/XA mixing (a
+  silent input hook), and volume sweeps (fixed-volume mode is exact)
 - CD-ROM (`cdrom.rs`): a real sub-controller at 0x1F80_1800..0x1F80_1803 (not
   the old read-back stub). Index-banked register file with parameter/response/
   data FIFOs; a command state machine (Getstat, Setloc, Play, ReadN/ReadS,
@@ -68,22 +81,23 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 - I/O device stubs (`iostubs.rs`) — write-then-read-back register files that
   cover the memory-mapped regions a real BIOS touches during boot but for which
   no real emulation exists yet: memory-control (0x1F80_1000..0x1F80_1023 + the
-  RAM_SIZE register at 0x1F80_1060), cache-control (0xFFFE_0130), SIO0 /
+  RAM_SIZE register at 0x1F80_1060), cache-control (0xFFFE_0130), and SIO0 /
   joypad (0x1F80_1040..0x1F80_105F — now implements the digital-pad serial
   protocol, clocking out real controller input set via
-  `Command::SetControllerState`), and the SPU register window
-  (0x1F80_1C00..0x1F80_1FFF). No side effects, no DMA/IRQ
-  delivery — the goal is only that BIOS init sequences do not FIFO-desync or
-  panic on unmapped-region reads. SPUSTAT is synthesized to mirror the low six
-  bits of SPUCNT the way real hardware does. (The CD-ROM ports
-  0x1F80_1800..0x1F80_1803 are no longer a stub here — see the real `cdrom.rs`
-  controller above)
+  `Command::SetControllerState`). No side effects, no DMA/IRQ delivery — the
+  goal is only that BIOS init sequences do not FIFO-desync or panic on
+  unmapped-region reads. (The CD-ROM ports 0x1F80_1800..0x1F80_1803 and the SPU
+  window 0x1F80_1C00..0x1F80_1FFF are no longer stubs here — see the real
+  `cdrom.rs` and `spu.rs` controllers above)
 
 ## Not Yet Implemented
 
 - GTE (cop2) — decoded but ignored
-- SPU (audio — register-file stub in `iostubs.rs` reads back what the BIOS
-  writes but produces no audio; there is no envelope, voice, or reverb engine)
+- SPU reverb DSP (the `spu.rs` voice engine is real — see "Hardware Emulated";
+  what stays stubbed is the reverb processor: the 32 reverb registers are stored
+  and read back but drive no DSP), CD-DA/XA audio mixing into the SPU (a silent
+  input hook is present), and volume-sweep envelopes (fixed-volume mode is
+  exact; sweep mode is approximated to a near-full-scale constant)
 - CD-ROM audio + fine timing (the controller in `cdrom.rs` is real — see
   "Hardware Emulated"): what stays stubbed is XA-ADPCM / CD-DA audio playback
   (Play/Setfilter/Mute are accepted but decode no samples and drive no SPU),
@@ -157,12 +171,11 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 - 24bpp display output is best-effort
 - Semi-transparency, dithering, and the mask bit are stored in GPUSTAT but not
   applied during rasterization
-- DMA channels other than 2 (GPU), 3 (CD-ROM), and 6 (OTC) are register-only
-  (no transfer)
+- DMA channels other than 2 (GPU), 3 (CD-ROM), 4 (SPU), and 6 (OTC) are
+  register-only (no transfer)
 - Semi-transparency (all four blend modes), ordered dithering, and the mask bit
   (check-before-draw + set-while-drawing) are applied during rasterization for
   polygons, rectangles, and lines
-- DMA channels other than 2 (GPU) and 6 (OTC) are register-only (no transfer)
 - Interrupt delivery uses the single cop0 IP2 line; VBlank timing is one pulse
   per `StepFrame` rather than cycle-accurate
 
@@ -223,7 +236,8 @@ pwsh scripts/verus-check.ps1
    controller (`cdrom.rs`) now mounts BIN/CUE MODE2/2352 discs via
    `Command::LoadDisc`, executes the BIOS/runtime command set, and delivers
    sectors through the data FIFO and DMA channel 3 (see the CD-ROM entry under
-   "Hardware Emulated"). Still needed for an actual game boot: the BIOS kernel /
-   CD-ROM boot path and SPU audio
+   "Hardware Emulated"), and the SPU (`spu.rs`) synthesises audio. Still needed
+   for an actual game boot: the BIOS kernel / CD-ROM boot path (and SPU reverb /
+   CD-audio remain stubbed)
 
 Test resources: Amidog PSX CPU/GTE tests, JaCzekanski `ps1-tests`, PeterLemon PSX demos.

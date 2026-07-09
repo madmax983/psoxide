@@ -7,11 +7,14 @@
 //!
 //! * **Channel 2 (GPU)** — block and linked-list (ordering-table) transfers to
 //!   GP0, and block transfers from GPUREAD.
+//! * **Channel 3 (CD-ROM)** — device→RAM block copy from the CD-ROM data FIFO.
+//! * **Channel 4 (SPU)** — bidirectional block copy between main RAM and SPU
+//!   sample RAM through the SPU transfer address.
 //! * **Channel 6 (OTC)** — the ordering-table clear that seeds an empty linked
 //!   list in RAM for the GPU DMA to walk.
 //!
-//! The remaining channels (MDEC in/out, CD-ROM, SPU, PIO) are register-only:
-//! their MADR/BCR/CHCR read and write back but no transfer is performed.
+//! The remaining channels (MDEC in/out, PIO) are register-only: their
+//! MADR/BCR/CHCR read and write back but no transfer is performed.
 //!
 //! Transfers run synchronously on the CHCR "start" trigger; on completion the
 //! busy/trigger bits are cleared and, if enabled, a DMA interrupt is raised.
@@ -23,6 +26,7 @@ use crate::bus::MAIN_RAM_MASK;
 use crate::cdrom::Cdrom;
 use crate::gpu::Gpu;
 use crate::irq::{Irq, IrqLine};
+use crate::spu::Spu;
 
 /// Number of DMA channels.
 pub const CHANNELS: usize = 7;
@@ -31,6 +35,8 @@ pub const CHANNELS: usize = 7;
 pub const CH_GPU: usize = 2;
 /// CD-ROM DMA channel index.
 pub const CH_CDROM: usize = 3;
+/// SPU DMA channel index.
+pub const CH_SPU: usize = 4;
 /// OTC (ordering-table clear) DMA channel index.
 pub const CH_OTC: usize = 6;
 
@@ -89,6 +95,11 @@ impl Dma {
 
     /// Writes a 32-bit DMA register. Writing a CHCR whose start/trigger bits are
     /// set executes the channel's transfer synchronously.
+    // The DMA controller is the crossbar between main memory and every DMA-
+    // capable device, so a register write that may trigger a transfer genuinely
+    // needs mutable access to all of them (RAM, GPU, CD-ROM, SPU) plus the IRQ
+    // line — there is no smaller honest signature.
+    #[allow(clippy::too_many_arguments)]
     pub fn write32(
         &mut self,
         addr: u32,
@@ -96,6 +107,7 @@ impl Dma {
         mem: &mut Memory,
         gpu: &mut Gpu,
         cdrom: &mut Cdrom,
+        spu: &mut Spu,
         irq: &mut Irq,
     ) {
         match addr {
@@ -117,7 +129,7 @@ impl Dma {
                     0x8 => {
                         self.chcr[ch] = val;
                         if Self::is_triggered(val) {
-                            self.run_channel(ch, mem, gpu, cdrom, irq);
+                            self.run_channel(ch, mem, gpu, cdrom, spu, irq);
                         }
                     }
                     _ => {}
@@ -145,17 +157,44 @@ impl Dma {
         mem: &mut Memory,
         gpu: &mut Gpu,
         cdrom: &mut Cdrom,
+        spu: &mut Spu,
         irq: &mut Irq,
     ) {
         match ch {
             CH_GPU => self.run_gpu(ch, mem, gpu),
             CH_CDROM => self.run_cdrom(ch, mem, cdrom),
+            CH_SPU => self.run_spu(ch, mem, spu),
             CH_OTC => self.run_otc(ch, mem),
             _ => {}
         }
         // Clear the busy (24) and trigger (28) bits to signal completion.
         self.chcr[ch] &= !((1 << 24) | (1 << 28));
         self.raise_completion(ch, irq);
+    }
+
+    /// SPU DMA (channel 4): a bidirectional block copy between main RAM and SPU
+    /// sample RAM through the SPU transfer address. CHCR bit 0 selects the
+    /// direction (set = RAM→SPU, clear = SPU→RAM). Word count is `size * blocks`
+    /// from BCR.
+    fn run_spu(&mut self, ch: usize, mem: &mut Memory, spu: &mut Spu) {
+        let bcr = self.bcr[ch];
+        let size = bcr & 0xFFFF;
+        let blocks = (bcr >> 16) & 0xFFFF;
+        let words = size.max(1) * blocks.max(1);
+        let to_device = self.chcr[ch] & 0x1 != 0;
+        let step: i64 = if self.chcr[ch] & 0x2 != 0 { -4 } else { 4 };
+        let mut addr = self.madr[ch] & 0x1F_FFFC;
+        for _ in 0..words {
+            if to_device {
+                let word = read_ram(mem, addr);
+                spu.dma_write_word(word);
+            } else {
+                let word = spu.dma_read_word();
+                write_ram(mem, addr, word);
+            }
+            addr = (addr as i64 + step) as u32 & 0x1F_FFFC;
+        }
+        self.madr[ch] = addr;
     }
 
     /// CD-ROM DMA (channel 3): a device→RAM block copy that pulls sector words
@@ -305,19 +344,20 @@ mod tests {
     use super::*;
     use crate::gpu::rgb_to_bgr555;
 
-    fn setup() -> (Dma, Memory, Gpu, Cdrom, Irq) {
+    fn setup() -> (Dma, Memory, Gpu, Cdrom, Spu, Irq) {
         (
             Dma::new(),
             Memory::new(),
             Gpu::new(),
             Cdrom::new(),
+            Spu::new(),
             Irq::new(),
         )
     }
 
     #[test]
     fn otc_builds_descending_list() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
         // OTC over 4 entries starting at 0x100.
         dma.madr[CH_OTC] = 0x100;
         dma.bcr[CH_OTC] = 4;
@@ -328,6 +368,7 @@ mod tests {
             &mut mem,
             &mut gpu,
             &mut cdrom,
+            &mut spu,
             &mut irq,
         );
         assert_eq!(read_ram(&mem, 0x100), 0x0FC & 0xFF_FFFF); // → 0x0FC
@@ -340,7 +381,7 @@ mod tests {
 
     #[test]
     fn linked_list_dma_drives_gp0_fill() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
         // Build a one-node list at 0x200: header (count=3) + a fill command.
         // Fill red 16x16 at (0,0).
         write_ram(&mut mem, 0x200, (3 << 24) | 0x00FF_FFFF); // count 3, next=end
@@ -356,6 +397,7 @@ mod tests {
             &mut mem,
             &mut gpu,
             &mut cdrom,
+            &mut spu,
             &mut irq,
         );
         assert_eq!(gpu.vram_at(0, 0), rgb_to_bgr555(0xFF, 0, 0));
@@ -364,7 +406,7 @@ mod tests {
 
     #[test]
     fn block_dma_cpu_to_vram_loads_pixels() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
         // Prepare a CPU->VRAM image load header + pixel data in RAM.
         write_ram(&mut mem, 0x300, 0xA000_0000); // CPU->VRAM
         write_ram(&mut mem, 0x304, 0x0000_0000); // dst (0,0)
@@ -380,6 +422,7 @@ mod tests {
             &mut mem,
             &mut gpu,
             &mut cdrom,
+            &mut spu,
             &mut irq,
         );
         assert_eq!(gpu.vram_at(0, 0), 0xAAAA);
@@ -388,7 +431,7 @@ mod tests {
 
     #[test]
     fn dma_completion_raises_irq_when_enabled() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
         // Enable DMA IRQ for the OTC channel + master enable.
         dma.dicr = (1 << 23) | (1 << (16 + CH_OTC));
         dma.madr[CH_OTC] = 0x100;
@@ -399,6 +442,7 @@ mod tests {
             &mut mem,
             &mut gpu,
             &mut cdrom,
+            &mut spu,
             &mut irq,
         );
         assert!(irq.read_stat() & (1 << IrqLine::Dma.bit()) != 0);
@@ -407,13 +451,14 @@ mod tests {
 
     #[test]
     fn register_read_write_roundtrip() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
         dma.write32(
             0x1F80_1080,
             0x1234,
             &mut mem,
             &mut gpu,
             &mut cdrom,
+            &mut spu,
             &mut irq,
         ); // ch0 MADR
         assert_eq!(dma.read32(0x1F80_1080), 0x1234);
@@ -423,6 +468,7 @@ mod tests {
             &mut mem,
             &mut gpu,
             &mut cdrom,
+            &mut spu,
             &mut irq,
         );
         assert_eq!(dma.read32(0x1F80_10F0), 0xDEAD_BEEF);
@@ -430,7 +476,7 @@ mod tests {
 
     #[test]
     fn cdrom_dma_copies_data_fifo_to_ram() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
         // Stage 8 bytes in the CD-ROM sector buffer and load the data FIFO.
         cdrom.set_sector_buffer_for_test((0..8).collect());
         cdrom.write8(0x1F80_1803, 0x80); // BFRD: load data FIFO
@@ -444,10 +490,52 @@ mod tests {
             &mut mem,
             &mut gpu,
             &mut cdrom,
+            &mut spu,
             &mut irq,
         );
         assert_eq!(read_ram(&mem, 0x400), 0x0302_0100);
         assert_eq!(read_ram(&mem, 0x404), 0x0706_0504);
         assert_eq!(dma.chcr[CH_CDROM] & (1 << 24), 0);
+    }
+
+    #[test]
+    fn spu_dma_round_trips_ram_through_spu_ram() {
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
+        // Stage two words in main RAM and DMA them into SPU RAM (RAM→SPU).
+        write_ram(&mut mem, 0x500, 0x1122_3344);
+        write_ram(&mut mem, 0x504, 0x5566_7788);
+        // Point the SPU transfer address at SPU-RAM offset 0.
+        spu.write16(0x1F80_1DA6, 0);
+        dma.madr[CH_SPU] = 0x500;
+        dma.bcr[CH_SPU] = 2; // 2 words
+        // Block DMA, sync mode 1, direction RAM→device (bit0 set).
+        let chcr = (1 << 24) | 0x1 | (1 << 9);
+        dma.write32(
+            0x1F80_1080 + (CH_SPU as u32) * 0x10 + 0x8,
+            chcr,
+            &mut mem,
+            &mut gpu,
+            &mut cdrom,
+            &mut spu,
+            &mut irq,
+        );
+        assert_eq!(dma.chcr[CH_SPU] & (1 << 24), 0);
+
+        // Read them back out of SPU RAM into main RAM (SPU→RAM).
+        spu.write16(0x1F80_1DA6, 0); // rewind transfer address
+        dma.madr[CH_SPU] = 0x600;
+        dma.bcr[CH_SPU] = 2;
+        let chcr = (1 << 24) | (1 << 9); // direction device→RAM (bit0 clear)
+        dma.write32(
+            0x1F80_1080 + (CH_SPU as u32) * 0x10 + 0x8,
+            chcr,
+            &mut mem,
+            &mut gpu,
+            &mut cdrom,
+            &mut spu,
+            &mut irq,
+        );
+        assert_eq!(read_ram(&mem, 0x600), 0x1122_3344);
+        assert_eq!(read_ram(&mem, 0x604), 0x5566_7788);
     }
 }

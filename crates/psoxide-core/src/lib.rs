@@ -5,9 +5,9 @@
 //!
 //! This crate is the CPU + bus foundation of the emulator: the MIPS R3000A
 //! interpreter, coprocessor-0 basics, the segmented memory map, a software GPU
-//! with VRAM and a command FIFO, DMA (GPU + OTC + CD-ROM channels), the
-//! interrupt controller, the GTE (coprocessor 2) geometry engine, and the
-//! CD-ROM controller. The SPU (audio) is not yet implemented.
+//! with VRAM and a command FIFO, DMA (GPU + OTC + CD-ROM + SPU channels), the
+//! interrupt controller, the GTE (coprocessor 2) geometry engine, the CD-ROM
+//! controller, and the SPU (24-voice ADPCM audio).
 
 pub mod api;
 pub mod bus;
@@ -18,6 +18,7 @@ pub mod gpu;
 pub mod gte;
 pub mod iostubs;
 pub mod irq;
+pub mod spu;
 pub mod timers;
 
 pub use api::{
@@ -33,4 +34,5 @@ pub use dma::Dma;
 pub use gpu::Gpu;
 pub use gte::Gte;
 pub use irq::{Irq, IrqLine};
+pub use spu::Spu;
 pub use timers::Timers;

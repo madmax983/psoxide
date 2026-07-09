@@ -1,5 +1,6 @@
-//! End-to-end tests that exercise the memory-control / cache-control / SIO0 /
-//! CD-ROM / SPU stubs via a hand-assembled MIPS program running on the real
+//! End-to-end tests that exercise the memory-control / cache-control / SIO0
+//! stubs (plus the register-facing surface of the real CD-ROM and SPU
+//! controllers) via a hand-assembled MIPS program running on the real
 //! [`PsxCore`] bus.
 //!
 //! These verify that the stubs are correctly wired into

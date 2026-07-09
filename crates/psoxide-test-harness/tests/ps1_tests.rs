@@ -107,7 +107,7 @@ fn code_in_io_executes_code_from_ram() {
     //     to code fetch (no exception); psoxide backs those registers, so the
     //     copied `jr $ra` is read back and executes.
     //   * testCodeInSPU — the SPU register block also responds to a code fetch on
-    //     hardware; psoxide now backs the SPU register file (`iostubs::Spu`), so
+    //     hardware; psoxide now backs the SPU register file (`spu::Spu`), so
     //     `fetch_ok` treats it as a legal fetch source and the copied `jr $ra`
     //     reads back and executes. This is the full 7/7 set — a byte-for-byte
     //     match against the vendored `psx.log` golden.

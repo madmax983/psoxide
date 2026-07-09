@@ -2,11 +2,12 @@
 //! do not yet have real emulation.
 //!
 //! These modules cover the memory-mapped register regions Nocash PSX-SPX
-//! documents (memory control, cache control, SIO0 joypad, CD-ROM, SPU) so a
-//! real BIOS image can perform its startup register writes without triggering
-//! FIFO desync, panics, or bogus reads. Each stub owns a small backing store
-//! and returns the last value written; reads from unwritten offsets return
-//! documented power-on defaults.
+//! documents (memory control, cache control, SIO0 joypad) so a real BIOS image
+//! can perform its startup register writes without triggering FIFO desync,
+//! panics, or bogus reads. Each stub owns a small backing store and returns the
+//! last value written; reads from unwritten offsets return documented power-on
+//! defaults. (The CD-ROM and SPU windows are no longer stubs — see the real
+//! `cdrom` and `spu` controllers.)
 //!
 //! Only the write-then-read-back contract is implemented — no side effects, no
 //! DMA, no interrupts. Once real emulation lands for a device, its region can
@@ -34,11 +35,6 @@ pub const CACHE_CTRL_REG: u32 = 0xFFFE_0130;
 pub const SIO0_BASE: u32 = 0x1F80_1040;
 /// Physical end (inclusive) of the SIO0 / joypad register window.
 pub const SIO0_END: u32 = 0x1F80_105F;
-
-/// Physical base of the SPU register window.
-pub const SPU_BASE: u32 = 0x1F80_1C00;
-/// Physical end (inclusive) of the SPU register window.
-pub const SPU_END: u32 = 0x1F80_1FFF;
 
 /// Memory-control register stub. Backs the nine 32-bit config words the BIOS
 /// programs at 0x1F80_1000..0x1F80_1023 plus the RAM_SIZE register at
@@ -485,122 +481,6 @@ impl Sio0 {
     }
 }
 
-/// SPU register stub. The SPU occupies a full 0x400-byte window (0x1F80_1C00..
-/// 0x1F80_1FFF). Real audio emulation is out of scope for boot; this stub is
-/// a plain byte-addressable backing store so the BIOS's SPU-reset sequence
-/// (which reads back register defaults, sets voice keys, etc.) does not
-/// wedge.
-///
-/// The SPU control register (SPUCNT, 0x1F80_1DAA) and status register (SPUSTAT,
-/// 0x1F80_1DAE) get a small amount of extra care: SPUSTAT is synthesized to
-/// mirror the low bits of SPUCNT the way real hardware does, which is enough
-/// for BIOS SPU init to complete.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Spu {
-    /// 1024-byte register file, initialized to zero.
-    #[serde(with = "spu_regs_serde")]
-    regs: Box<[u8; SPU_REG_BYTES]>,
-}
-
-/// Size of the SPU register window (1KB).
-pub const SPU_REG_BYTES: usize = 1024;
-
-impl Default for Spu {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Spu {
-    /// Creates a fresh SPU register file (all zero).
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            regs: Box::new([0; SPU_REG_BYTES]),
-        }
-    }
-
-    /// Returns `true` if `phys` falls in the SPU register window.
-    #[must_use]
-    pub fn contains(phys: u32) -> bool {
-        matches!(phys, SPU_BASE..=SPU_END)
-    }
-
-    /// Reads an 8-bit value.
-    #[must_use]
-    pub fn read8(&self, phys: u32) -> u8 {
-        let off = (phys - SPU_BASE) as usize;
-        self.regs.get(off).copied().unwrap_or(0)
-    }
-
-    /// Reads a 16-bit value.
-    #[must_use]
-    pub fn read16(&self, phys: u32) -> u16 {
-        // SPUSTAT mirrors the low six bits of SPUCNT.
-        if phys == 0x1F80_1DAE {
-            let cnt = self.read16(0x1F80_1DAA);
-            return cnt & 0x3F;
-        }
-        u16::from_le_bytes([self.read8(phys), self.read8(phys.wrapping_add(1))])
-    }
-
-    /// Reads a 32-bit value.
-    #[must_use]
-    pub fn read32(&self, phys: u32) -> u32 {
-        u32::from_le_bytes([
-            self.read8(phys),
-            self.read8(phys.wrapping_add(1)),
-            self.read8(phys.wrapping_add(2)),
-            self.read8(phys.wrapping_add(3)),
-        ])
-    }
-
-    /// Writes an 8-bit value.
-    pub fn write8(&mut self, phys: u32, val: u8) {
-        let off = (phys - SPU_BASE) as usize;
-        if let Some(slot) = self.regs.get_mut(off) {
-            *slot = val;
-        }
-    }
-
-    /// Writes a 16-bit value.
-    pub fn write16(&mut self, phys: u32, val: u16) {
-        let b = val.to_le_bytes();
-        self.write8(phys, b[0]);
-        self.write8(phys.wrapping_add(1), b[1]);
-    }
-
-    /// Writes a 32-bit value.
-    pub fn write32(&mut self, phys: u32, val: u32) {
-        let b = val.to_le_bytes();
-        self.write8(phys, b[0]);
-        self.write8(phys.wrapping_add(1), b[1]);
-        self.write8(phys.wrapping_add(2), b[2]);
-        self.write8(phys.wrapping_add(3), b[3]);
-    }
-}
-
-mod spu_regs_serde {
-    use super::SPU_REG_BYTES;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
-
-    pub fn serialize<S: Serializer>(v: &[u8; SPU_REG_BYTES], s: S) -> Result<S::Ok, S::Error> {
-        v.as_slice().serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Box<[u8; SPU_REG_BYTES]>, D::Error> {
-        let v: Vec<u8> = Vec::deserialize(d)?;
-        if v.len() != SPU_REG_BYTES {
-            return Err(D::Error::custom("spu register file has wrong length"));
-        }
-        let mut boxed = Box::new([0u8; SPU_REG_BYTES]);
-        boxed.copy_from_slice(&v);
-        Ok(boxed)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,40 +647,5 @@ mod tests {
     fn sio0_stat_idle_is_five() {
         let mut sio = Sio0::new();
         assert_eq!(sio.read32(0x1F80_1044), 0x5);
-    }
-
-    #[test]
-    fn spu_write_readback() {
-        let mut spu = Spu::new();
-        spu.write16(0x1F80_1C00, 0x1234);
-        assert_eq!(spu.read16(0x1F80_1C00), 0x1234);
-        spu.write32(0x1F80_1F00, 0xDEAD_BEEF);
-        assert_eq!(spu.read32(0x1F80_1F00), 0xDEAD_BEEF);
-    }
-
-    #[test]
-    fn spu_status_mirrors_control() {
-        let mut spu = Spu::new();
-        // SPUCNT
-        spu.write16(0x1F80_1DAA, 0x8032);
-        // SPUSTAT should mirror low 6 bits (0x32).
-        assert_eq!(spu.read16(0x1F80_1DAE), 0x0032);
-    }
-
-    #[test]
-    fn spu_serde_roundtrip() {
-        let mut spu = Spu::new();
-        spu.write16(0x1F80_1C00, 0xABCD);
-        let s = serde_json::to_string(&spu).unwrap();
-        let back: Spu = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.read16(0x1F80_1C00), 0xABCD);
-    }
-
-    #[test]
-    fn spu_serde_rejects_wrong_length() {
-        // Craft a JSON blob whose "regs" array is empty.
-        let bad = "{\"regs\":[]}";
-        let r: Result<Spu, _> = serde_json::from_str(bad);
-        assert!(r.is_err());
     }
 }
