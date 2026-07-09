@@ -107,7 +107,7 @@ pwsh scripts/verus-check.ps1
 
 ## Test Tiers
 
-1. CPU instruction tests **[tier-1 gate wired]** — PS-EXE sideloader + BIOS TTY/`printf`/exception HLE + hardware timers in psoxide-test-harness. Always-on gates = synthetic PS-EXE self-test, syscall-exception round-trip, spec-derived MIPS corner tests (`cpu_semantics.rs`), and the four **vendored** JaCzekanski `ps1-tests` CPU binaries (MIT, `tests/ps1_tests.rs`) driven end-to-end to their progress markers. Amidog `psxtest_cpu` (CC BY-NC-SA, not vendored) stays an env-gated `run_real_suite` driver; it now runs to completion but a full pass needs the R3000 load-delay pipeline + BIOS exception-dispatch chain (see `crates/psoxide-test-harness/README.md`).
+1. CPU instruction tests **[tier-1 gate wired]** — PS-EXE sideloader + BIOS TTY/`printf`/exception HLE + hardware timers in psoxide-test-harness. Always-on gates = synthetic PS-EXE self-test, syscall-exception round-trip, spec-derived MIPS corner tests (`cpu_semantics.rs`), and the four **vendored** JaCzekanski `ps1-tests` CPU binaries (MIT, `tests/ps1_tests.rs`) driven end-to-end to their progress markers. Amidog `psxtest_cpu` (CC BY-NC-SA, not vendored) stays an env-gated `run_real_suite` driver; it now runs to completion with the R3000 load-delay pipeline modelled (the whole back-to-back same-register load-delay matrix passes), leaving only 6 `value error` lines that need the BIOS exception-dispatch chain (see `crates/psoxide-test-harness/README.md`).
 2. GPU rendering tests — golden-frame comparison
 3. Full boot: BIOS boots to the shell/logo, then a real game boots from a disc image
 

@@ -50,6 +50,32 @@ fn sign_extend(imm: u16) -> u32 {
     imm as i16 as i32 as u32
 }
 
+/// Queues a delayed load of `value` into `rt`, first squashing any delayed load
+/// that was committed into `rt` at the start of this instruction.
+///
+/// On the R3000 the load delay slot holds a single pending target. When the
+/// instruction in a load's delay slot is *itself* a load into the same register,
+/// the newer load wins and the older load's value is **never** published to
+/// `rt`. The step loop has already committed the older load into the output bank
+/// (`out_regs[rt]`) before this instruction ran, so left alone that stale value
+/// would leak into the register file when the step publishes `out_regs`.
+/// Resetting `out_regs[rt]` back to the input-bank value (its value before this
+/// cycle's commit) cancels that leak; the freshly queued `value` then becomes
+/// visible one instruction later, exactly as on hardware.
+///
+/// This applies to *every* load, pure-overwrite and merging alike. The two kinds
+/// differ only in how `value` is computed by the caller: pure-overwrite loads
+/// (`LB/LBU/LH/LHU/LW/MFC0`) synthesise a fresh value, whereas `LWL`/`LWR` first
+/// read `out_regs[rt]` (which still holds the load committed this cycle) and
+/// merge into it — so a load→`LWL` chain or an `LWL`/`LWR` pair composes — before
+/// handing the merged result here to be queued and de-leaked.
+#[inline]
+fn queue_load(cpu: &mut Cpu, rt: u8, value: u32) {
+    let preserved = cpu.reg(rt);
+    cpu.set_reg(rt, preserved);
+    cpu.pending_load = (rt, value);
+}
+
 /// Fetches, decodes, and executes one instruction, advancing the branch and
 /// load delay slots.
 pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
@@ -276,12 +302,12 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
         Instruction::Lb { rt, rs, imm } => {
             let addr = cpu.reg(rs).wrapping_add(sign_extend(imm));
             let value = bus.load8(addr) as i8 as i32 as u32;
-            cpu.pending_load = (rt, value);
+            queue_load(cpu, rt, value);
         }
         Instruction::Lbu { rt, rs, imm } => {
             let addr = cpu.reg(rs).wrapping_add(sign_extend(imm));
             let value = u32::from(bus.load8(addr));
-            cpu.pending_load = (rt, value);
+            queue_load(cpu, rt, value);
         }
         Instruction::Lh { rt, rs, imm } => {
             let addr = cpu.reg(rs).wrapping_add(sign_extend(imm));
@@ -290,7 +316,7 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 enter_exception(cpu, EXC_ADEL);
             } else {
                 let value = bus.load16(addr) as i16 as i32 as u32;
-                cpu.pending_load = (rt, value);
+                queue_load(cpu, rt, value);
             }
         }
         Instruction::Lhu { rt, rs, imm } => {
@@ -300,7 +326,7 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 enter_exception(cpu, EXC_ADEL);
             } else {
                 let value = u32::from(bus.load16(addr));
-                cpu.pending_load = (rt, value);
+                queue_load(cpu, rt, value);
             }
         }
         Instruction::Lw { rt, rs, imm } => {
@@ -310,13 +336,15 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 enter_exception(cpu, EXC_ADEL);
             } else {
                 let value = bus.load32(addr);
-                cpu.pending_load = (rt, value);
+                queue_load(cpu, rt, value);
             }
         }
         Instruction::Lwl { rt, rs, imm } => {
             let addr = cpu.reg(rs).wrapping_add(sign_extend(imm));
             // Merge with the value currently in the load delay slot so that a
-            // back-to-back LWL/LWR pair targeting the same register composes.
+            // back-to-back LWL/LWR pair (or a load→LWL chain) targeting the same
+            // register composes: `out_regs[rt]` still holds the delayed load
+            // committed at the top of this step.
             let current = cpu.out_regs[rt as usize];
             let aligned = bus.load32(addr & !3);
             let value = match addr & 3 {
@@ -325,7 +353,7 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 2 => (current & 0x0000_00FF) | (aligned << 8),
                 _ => aligned,
             };
-            cpu.pending_load = (rt, value);
+            queue_load(cpu, rt, value);
         }
         Instruction::Lwr { rt, rs, imm } => {
             let addr = cpu.reg(rs).wrapping_add(sign_extend(imm));
@@ -337,7 +365,7 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 2 => (current & 0xFFFF_0000) | (aligned >> 16),
                 _ => (current & 0xFFFF_FF00) | (aligned >> 24),
             };
-            cpu.pending_load = (rt, value);
+            queue_load(cpu, rt, value);
         }
 
         // ── Stores ──────────────────────────────────────────────────────
@@ -398,8 +426,10 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
 
         // ── Coprocessor 0 ───────────────────────────────────────────────
         Instruction::Mfc0 { rt, rd } => {
-            // Coprocessor moves also occupy the load delay slot.
-            cpu.pending_load = (rt, cpu.cop0[rd as usize]);
+            // Coprocessor moves also occupy the load delay slot and are pure
+            // overwrites, so they squash a same-cycle delayed load into `rt`.
+            let value = cpu.cop0[rd as usize];
+            queue_load(cpu, rt, value);
         }
         Instruction::Mtc0 { rt, rd } => {
             cpu.cop0[rd as usize] = cpu.reg(rt);
@@ -721,6 +751,110 @@ mod tests {
         assert_eq!(cpu.reg(10), 0x1111);
         // But $t1 itself is now the loaded value.
         assert_eq!(cpu.reg(9), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn back_to_back_load_same_reg_second_wins_first_squashed() {
+        // On the R3000 two loads into the same register back-to-back: the second
+        // load squashes the first, so the first's value is NEVER visible in rt.
+        //   addiu $t0,$zero,0x100  ; a0
+        //   addiu $t1,$zero,0x200  ; a1
+        //   addiu $t2,$zero,0xAAA  ; rt seed (old value V0)
+        //   lw    $t2,0($t0)       ; queue rt = memA
+        //   lw    $t2,0($t1)       ; queue rt = memB, squashing memA
+        //   addu  $t3,$t2,$zero    ; delay slot of 2nd lw: reads rt -> V0, not memA
+        //   addu  $t4,$t2,$zero    ; now rt = memB is visible
+        let (mut cpu, mut bus) = setup(&[
+            i_type(0x09, 0, 8, 0x100),  // $t0 = 0x100
+            i_type(0x09, 0, 9, 0x200),  // $t1 = 0x200
+            i_type(0x09, 0, 10, 0xAAA), // $t2 = 0xAAA (V0)
+            i_type(0x23, 8, 10, 0),     // lw $t2,0($t0)  -> memA
+            i_type(0x23, 9, 10, 0),     // lw $t2,0($t1)  -> memB
+            r_type(10, 0, 11, 0, 0x21), // addu $t3,$t2,$zero
+            r_type(10, 0, 12, 0, 0x21), // addu $t4,$t2,$zero
+        ]);
+        bus.write_u32(0x100, 0x1111_1111); // memA
+        bus.write_u32(0x200, 0x2222_2222); // memB
+        run(&mut cpu, &mut bus, 7);
+        // The delay-slot reader saw the OLD value; memA (0x1111_1111) is never
+        // observed because the second load squashed it.
+        assert_eq!(cpu.reg(11), 0xAAA);
+        // memB becomes visible one instruction later, and rt ends as memB.
+        assert_eq!(cpu.reg(12), 0x2222_2222);
+        assert_eq!(cpu.reg(10), 0x2222_2222);
+    }
+
+    #[test]
+    fn load_then_reg_write_same_reg_write_wins() {
+        // A load into rt followed by an ALU write into rt: the ALU write wins;
+        // the loaded value must not clobber it.
+        //   addiu $t0,$zero,0x100  ; a0
+        //   addiu $t2,$zero,0xAAA  ; rt seed
+        //   lw    $t2,0($t0)       ; queue rt = memA
+        //   addiu $t2,$t2,5        ; delay slot reads OLD rt(0xAAA), writes 0xAAF
+        //   addu  $t3,$t2,$zero    ; observe final rt
+        let (mut cpu, mut bus) = setup(&[
+            i_type(0x09, 0, 8, 0x100),  // $t0 = 0x100
+            i_type(0x09, 0, 10, 0xAAA), // $t2 = 0xAAA
+            i_type(0x23, 8, 10, 0),     // lw $t2,0($t0) -> memA
+            i_type(0x09, 10, 10, 5),    // addiu $t2,$t2,5
+            r_type(10, 0, 11, 0, 0x21), // addu $t3,$t2,$zero
+        ]);
+        bus.write_u32(0x100, 0x1111_1111); // memA (must be discarded)
+        run(&mut cpu, &mut bus, 5);
+        // Delay-slot ADDIU read the OLD rt (0xAAA) and its write survived the
+        // load; memA never reached rt.
+        assert_eq!(cpu.reg(10), 0xAAF);
+        assert_eq!(cpu.reg(11), 0xAAF);
+    }
+
+    #[test]
+    fn back_to_back_load_different_regs_both_land() {
+        // Loads into distinct registers do not interfere; both values commit.
+        //   addiu $t0,$zero,0x100  ; a0
+        //   addiu $t1,$zero,0x200  ; a1
+        //   lw    $t2,0($t0)       ; rt = memA
+        //   lw    $t3,0($t1)       ; rd = memB (different reg)
+        //   nop
+        let (mut cpu, mut bus) = setup(&[
+            i_type(0x09, 0, 8, 0x100), // $t0 = 0x100
+            i_type(0x09, 0, 9, 0x200), // $t1 = 0x200
+            i_type(0x23, 8, 10, 0),    // lw $t2,0($t0)
+            i_type(0x23, 9, 11, 0),    // lw $t3,0($t1)
+            i_type(0x09, 0, 0, 0),     // nop (commit the second load)
+        ]);
+        bus.write_u32(0x100, 0x1111_1111); // memA
+        bus.write_u32(0x200, 0x2222_2222); // memB
+        run(&mut cpu, &mut bus, 5);
+        assert_eq!(cpu.reg(10), 0x1111_1111);
+        assert_eq!(cpu.reg(11), 0x2222_2222);
+    }
+
+    #[test]
+    fn lwl_merges_with_pending_load_of_same_reg() {
+        // LWL is NOT a pure-overwrite load: it merges with the register value,
+        // including a load committed the same cycle. A regular LW followed by an
+        // LWL into the same register must therefore merge, not squash.
+        //   addiu $t0,$zero,0x100  ; a0 -> full word source
+        //   addiu $t1,$zero,0x204  ; a1 -> aligned LWL source
+        //   lw    $t2,0($t0)       ; queue rt = W1 (0x1111_1111)
+        //   lwl   $t2,0($t1)       ; merge aligned word with pending W1
+        //   nop
+        let (mut cpu, mut bus) = setup(&[
+            i_type(0x09, 0, 8, 0x100), // $t0 = 0x100
+            i_type(0x09, 0, 9, 0x204), // $t1 = 0x204
+            i_type(0x23, 8, 10, 0),    // lw  $t2,0($t0)
+            i_type(0x22, 9, 10, 0),    // lwl $t2,0($t1)
+            i_type(0x09, 0, 0, 0),     // nop
+        ]);
+        bus.write_u32(0x100, 0x1111_1111); // W1
+        bus.write_u32(0x204, 0xAABB_CCDD); // LWL aligned source
+        run(&mut cpu, &mut bus, 5);
+        // addr & 3 == 0: value = (W1 & 0x00FF_FFFF) | (aligned << 24)
+        //             = 0x0011_1111 | 0xDD00_0000 = 0xDD11_1111.
+        // If LWL had squashed the pending LW (like a pure-overwrite load), the
+        // low bytes would be 0 (0xDD00_0000) instead.
+        assert_eq!(cpu.reg(10), 0xDD11_1111);
     }
 
     #[test]
