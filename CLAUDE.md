@@ -24,9 +24,13 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 - BIOS loading; reset vector at 0xBFC00000
 - GPU (`gpu.rs`): 1024x512 BGR555 VRAM, GP0 command FIFO (multi-word
   accumulation, no desync), GP1 control port, GPUSTAT/GPUREAD. Software
-  rasterizer: fill, flat/Gouraud triangles + quads, monochrome rectangles, flat
-  lines, VRAM↔VRAM and CPU↔VRAM transfers. `framebuffer_rgba()` renders the real
-  display area from VRAM (15bpp full; 24bpp best-effort)
+  rasterizer: fill, flat/Gouraud triangles + quads, textured triangles/quads/
+  rectangles (4/8/15bpp CLUT + direct sampling, colour modulation, texture
+  window), monochrome/textured rectangles, flat/Gouraud lines + poly-lines,
+  VRAM↔VRAM and CPU↔VRAM transfers. Honours all four semi-transparency blend
+  modes, ordered dithering, the mask bit, and the top-left fill rule.
+  `framebuffer_rgba()` renders the real display area from VRAM (15bpp full;
+  24bpp best-effort)
 - DMA (`dma.rs`): register file for all 7 channels; channel 2 (GPU: linked-list
   + block, both directions), channel 3 (CD-ROM: device→RAM block copy pulling
   sector words from the CD data FIFO), and channel 6 (OTC) execute synchronously
@@ -135,15 +139,25 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 
 ### GPU/DMA gaps (implemented but partial)
 
-- Textured polygons/rectangles are parsed (correct word counts, no FIFO desync)
-  but rendered as flat-shaded — no real texture sampling yet
-- Poly-lines are parsed to their terminator; each segment is drawn flat with the
-  first vertex color (no per-vertex Gouraud along the line)
+- Textured polygons/rectangles sample real textures: 4/8/15bpp CLUT + 15bpp
+  direct, colour modulation vs. raw, the texture window, and per-texel
+  semi-transparency (STP). Remaining texture gaps: no perspective correction (the
+  GPU is affine like real hardware, so this is not a bug) and no texture cache
+  timing model
+- Poly-lines are parsed to their terminator and each segment is Gouraud-
+  interpolated between its own two endpoints (flat/monochrome lines keep their
+  single colour); line pixels go through the shared shade/plot path so they
+  honour the mask bit, dithering (Gouraud segments only, per PSX-SPX), and
+  semi-transparency
 - 24bpp display output is best-effort
 - Semi-transparency, dithering, and the mask bit are stored in GPUSTAT but not
   applied during rasterization
 - DMA channels other than 2 (GPU), 3 (CD-ROM), and 6 (OTC) are register-only
   (no transfer)
+- Semi-transparency (all four blend modes), ordered dithering, and the mask bit
+  (check-before-draw + set-while-drawing) are applied during rasterization for
+  polygons, rectangles, and lines
+- DMA channels other than 2 (GPU) and 6 (OTC) are register-only (no transfer)
 - Interrupt delivery uses the single cop0 IP2 line; VBlank timing is one pulse
   per `StepFrame` rather than cycle-accurate
 

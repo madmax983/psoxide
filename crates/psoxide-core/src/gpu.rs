@@ -16,10 +16,12 @@
 //! flat/Gouraud triangles and quads, textured triangles/quads/rectangles
 //! (4bpp/8bpp CLUT + 15bpp direct sampling, colour modulation, per-texel
 //! semi-transparency, and the texture window), monochrome/textured rectangles,
-//! flat lines, fills, and VRAM↔VRAM / CPU↔VRAM block transfers. It also honours
-//! all four semi-transparency blend modes, ordered dithering, the mask bit, and
-//! the top-left fill rule. Poly-lines are parsed to their terminator and each
-//! segment is drawn flat with the first color (a documented gap).
+//! flat and Gouraud lines/poly-lines, fills, and VRAM↔VRAM / CPU↔VRAM block
+//! transfers. It also honours all four semi-transparency blend modes, ordered
+//! dithering, the mask bit, and the top-left fill rule. Poly-lines are parsed to
+//! their terminator and each segment is colour-interpolated between its own two
+//! endpoints, routed through the shared shade/plot path (mask, dither on
+//! Gouraud segments, semi-transparency).
 
 use serde::{Deserialize, Serialize};
 
@@ -455,16 +457,18 @@ impl Gpu {
         // 0x5000_5000 pattern (0xF000_F000 mask). The terminator can only
         // appear where a vertex is expected — after at least the first vertex.
         let have = self.cmd_buffer.len();
-        let is_vertex_slot = if self.polyline_shaded {
-            // Shaded: cmd, col?, v0, col, v1, col, v2, ... colors at even indices
-            // after the header. Word layout: [0]=cmd+col0, [1]=v0, [2]=col1,
-            // [3]=v1, ... vertices at odd indices.
-            have >= 1 && have % 2 == 1
+        let terminator_slot = if self.polyline_shaded {
+            // Shaded layout: [0]=cmd+col0, [1]=v0, [2]=col1, [3]=v1, [4]=col2,
+            // [5]=v2, ... — colours at even indices, vertices at odd. The
+            // terminator follows a vertex, i.e. it occupies the next colour slot
+            // (even index ≥ 2).
+            have >= 2 && have.is_multiple_of(2)
         } else {
-            // Flat: cmd+col, v0, v1, v2, ... vertices at index >= 1.
+            // Flat layout: [0]=cmd+col, [1]=v0, [2]=v1, ... — the terminator
+            // follows a vertex (any index ≥ 1).
             have >= 1
         };
-        if is_vertex_slot && (word & 0xF000_F000) == 0x5000_5000 {
+        if terminator_slot && (word & 0xF000_F000) == 0x5000_5000 {
             self.render_polyline();
             self.polyline_active = false;
             self.polyline_shaded = false;
@@ -475,31 +479,57 @@ impl Gpu {
     }
 
     fn render_polyline(&mut self) {
-        // Extract vertices and (for flat) the single color; draw each segment
-        // with Bresenham using the first color. Gouraud shading across the line
-        // is approximated with the first vertex color (documented gap).
+        // Extract each vertex with its colour, then draw every segment with
+        // per-vertex colour interpolation between its own two endpoints (a
+        // shaded poly-line carries a colour per vertex; PSX-SPX). Every segment
+        // is routed through the shared shade/plot path so it honours the mask
+        // bit, dithering (Gouraud segments only), and semi-transparency.
         let words = self.cmd_buffer.clone();
         if words.is_empty() {
             return;
         }
-        let base_color = words[0];
-        let mut verts: Vec<(i32, i32)> = Vec::new();
+        let header = words[0];
+        let semi = header & 0x0200_0000 != 0;
+        let flags = PrimFlags {
+            textured: false,
+            raw: false,
+            semi,
+            gouraud: self.polyline_shaded,
+            dither_allowed: true,
+        };
+        // (screen position, 8-bit vertex colour) per vertex.
+        let mut verts: Vec<LineVertex> = Vec::new();
         if self.polyline_shaded {
+            // Layout: [0]=cmd+col0, [1]=v0, [2]=col1, [3]=v1, ... vertices at odd
+            // indices, each preceded by its colour ([0] carries v0's colour).
+            let mut color = color_channels(header);
             let mut i = 1;
             while i < words.len() {
-                verts.push(decode_vertex(words[i]));
-                i += 2; // skip the following color word
+                verts.push((self.offset_vertex(words[i]), color));
+                if i + 1 < words.len() {
+                    color = color_channels(words[i + 1]);
+                }
+                i += 2;
             }
         } else {
+            let color = color_channels(header);
             for w in &words[1..] {
-                verts.push(decode_vertex(*w));
+                verts.push((self.offset_vertex(*w), color));
             }
         }
-        let (r, g, b) = color_channels(base_color);
-        let color = rgb_to_bgr555(r, g, b);
         for pair in verts.windows(2) {
-            self.draw_line(pair[0], pair[1], color);
+            self.draw_line_shaded(pair[0].0, pair[1].0, pair[0].1, pair[1].1, &flags);
         }
+    }
+
+    /// Decodes a packed vertex word and applies the signed drawing offset.
+    #[inline]
+    fn offset_vertex(&self, word: u32) -> (i32, i32) {
+        let (vx, vy) = decode_vertex(word);
+        (
+            vx + i32::from(self.draw_off_x),
+            vy + i32::from(self.draw_off_y),
+        )
     }
 
     // ── CPU↔VRAM transfers ───────────────────────────────────────────────
@@ -598,22 +628,6 @@ impl Gpu {
                 self.set_vram(x.wrapping_add(col), y.wrapping_add(row), pixel);
             }
         }
-    }
-
-    /// Writes a pixel if it lies within the drawing area.
-    #[inline]
-    fn plot_clipped(&mut self, x: i32, y: i32, color: u16) {
-        if x < i32::from(self.draw_x0)
-            || x > i32::from(self.draw_x1)
-            || y < i32::from(self.draw_y0)
-            || y > i32::from(self.draw_y1)
-        {
-            return;
-        }
-        if x < 0 || y < 0 || x >= VRAM_WIDTH as i32 || y >= VRAM_HEIGHT as i32 {
-            return;
-        }
-        self.set_vram(x as u16, y as u16, color);
     }
 
     fn draw_polygon(&mut self) {
@@ -1012,53 +1026,83 @@ impl Gpu {
     fn draw_single_line(&mut self) {
         let cmd = self.cmd_buffer[0];
         let shaded = cmd & 0x1000_0000 != 0;
-        let (r, g, b) = color_channels(cmd);
-        let color = rgb_to_bgr555(r, g, b);
-        let (v0, v1) = if shaded {
+        let semi = cmd & 0x0200_0000 != 0;
+        let c0 = color_channels(cmd);
+        // Shaded layout: [0]=cmd+col0, [1]=v0, [2]=col1, [3]=v1. Flat: [0]=cmd+col,
+        // [1]=v0, [2]=v1 (both endpoints share the single colour).
+        let (a, c1, bb) = if shaded {
             (
-                decode_vertex(self.cmd_buffer[1]),
-                decode_vertex(self.cmd_buffer[3]),
+                self.offset_vertex(self.cmd_buffer[1]),
+                color_channels(self.cmd_buffer[2]),
+                self.offset_vertex(self.cmd_buffer[3]),
             )
         } else {
             (
-                decode_vertex(self.cmd_buffer[1]),
-                decode_vertex(self.cmd_buffer[2]),
+                self.offset_vertex(self.cmd_buffer[1]),
+                c0,
+                self.offset_vertex(self.cmd_buffer[2]),
             )
         };
-        let a = (
-            v0.0 + i32::from(self.draw_off_x),
-            v0.1 + i32::from(self.draw_off_y),
-        );
-        let bb = (
-            v1.0 + i32::from(self.draw_off_x),
-            v1.1 + i32::from(self.draw_off_y),
-        );
-        self.draw_line(a, bb, color);
+        let flags = PrimFlags {
+            textured: false,
+            raw: false,
+            semi,
+            gouraud: shaded,
+            dither_allowed: true,
+        };
+        self.draw_line_shaded(a, bb, c0, c1, &flags);
     }
 
-    /// Draws a Bresenham line clipped to the drawing area.
-    fn draw_line(&mut self, a: (i32, i32), b: (i32, i32), color: u16) {
+    /// Draws a Bresenham line from `a` to `b`, linearly interpolating the 8-bit
+    /// per-channel colour from `ca` at `a` to `cb` at `b` by parametric pixel
+    /// position. Each pixel is routed through [`Gpu::shade_and_plot`], so the
+    /// segment honours the drawing-area clip, the mask bit, dithering (when the
+    /// primitive is Gouraud-shaded and dither is enabled), and semi-transparency
+    /// — reusing the exact same helpers as triangles/rectangles. A monochrome
+    /// line passes `ca == cb`, yielding a constant colour with no dithering.
+    fn draw_line_shaded(
+        &mut self,
+        a: (i32, i32),
+        b: (i32, i32),
+        ca: (u8, u8, u8),
+        cb: (u8, u8, u8),
+        flags: &PrimFlags,
+    ) {
         let (mut x0, mut y0) = a;
         let (x1, y1) = b;
         let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
+        let dy = (y1 - y0).abs();
+        // Pixel count along the dominant axis; the line spans `steps + 1` pixels.
+        let steps = dx.max(dy);
         let sx = if x0 < x1 { 1 } else { -1 };
         let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
+        let mut err = dx - dy;
+        let tex = TexInfo::default();
+        let mut i = 0i32;
         loop {
-            self.plot_clipped(x0, y0, color);
+            // Parametric colour at position i/steps along the segment.
+            let (r8, g8, b8) = if steps == 0 {
+                (i32::from(ca.0), i32::from(ca.1), i32::from(ca.2))
+            } else {
+                let lerp = |s: u8, e: u8| -> i32 {
+                    i32::from(s) + (i32::from(e) - i32::from(s)) * i / steps
+                };
+                (lerp(ca.0, cb.0), lerp(ca.1, cb.1), lerp(ca.2, cb.2))
+            };
+            self.shade_and_plot(x0, y0, r8, g8, b8, 0, 0, flags, &tex);
             if x0 == x1 && y0 == y1 {
                 break;
             }
             let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
+            if e2 > -dy {
+                err -= dy;
                 x0 += sx;
             }
-            if e2 <= dx {
+            if e2 < dx {
                 err += dx;
                 y0 += sy;
             }
+            i += 1;
         }
     }
 
@@ -1273,6 +1317,10 @@ const DITHER_MATRIX: [[i32; 4]; 4] = [
     [-3, 1, -4, 0],
     [3, -1, 2, -2],
 ];
+
+/// A poly-line vertex: screen position `(x, y)` paired with its 8-bit R/G/B
+/// vertex colour, used to interpolate colour along each segment.
+type LineVertex = ((i32, i32), (u8, u8, u8));
 
 /// A rasterizer vertex: screen position, 8-bit vertex colour, and texcoords.
 #[derive(Clone, Copy, Default)]
@@ -1911,5 +1959,115 @@ mod tests {
             }
         }
         assert!(varies, "dither → spatial variation");
+    }
+
+    // ── Lines ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn monochrome_line_renders_single_colour() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        // Flat line (opcode 0x40) red from (0,0) to (10,0).
+        feed(
+            &mut gpu,
+            &[
+                0x4000_00FF, // flat line, colour red
+                0x0000_0000, // v0 (0,0)
+                0x0000_000A, // v1 (10,0)
+            ],
+        );
+        let red = rgb_to_bgr555(0xFF, 0, 0);
+        assert_eq!(gpu.vram_at(0, 0), red, "endpoint");
+        assert_eq!(gpu.vram_at(5, 0), red, "midpoint uniform");
+        assert_eq!(gpu.vram_at(10, 0), red, "endpoint");
+    }
+
+    #[test]
+    fn shaded_line_interpolates_between_endpoint_colours() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        // Gouraud line (opcode 0x50): red at v0 (0,0), blue at v1 (10,0).
+        feed(
+            &mut gpu,
+            &[
+                0x5000_00FF, // shaded line, colour0 = red
+                0x0000_0000, // v0 (0,0)
+                0x00FF_0000, // colour1 = blue
+                0x0000_000A, // v1 (10,0)
+            ],
+        );
+        // Endpoints match their vertex colours exactly.
+        assert_eq!(gpu.vram_at(0, 0), rgb_to_bgr555(0xFF, 0, 0), "v0 red");
+        assert_eq!(gpu.vram_at(10, 0), rgb_to_bgr555(0, 0, 0xFF), "v1 blue");
+        // The midpoint is a blend of both endpoints — not the first-vertex colour.
+        let mid = gpu.vram_at(5, 0);
+        let (r, g, b) = unpack5(mid);
+        assert!(r > 0 && b > 0, "midpoint blends red+blue, got {r},{g},{b}");
+        assert_eq!(g, 0, "no green anywhere on this line");
+        assert_ne!(mid, rgb_to_bgr555(0xFF, 0, 0), "midpoint is not pure red");
+    }
+
+    #[test]
+    fn shaded_polyline_interpolates_each_segment() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        // Gouraud poly-line (opcode 0x58, bit27 set): red→green→blue across two
+        // segments (0,0)→(10,0)→(20,0).
+        gpu.gp0(0x5800_00FF); // shaded poly-line, colour0 = red
+        gpu.gp0(0x0000_0000); // v0 (0,0)
+        gpu.gp0(0x0000_FF00); // colour1 = green
+        gpu.gp0(0x0000_000A); // v1 (10,0)
+        gpu.gp0(0x00FF_0000); // colour2 = blue
+        gpu.gp0(0x0000_0014); // v2 (20,0)
+        gpu.gp0(0x5555_5555); // terminator
+        assert!(gpu.is_idle());
+        // Vertices carry their exact colours.
+        assert_eq!(gpu.vram_at(0, 0), rgb_to_bgr555(0xFF, 0, 0), "v0 red");
+        assert_eq!(gpu.vram_at(10, 0), rgb_to_bgr555(0, 0xFF, 0), "v1 green");
+        assert_eq!(gpu.vram_at(20, 0), rgb_to_bgr555(0, 0, 0xFF), "v2 blue");
+        // Segment 1 midpoint blends red+green; segment 2 midpoint blends green+blue.
+        let (r1, g1, b1) = unpack5(gpu.vram_at(5, 0));
+        assert!(
+            r1 > 0 && g1 > 0 && b1 == 0,
+            "seg1 red→green: {r1},{g1},{b1}"
+        );
+        let (r2, g2, b2) = unpack5(gpu.vram_at(15, 0));
+        assert!(
+            r2 == 0 && g2 > 0 && b2 > 0,
+            "seg2 green→blue: {r2},{g2},{b2}"
+        );
+    }
+
+    #[test]
+    fn semi_transparent_line_blends_against_background() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        gpu.gp0(0xE100_0000); // latch semi mode 0 (B/2 + F/2)
+        let bg = pack555(20, 10, 4);
+        gpu.set_vram(5, 5, bg);
+        // Semi-transparent flat line (opcode 0x42) across y=5, colour F5=(8,16,24).
+        feed(
+            &mut gpu,
+            &[
+                0x42C0_8040, // semi flat line, R=0x40 G=0x80 B=0xC0
+                0x0005_0000, // v0 (0,5)
+                0x0005_000A, // v1 (10,5)
+            ],
+        );
+        // Mode 0 average: ((20+8)/2, (10+16)/2, (4+24)/2) = (14,13,14).
+        assert_eq!(gpu.vram_at(5, 5), pack555(14, 13, 14));
+    }
+
+    #[test]
+    fn mask_check_blocks_a_line_pixel() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        gpu.gp0(0xE600_0002); // check-mask-before-draw
+        gpu.set_vram(5, 5, 0xBEEF); // bit15 set → masked destination
+        // Opaque flat line across y=5.
+        feed(&mut gpu, &[0x4000_00FF, 0x0005_0000, 0x0005_000A]);
+        assert_eq!(gpu.vram_at(5, 5), 0xBEEF, "masked line pixel preserved");
+        // A neighbouring unmasked pixel on the same line is still drawn.
+        assert_eq!(gpu.vram_at(4, 5), rgb_to_bgr555(0xFF, 0, 0));
     }
 }
