@@ -424,13 +424,21 @@ impl Gpu {
     }
 
     fn set_texpage(&mut self, cmd: u32) {
+        self.set_texpage_low(cmd);
+        self.dither = (cmd >> 9) & 0x1 != 0;
+        self.draw_to_display = (cmd >> 10) & 0x1 != 0;
+        self.tex_disable = (cmd >> 11) & 0x1 != 0;
+    }
+
+    /// Latches the GPUSTAT bits 0–8 texpage fields (page X/Y base,
+    /// semi-transparency mode, texture depth) from a texpage word's low bits.
+    /// Shared by GP0(E1) and the texpage attribute carried in a textured
+    /// polygon's vertex-1 texcoord word (PSX-SPX Render-Polygon "Texpage").
+    fn set_texpage_low(&mut self, cmd: u32) {
         self.tex_page_x = (cmd & 0xF) as u8;
         self.tex_page_y = ((cmd >> 4) & 0x1) as u8;
         self.semi_transparency = ((cmd >> 5) & 0x3) as u8;
         self.tex_depth = ((cmd >> 7) & 0x3) as u8;
-        self.dither = (cmd >> 9) & 0x1 != 0;
-        self.draw_to_display = (cmd >> 10) & 0x1 != 0;
-        self.tex_disable = (cmd >> 11) & 0x1 != 0;
     }
 
     fn set_texture_window(&mut self, cmd: u32) {
@@ -672,6 +680,15 @@ impl Gpu {
         }
 
         let tex = self.poly_texinfo(clut_word, page_word, textured);
+        if textured {
+            // A textured polygon's texpage attribute (high half of vertex-1's
+            // texcoord word) also reloads the persistent draw-mode/GPUSTAT
+            // texpage bits (0–8) exactly like GP0(E1), so a subsequent
+            // untextured primitive's semi-transparency mode and a subsequent
+            // textured rectangle's page pick it up (PSX-SPX Render-Polygon).
+            // Textured rectangles carry no texpage word and never latch.
+            self.set_texpage_low(page_word >> 16);
+        }
         let flags = PrimFlags {
             textured,
             raw,
@@ -1227,7 +1244,7 @@ fn quant(v: i32) -> u8 {
 fn blend(mode: u8, b: (u8, u8, u8), f: (u8, u8, u8)) -> (u8, u8, u8) {
     let ch = |bg: u8, fg: u8| -> u8 {
         match mode {
-            0 => (bg >> 1) + (fg >> 1),
+            0 => ((u16::from(bg) + u16::from(fg)) >> 1) as u8,
             1 => (u16::from(bg) + u16::from(fg)).min(0x1F) as u8,
             2 => bg.saturating_sub(fg),
             3 => (u16::from(bg) + u16::from(fg >> 2)).min(0x1F) as u8,
@@ -1702,8 +1719,10 @@ mod tests {
                 0x0000_0300, // v2 uv (0,3)
             ],
         );
-        // Interior pixels sample non-zero texels from the patch.
-        assert_ne!(gpu.vram_at(2, 2), 0);
+        // Interior pixel (2,2) interpolates to texel (u=0,v=0) — the barycentric
+        // weights give u = (32*3)/256 = 0, v = 0 — so it samples the patch's
+        // (0,0) texel 0x0008 verbatim (raw texture, no modulation).
+        assert_eq!(gpu.vram_at(2, 2), 0x0008);
     }
 
     #[test]
@@ -1730,6 +1749,43 @@ mod tests {
                 "semi mode {mode}"
             );
         }
+    }
+
+    #[test]
+    fn blend_mode0_rounds_full_sum() {
+        // Mode 0 is (B+F)/2 over the full sum, not (B/2)+(F/2): odd operands
+        // must not each lose their low bit before the add.
+        // B=3,F=3 → 3 (the truncating form gave 2); B=5,F=7 → 6 (gave 5);
+        // B=1,F=3 → 2 (matches either form).
+        assert_eq!(blend(0, (3, 5, 1), (3, 7, 3)), (3, 6, 2));
+    }
+
+    #[test]
+    fn textured_polygon_latches_texpage_into_gpustat() {
+        let mut gpu = Gpu::new();
+        open_draw_area(&mut gpu);
+        // Textured flat triangle. Vertex-1's texcoord word high half carries the
+        // texpage attribute (same bit layout as GP0 E1's low half):
+        // page_x=2, page_y=1, semi=2, depth=1 → 0x00D2.
+        feed(
+            &mut gpu,
+            &[
+                0x2400_0000, // textured flat triangle
+                0x0000_0000, // v0 pos (0,0)
+                0x0000_0000, // v0 clut + uv
+                0x0000_0010, // v1 pos (16,0)
+                0x00D2_0000, // v1 texpage=0x00D2 + uv (0,0)
+                0x0010_0000, // v2 pos (0,16)
+                0x0000_0000, // v2 uv (0,0)
+            ],
+        );
+        // The polygon reloads GPUSTAT bits 0–8 exactly like GP0(E1) would.
+        assert_eq!(gpu.gpustat() & 0x1FF, 0xD2, "polygon latched texpage");
+
+        // A textured rectangle carries no texpage word, so it must leave the
+        // latched texpage untouched (it draws using the latched page/mode).
+        feed(&mut gpu, &[0x6C00_0000, 0x0005_0005, 0x0000_0000]);
+        assert_eq!(gpu.gpustat() & 0x1FF, 0xD2, "rect did not change texpage");
     }
 
     #[test]
