@@ -529,11 +529,13 @@ impl Harness {
             // Flags.
             let mut left = false;
             let mut zero = false;
+            let mut alt = false;
             while i < fmt.len() {
                 match fmt[i] {
                     b'-' => left = true,
                     b'0' => zero = true,
-                    b'+' | b' ' | b'#' => {}
+                    b'#' => alt = true,
+                    b'+' | b' ' => {}
                     _ => break,
                 }
                 i += 1;
@@ -577,6 +579,10 @@ impl Harness {
             let spec = fmt[i];
             i += 1;
 
+            // Alt-form (`#`) prefix, emitted between any field-width padding and
+            // the converted digits (`0x`/`0X` for nonzero hex, a leading `0` for
+            // octal). Zero values get no prefix, matching C `printf`.
+            let mut prefix: Vec<u8> = Vec::new();
             let body: Vec<u8> = match spec {
                 b'%' => vec![b'%'],
                 b'c' => {
@@ -606,16 +612,25 @@ impl Harness {
                 b'x' => {
                     let a = self.printf_arg(argn);
                     argn += 1;
+                    if alt && a != 0 {
+                        prefix = vec![b'0', b'x'];
+                    }
                     format!("{a:x}").into_bytes()
                 }
                 b'X' => {
                     let a = self.printf_arg(argn);
                     argn += 1;
+                    if alt && a != 0 {
+                        prefix = vec![b'0', b'X'];
+                    }
                     format!("{a:X}").into_bytes()
                 }
                 b'o' => {
                     let a = self.printf_arg(argn);
                     argn += 1;
+                    if alt && a != 0 {
+                        prefix = vec![b'0'];
+                    }
                     format!("{a:o}").into_bytes()
                 }
                 b'p' => {
@@ -631,18 +646,28 @@ impl Harness {
             };
 
             // Apply field width padding (zero-pad only for right-justified
-            // numeric output; string/char use space padding).
+            // numeric output; string/char use space padding). The alt-form
+            // prefix counts toward the field width and always hugs the digits:
+            // space padding precedes the prefix, zero padding follows it.
             let pad_zero = zero && !left && !matches!(spec, b's' | b'c' | b'%');
-            if body.len() < width {
-                let pad = width - body.len();
+            let content_len = prefix.len() + body.len();
+            if content_len < width {
+                let pad = width - content_len;
                 if left {
+                    out.extend_from_slice(&prefix);
                     out.extend_from_slice(&body);
                     out.extend(std::iter::repeat_n(b' ', pad));
+                } else if pad_zero {
+                    out.extend_from_slice(&prefix);
+                    out.extend(std::iter::repeat_n(b'0', pad));
+                    out.extend_from_slice(&body);
                 } else {
-                    out.extend(std::iter::repeat_n(if pad_zero { b'0' } else { b' ' }, pad));
+                    out.extend(std::iter::repeat_n(b' ', pad));
+                    out.extend_from_slice(&prefix);
                     out.extend_from_slice(&body);
                 }
             } else {
+                out.extend_from_slice(&prefix);
                 out.extend_from_slice(&body);
             }
         }
@@ -780,5 +805,32 @@ mod tests {
         h.core.memory_mut().write8(sp + 16, b'Z');
         h.hle_printf(msg_addr);
         assert_eq!(h.tty(), "[-5|00000abc|hi|Z%]");
+    }
+
+    #[test]
+    fn printf_alt_form_hex_prefix() {
+        // The `#` flag adds a `0x`/`0X` prefix to nonzero hex (and a leading `0`
+        // to octal); zero gets no prefix. The prefix counts toward the field
+        // width and hugs the digits (space padding precedes it). This matches
+        // the ps1-tests `io-access-bitwidth` `%#10x` value columns.
+        let msg_addr = 0x8001_0000u32 + 0x400;
+        let fmt = b"[%#10x|%#x|%#X|%#o|%#x]\0";
+        let mut h = Harness::new();
+        h.load_exe(&build_exe(&[0])).expect("load_exe");
+        {
+            let mem = h.core.memory_mut();
+            for (i, b) in fmt.iter().enumerate() {
+                mem.write8(msg_addr + i as u32, *b);
+            }
+        }
+        h.core.set_reg(4, msg_addr);
+        h.core.set_reg(5, 0x78); // %#10x -> "      0x78"
+        h.core.set_reg(6, 0x5678); // %#x   -> "0x5678"
+        h.core.set_reg(7, 0xABC); // %#X   -> "0XABC"
+        let sp = h.core.reg(29);
+        h.core.memory_mut().write8(sp + 16, 0o17); // %#o -> "017"
+        h.core.memory_mut().write8(sp + 20, 0); // %#x of 0 -> "0" (no prefix)
+        h.hle_printf(msg_addr);
+        assert_eq!(h.tty(), "[      0x78|0x5678|0XABC|017|0]");
     }
 }
