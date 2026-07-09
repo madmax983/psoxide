@@ -18,6 +18,7 @@ use crate::cpu::{Cpu, CpuSnapshot, poll_interrupt, step};
 use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::irq::{Irq, IrqLine};
+use crate::timers::{TIMERS_BASE, TIMERS_END, Timers};
 
 /// Placeholder framebuffer width in pixels.
 pub const FRAME_WIDTH: usize = 320;
@@ -259,6 +260,7 @@ struct CoreBus<'a> {
     gpu: &'a mut Gpu,
     dma: &'a mut Dma,
     irq: &'a mut Irq,
+    timers: &'a mut Timers,
 }
 
 impl CoreBus<'_> {
@@ -275,7 +277,7 @@ impl CoreBus<'_> {
             0x1F80_1070 => self.irq.read_stat(),
             0x1F80_1074 => self.irq.read_mask(),
             0x1F80_1080..=0x1F80_10FF => self.dma.read32(phys),
-            // Timer registers (0x1F80_1100..=0x1F80_112F) are stubbed read-as-0.
+            TIMERS_BASE..=TIMERS_END => self.timers.read32(phys),
             _ => 0,
         }
     }
@@ -289,7 +291,8 @@ impl CoreBus<'_> {
             0x1F80_1080..=0x1F80_10FF => {
                 self.dma.write32(phys, val, self.mem, self.gpu, self.irq);
             }
-            // Timers and other I/O ports are stubbed (ignored).
+            TIMERS_BASE..=TIMERS_END => self.timers.write32(phys, val),
+            // Other I/O ports are stubbed (ignored).
             _ => {}
         }
     }
@@ -298,6 +301,7 @@ impl CoreBus<'_> {
         match phys {
             0x1F80_1070 => self.irq.read_stat() as u16,
             0x1F80_1074 => self.irq.read_mask() as u16,
+            TIMERS_BASE..=TIMERS_END => self.timers.read16(phys),
             _ => 0,
         }
     }
@@ -310,6 +314,7 @@ impl CoreBus<'_> {
                 let hi = self.irq.read_mask() & 0xFFFF_0000;
                 self.irq.write_mask(hi | u32::from(val));
             }
+            TIMERS_BASE..=TIMERS_END => self.timers.write16(phys, val),
             _ => {}
         }
     }
@@ -387,6 +392,9 @@ pub struct CoreSnapshot {
     pub dma: Dma,
     /// Interrupt controller state.
     pub irq: Irq,
+    /// Hardware timer / root-counter state.
+    #[serde(default)]
+    pub timers: Timers,
 }
 
 /// Deserializes the RAM buffer, rejecting snapshots whose length is not the
@@ -408,6 +416,7 @@ pub struct PsxCore {
     gpu: Gpu,
     dma: Dma,
     irq: Irq,
+    timers: Timers,
     paused: bool,
     controllers: [u16; 2],
 }
@@ -428,6 +437,7 @@ impl PsxCore {
             gpu: Gpu::new(),
             dma: Dma::new(),
             irq: Irq::new(),
+            timers: Timers::new(),
             paused: false,
             controllers: [0; 2],
         }
@@ -495,6 +505,44 @@ impl PsxCore {
         self.cpu.current_pc = pc;
     }
 
+    /// Reads general-purpose register `index` (architectural value). Useful for
+    /// test harnesses that high-level-emulate BIOS calls.
+    #[must_use]
+    pub fn reg(&self, index: usize) -> u32 {
+        self.cpu.regs[index]
+    }
+
+    /// Writes general-purpose register `index` directly into both register
+    /// banks so the value is immediately visible (no load-delay). For test
+    /// harnesses that stage BIOS-call results.
+    pub fn set_reg(&mut self, index: usize, value: u32) {
+        if index != 0 {
+            self.cpu.regs[index] = value;
+            self.cpu.out_regs[index] = value;
+        }
+    }
+
+    /// Reads coprocessor-0 register `index`.
+    #[must_use]
+    pub fn cop0(&self, index: usize) -> u32 {
+        self.cpu.cop0[index]
+    }
+
+    /// Writes coprocessor-0 register `index`. For test harnesses that
+    /// high-level-emulate the BIOS exception handler.
+    pub fn set_cop0(&mut self, index: usize, value: u32) {
+        self.cpu.cop0[index] = value;
+    }
+
+    /// Raises a VBlank interrupt and advances the interlace field, exactly as
+    /// [`Command::StepFrame`] does once per frame. Exposed for test harnesses
+    /// that drive the CPU via [`Command::StepCpu`] but still need `VSync`-based
+    /// programs to make progress.
+    pub fn raise_vblank(&mut self) {
+        self.gpu.field = !self.gpu.field;
+        self.irq.set(IrqLine::VBlank);
+    }
+
     /// Executes a single command.
     ///
     /// # Errors
@@ -560,6 +608,11 @@ impl PsxCore {
     }
 
     fn step_cpu(&mut self) {
+        // Advance the hardware timers by one CPU cycle first, so a timer that
+        // reaches its target/overflow this cycle can deliver its interrupt at
+        // this same instruction boundary.
+        self.timers.tick(1, &mut self.irq);
+
         // Deliver a pending, unmasked hardware interrupt at the instruction
         // boundary before fetching the next instruction. With reset state
         // (interrupts disabled) this is a no-op.
@@ -572,6 +625,7 @@ impl PsxCore {
             gpu: &mut self.gpu,
             dma: &mut self.dma,
             irq: &mut self.irq,
+            timers: &mut self.timers,
         };
         step(&mut self.cpu, &mut bus);
     }
@@ -654,6 +708,7 @@ impl PsxCore {
             gpu: self.gpu.clone(),
             dma: self.dma.clone(),
             irq: self.irq.clone(),
+            timers: self.timers.clone(),
         }
     }
 
@@ -672,6 +727,7 @@ impl PsxCore {
         self.gpu = snap.gpu.clone();
         self.dma = snap.dma.clone();
         self.irq = snap.irq.clone();
+        self.timers = snap.timers.clone();
     }
 }
 
@@ -813,6 +869,7 @@ mod tests {
                 gpu: &mut core.gpu,
                 dma: &mut core.dma,
                 irq: &mut core.irq,
+                timers: &mut core.timers,
             };
             // Fill red 16x16 at (0,0) through the GP0 port.
             bus.store32(0x1F80_1810, 0x0200_00FF);
@@ -834,6 +891,7 @@ mod tests {
                 gpu: &mut core.gpu,
                 dma: &mut core.dma,
                 irq: &mut core.irq,
+                timers: &mut core.timers,
             };
             bus.load32(0x1F80_1814)
         };
@@ -850,6 +908,7 @@ mod tests {
             gpu: &mut core.gpu,
             dma: &mut core.dma,
             irq: &mut core.irq,
+            timers: &mut core.timers,
         };
         bus.store32(0x1F80_1074, 0x1); // I_MASK = VBlank
         assert_eq!(bus.load32(0x1F80_1074), 0x1);

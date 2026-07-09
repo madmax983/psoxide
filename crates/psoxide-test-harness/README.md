@@ -14,11 +14,23 @@ The [`Harness`] type drives `psoxide-core` through its public `Command` /
   `PS-X EXE` header, copy the body to its `t_addr`, and stage PC/GP/SP/`$ra`.
 
 When a sideloaded EXE calls the BIOS, `Harness::run_hle` high-level-emulates the
-A0h/B0h jump-table entries for `std_out_putchar` and `std_out_puts`, capturing
-console output so it can be read back with `Harness::tty()` /
-`Harness::tty_bytes()` (`clear_tty()` resets the buffer). This lets CPU test
+A0h/B0h jump-table entries for `std_out_putchar`, `std_out_puts`, and
+`printf` (A(0x3F), with `%d/%i/%u/%x/%X/%o/%c/%s/%p` plus flags, width, and
+precision), capturing console output so it can be read back with `Harness::tty()`
+/ `Harness::tty_bytes()` (`clear_tty()` resets the buffer). This lets CPU test
 programs produce their pass/fail TTY log without a real BIOS image. Execution
 stops when the program returns to the sentinel `HLE_RETURN_ADDR`.
+
+`run_hle` also stands in for the **BIOS general exception handler** when a test
+takes an exception and no real BIOS or test-installed handler lives at the
+vector (`0x8000_0080` / `0xBFC0_0180`): it dispatches `syscall`
+(`EnterCriticalSection` / `ExitCriticalSection` by `$a0`), acknowledges hardware
+interrupts, and performs the `rfe`-style return (resuming at `EPC + 4` for a
+syscall, `EPC` for an interrupt). If nonzero code is present at the vector — a
+test that installs its own handler — the harness leaves it alone and lets the CPU
+run it. Finally, `run_hle` injects a VBlank interrupt roughly once per frame's
+worth of stepping so `VSync`-polling programs make progress (`StepCpu` alone
+never raises VBlank).
 
 ## Always-on CPU gate (runs in CI, no external assets)
 
@@ -35,45 +47,63 @@ These tests are self-contained and run on every `cargo test --workspace`:
   zero-extension, `SLT` vs `SLTU` signedness, `LWL`/`LWR` merge, and `JAL`/`JALR`
   link = jump + 8. Expected values are taken from the MIPS I specification, not
   from this emulator, so they catch interpreter regressions.
+- **`tests/ps1_tests.rs`** — drives the four **vendored** JaCzekanski `ps1-tests`
+  CPU binaries (`cpu/{cop,code-in-io,io-access-bitwidth,access-time}`, MIT, under
+  `tests/fixtures/ps1-tests/`) end-to-end through the sideloader + HLE + timers
+  and asserts each loads, executes, and reaches its known progress markers (e.g.
+  `cop` runs to `Done.` reporting the coprocessor-enabled passes). These are
+  regression guards for the real-PS-EXE path; they do **not** yet assert a full
+  `psx.log` match (each suite still needs hardware listed in the blocker table
+  below — the vendored `psx.log` goldens are kept so the gate can be tightened as
+  that hardware lands).
 
-## External reference suites (env-gated, NOT vendored)
+The four `ps1-tests` CPU binaries these gates use are **vendored** (MIT) under
+`tests/fixtures/ps1-tests/` — see that directory's `README.md`/`LICENSE` for
+attribution and per-file SHA1s. They now run every `cargo test`; the gates assert
+end-to-end execution, not (yet) a full golden match.
 
-These binaries are not committed to the repo. Obtain them out-of-band and run
-them through the ignored `run_real_suite` driver.
+## Amidog `psxtest_cpu` (env-gated, NOT vendored)
 
-| Suite | License | How to obtain (SHA1) | Runtime feature(s) still needed |
-|-------|---------|----------------------|---------------------------------|
-| **JaCzekanski ps1-tests** (`cpu/`) | MIT | https://github.com/JaCzekanski/ps1-tests (prebuilt binaries in Releases `build-158`). CI-friendly mirror (GitHub egress-blocked in our env): `https://archive.org/download/tests_202203/tests.zip`, zip SHA1 `bc9d5f910cd79f86ec703f198f0bf46a12253ab6`. CPU EXEs + expected `psx.log` under `cpu/{access-time,io-access-bitwidth,code-in-io,cop}/`. Per-exe SHA1: access-time `bf3e90089b7e8a1b92ca18f2f547b205bf595559`, code-in-io `409ac92b8f77ed753a85076a926cfb37dd7431ff`, cop `74bf58ae5237263ab2580dcc5558c3e75b8b53f5`, io-access-bitwidth `9b1c1e87b7969d7c64f2c61d6bda020ab014668d`. | Output is plain ASCII TTY (psn00bsdk `printf` → BIOS putchar); verify by diffing captured TTY against the shipped `psx.log`. See blockers table below. |
-| **Amidog psxtest_cpu** | CC BY-NC-SA 3.0 (non-commercial) — **not vendored** (non-commercial + share-alike is incompatible with vendoring into this project) | `https://psx.amidog.se/lib/exe/fetch.php?media=psx:download:psxtest_cpu.zip`; extracted `psxtest_cpu.exe` SHA1 `023aec8c92aaaf4d3b07956e26dd6c77ff397456`. | Reports results to the GPU and to TTY. See blockers table below. |
+Amidog `psxtest_cpu` is **CC BY-NC-SA 3.0** (non-commercial + share-alike), which
+is incompatible with vendoring into this project, so it stays env-gated behind the
+ignored `run_real_suite` driver.
 
-### How to run one manually
+- Obtain: `https://psx.amidog.se/lib/exe/fetch.php?media=psx:download:psxtest_cpu.zip`
+  → extracted `psxtest_cpu.exe` SHA1 `023aec8c92aaaf4d3b07956e26dd6c77ff397456`.
+- Run:
 
-```
-PSOXIDE_EXE=/path/to/test.exe \
-PSOXIDE_STEPS=50000000 \
-PSOXIDE_OUT=/tmp/out.txt \
-cargo test -p psoxide-test-harness --release run_real_suite -- --ignored --nocapture
-```
+  ```
+  PSOXIDE_EXE=/path/to/psxtest_cpu.exe \
+  PSOXIDE_STEPS=80000000 \
+  PSOXIDE_OUT=/tmp/amidog.txt \
+  cargo test -p psoxide-test-harness --release run_real_suite -- --ignored --nocapture
+  ```
+
+- Expected: with timers + the syscall/`printf`/exception HLE, the suite now runs
+  end-to-end and prints its per-instruction test log (`Running <op> test` / `Done`)
+  down to a final `Result: <errors>` line. Every ALU, shift, mul/div, immediate,
+  and branch group passes. The remaining errors are the exhaustive **back-to-back
+  load-delay matrix** (`nop_<load>_<load>_d`, i.e. two loads targeting the same
+  register in consecutive slots) plus a few exception-return-address cases — both
+  require precise R3000 load-delay-slot pipeline modelling, tracked as a CPU-
+  accuracy follow-up (see below).
 
 `PSOXIDE_EXE` is required; `PSOXIDE_STEPS` (step budget, default 50,000,000) and
-`PSOXIDE_OUT` (write captured TTY to a file) are optional. The driver prints the
-step count, whether it terminated via the sentinel, the final PC, and the
-captured TTY.
+`PSOXIDE_OUT` (write captured TTY to a file) are optional. The same driver runs
+any PS-EXE, including the vendored `ps1-tests` binaries, for ad-hoc inspection.
 
-## Why the external suites are gated (remaining runtime blockers)
+## Remaining runtime blockers (why the gates aren't full golden diffs)
 
-These binaries assume a booting console and stall on hardware the core does not
-implement yet. Each blocker below names the suites it holds back:
+Milestone-2 landed hardware timers (`timers.rs`), the VBlank interrupt in the
+step loop, and the BIOS TTY/`printf`/exception HLE — so all four `ps1-tests` CPU
+binaries and Amidog `psxtest_cpu` now **run to completion** instead of stalling.
+Turning each gate into a byte-for-byte `psx.log` comparison still needs hardware
+that is out of scope for this milestone:
 
-| Blocker | Missing hardware | Suites blocked | Provided by |
-|---------|------------------|----------------|-------------|
-| **GPUSTAT-ready** | GPU status poll at `0x1F801814` bit 26 during GPU init | **all** of them | in-progress GPU work (branch `gpu-command-fifo`) |
-| **VBlank interrupt / frame counter** | `VSync` wait (I_STAT/I_MASK + VBlank tick) | `io-access-bitwidth`, `code-in-io`, Amidog `psxtest_cpu` | `gpu-command-fifo` |
-| **BIOS syscall + exception-vector handling** | `syscall` → 0xBFC00180 (EnterCriticalSection / ExitCriticalSection) | `cop`, `access-time` | milestone-2 follow-up (needs a BIOS image or syscall HLE) |
-| **Hardware timers** | root-counter timing | `access-time` (additionally) | milestone-2 follow-up |
-
-Bottom line: once VBlank IRQ + GPUSTAT land (via `gpu-command-fifo`), enabling
-ps1-tests `io-access-bitwidth` / `code-in-io` is a mechanical re-run against
-their shipped `psx.log`. `cop` / `access-time` / Amidog `psxtest_cpu`
-additionally need BIOS syscall/exception handling (and, for `access-time`,
-timers) — a milestone-2 follow-up.
+| Suite | Runs to completion | Remaining hardware for a full pass |
+|-------|--------------------|------------------------------------|
+| `cop` | yes (`Done.`, coprocessor-*enabled* cases pass) | BIOS **exception-dispatch chain** (so a program-registered handler actually runs and can observe the trap) + the **coprocessor-unusable** exception (ExcCode 0x0B). Our HLE services the trap itself but does not invoke a test-installed handler. |
+| `code-in-io` | header + `testCodeInRam` pass | instruction **bus-error** exception (ExcCode 0x06) for fetches from MDEC/IO/SPU. |
+| `io-access-bitwidth` | yes (`Done.`, RAM/scratchpad rows correct) | JOY / SIO / SPU / CD-ROM / MDEC registers with per-bitwidth semantics, plus data **bus-error** (`--CRASH--`) cases. |
+| `access-time` | yes (`Done.`) | **cycle-accurate** per-region access timing; the one-cycle-per-instruction model cannot reproduce the reference cycle counts (this test has no self-asserted pass/fail — it is a manual comparison). |
+| Amidog `psxtest_cpu` | yes (`Result:` printed) | precise R3000 **load-delay-slot pipeline** for back-to-back same-register loads; BIOS exception-dispatch chain for the rfe/break/syscall return-address cases. |
