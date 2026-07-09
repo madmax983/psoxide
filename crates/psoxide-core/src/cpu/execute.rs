@@ -219,6 +219,9 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
             cpu.lo = product as u32;
             cpu.hi = (product >> 32) as u32;
         }
+        // MIPS defines specific LO/HI results for divide-by-zero and i32::MIN/-1; checked_div can't express those, so the manual guard is intentional.
+        // (unknown_lints keeps this compiling on pre-1.96 clippy that lacks manual_checked_ops.)
+        #[allow(unknown_lints, clippy::manual_checked_ops)]
         Instruction::Div { rs, rt } => {
             let n = cpu.reg(rs) as i32;
             let d = cpu.reg(rt) as i32;
@@ -233,6 +236,9 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 cpu.hi = (n % d) as u32;
             }
         }
+        // MIPS defines specific LO/HI results for divide-by-zero; checked_div can't express those, so the manual guard is intentional.
+        // (unknown_lints keeps this compiling on pre-1.96 clippy that lacks manual_checked_ops.)
+        #[allow(unknown_lints, clippy::manual_checked_ops)]
         Instruction::Divu { rs, rt } => {
             let n = cpu.reg(rs);
             let d = cpu.reg(rt);
