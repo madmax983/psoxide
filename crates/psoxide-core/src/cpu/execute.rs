@@ -219,6 +219,9 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
             cpu.lo = product as u32;
             cpu.hi = (product >> 32) as u32;
         }
+        // MIPS defines specific LO/HI results for divide-by-zero and i32::MIN/-1; checked_div can't express those, so the manual guard is intentional.
+        // (unknown_lints keeps this compiling on pre-1.96 clippy that lacks manual_checked_ops.)
+        #[allow(unknown_lints, clippy::manual_checked_ops)]
         Instruction::Div { rs, rt } => {
             let n = cpu.reg(rs) as i32;
             let d = cpu.reg(rt) as i32;
@@ -233,6 +236,9 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 cpu.hi = (n % d) as u32;
             }
         }
+        // MIPS defines specific LO/HI results for divide-by-zero; checked_div can't express those, so the manual guard is intentional.
+        // (unknown_lints keeps this compiling on pre-1.96 clippy that lacks manual_checked_ops.)
+        #[allow(unknown_lints, clippy::manual_checked_ops)]
         Instruction::Divu { rs, rt } => {
             let n = cpu.reg(rs);
             let d = cpu.reg(rt);
@@ -500,18 +506,60 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
         }
 
         // ── Coprocessors 1 / 2 / 3 ──────────────────────────────────────
-        // The PSX has no COP1/COP3, and the COP2 (GTE) datapath is
-        // unimplemented, but the usability trap is real: a COP{n} op with its
-        // `SR.CU{n}` bit clear raises Coprocessor Unusable (CE=n). When usable
-        // each stays a no-op.
+        // The PSX has no COP1/COP3, but the usability trap is real: a COP{n} op
+        // with its `SR.CU{n}` bit clear raises Coprocessor Unusable (CE=n).
+        // COP1/COP3 stay no-ops when usable; COP2 drives the GTE.
         Instruction::Cop1 { .. } => {
             if !cop_usable(cpu, 1) {
                 enter_cop_unusable(cpu, 1);
             }
         }
+        // An unassigned COP2 (GTE) sub-op: a no-op when usable, else CE=2.
         Instruction::Cop2 { .. } => {
             if !cop_usable(cpu, 2) {
                 enter_cop_unusable(cpu, 2);
+            }
+        }
+        // GTE register moves. MFC2/CFC2 read a GTE register through the load
+        // delay slot (like MFC0); MTC2/CTC2 write immediately.
+        Instruction::Mfc2 { rt, rd } => {
+            if !cop_usable(cpu, 2) {
+                enter_cop_unusable(cpu, 2);
+            } else {
+                let value = cpu.gte.read_data(rd);
+                queue_load(cpu, rt, value);
+            }
+        }
+        Instruction::Cfc2 { rt, rd } => {
+            if !cop_usable(cpu, 2) {
+                enter_cop_unusable(cpu, 2);
+            } else {
+                let value = cpu.gte.read_control(rd);
+                queue_load(cpu, rt, value);
+            }
+        }
+        Instruction::Mtc2 { rt, rd } => {
+            if !cop_usable(cpu, 2) {
+                enter_cop_unusable(cpu, 2);
+            } else {
+                let value = cpu.reg(rt);
+                cpu.gte.write_data(rd, value);
+            }
+        }
+        Instruction::Ctc2 { rt, rd } => {
+            if !cop_usable(cpu, 2) {
+                enter_cop_unusable(cpu, 2);
+            } else {
+                let value = cpu.reg(rt);
+                cpu.gte.write_control(rd, value);
+            }
+        }
+        // A GTE command word (`CO=1`): runs the geometry op when COP2 is usable.
+        Instruction::Gte { cmd } => {
+            if !cop_usable(cpu, 2) {
+                enter_cop_unusable(cpu, 2);
+            } else {
+                cpu.gte.execute(cmd);
             }
         }
         Instruction::Cop3 { .. } => {
@@ -525,12 +573,42 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
         // the coprocessor number). Unlike the COP0 register ops (MFC0/MTC0),
         // LWC0/SWC0 get *no* kernel-mode exemption: on the R3000 a coprocessor
         // load/store with its CU bit clear raises Coprocessor Unusable even in
-        // kernel mode. No coprocessor load/store target is implemented, so a
-        // usable LWC/SWC is a no-op.
-        Instruction::Lwc { cop, .. } | Instruction::Swc { cop, .. } => {
-            let cop = u32::from(cop);
-            if cpu.sr() & (1 << (28 + cop)) == 0 {
-                enter_cop_unusable(cpu, cop);
+        // kernel mode. LWC2/SWC2 transfer to/from GTE data registers; the other
+        // coprocessors have no load/store target, so a usable LWC/SWC is a no-op.
+        Instruction::Lwc { cop, raw } => {
+            let copn = u32::from(cop);
+            if cpu.sr() & (1 << (28 + copn)) == 0 {
+                enter_cop_unusable(cpu, copn);
+            } else if cop == 2 {
+                let base = ((raw >> 21) & 0x1F) as u8;
+                let dst = ((raw >> 16) & 0x1F) as u8;
+                let off = (raw & 0xFFFF) as u16;
+                let addr = cpu.reg(base).wrapping_add(sign_extend(off));
+                if addr & 3 != 0 {
+                    cpu.cop0[COP0_BADVADDR] = addr;
+                    enter_exception(cpu, EXC_ADEL);
+                } else {
+                    let value = bus.load32(addr);
+                    cpu.gte.write_data(dst, value);
+                }
+            }
+        }
+        Instruction::Swc { cop, raw } => {
+            let copn = u32::from(cop);
+            if cpu.sr() & (1 << (28 + copn)) == 0 {
+                enter_cop_unusable(cpu, copn);
+            } else if cop == 2 {
+                let base = ((raw >> 21) & 0x1F) as u8;
+                let src = ((raw >> 16) & 0x1F) as u8;
+                let off = (raw & 0xFFFF) as u16;
+                let addr = cpu.reg(base).wrapping_add(sign_extend(off));
+                if addr & 3 != 0 {
+                    cpu.cop0[COP0_BADVADDR] = addr;
+                    enter_exception(cpu, EXC_ADES);
+                } else if !cache_isolated(cpu) {
+                    let value = cpu.gte.read_data(src);
+                    bus.store32(addr, value);
+                }
             }
         }
 

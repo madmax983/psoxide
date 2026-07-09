@@ -17,6 +17,7 @@
 //!   instruction, so that instruction still reads the register's old value.
 
 use super::CpuSnapshot;
+use crate::gte::Gte;
 
 /// Coprocessor-0 register index for the bad virtual address (`BadVaddr`).
 pub const COP0_BADVADDR: usize = 8;
@@ -55,6 +56,8 @@ pub struct Cpu {
     pub lo: u32,
     /// Coprocessor-0 system-control registers (indexed 0..=31 by `rd`).
     pub cop0: [u32; 32],
+    /// Coprocessor-2 (GTE) geometry-transformation engine state.
+    pub gte: Gte,
     /// Pending load: `(register, value)` committed before the next
     /// instruction's operands are read. Register 0 means "no load".
     pub pending_load: (u8, u32),
@@ -79,6 +82,7 @@ impl Cpu {
             hi: 0,
             lo: 0,
             cop0: [0; 32],
+            gte: Gte::new(),
             pending_load: (0, 0),
             branch: false,
             delay_slot: false,
@@ -98,6 +102,7 @@ impl Cpu {
         self.hi = 0;
         self.lo = 0;
         self.cop0 = [0; 32];
+        self.gte = Gte::new();
         // Boot with BEV set, matching R3000A reset behaviour.
         self.cop0[COP0_SR] = SR_BEV;
         self.pending_load = (0, 0);
@@ -146,6 +151,7 @@ impl Cpu {
             hi: self.hi,
             lo: self.lo,
             cop0: self.cop0,
+            gte: self.gte.clone(),
             pending_load: self.pending_load,
             cycles: self.cycles,
         }
@@ -161,6 +167,7 @@ impl Cpu {
         self.hi = snap.hi;
         self.lo = snap.lo;
         self.cop0 = snap.cop0;
+        self.gte = snap.gte.clone();
         self.pending_load = snap.pending_load;
         self.branch = false;
         self.delay_slot = false;

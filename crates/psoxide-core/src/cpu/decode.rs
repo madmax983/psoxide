@@ -140,8 +140,20 @@ pub enum Instruction {
     /// Any coprocessor-1 operation. The PSX has no COP1; usable via `SR.CU1`
     /// (CE=1) and a no-op when usable. The raw word is retained.
     Cop1 { raw: u32 },
-    /// Any coprocessor-2 (GTE) operation. Decoded but not executed; the raw
-    /// instruction word is retained for future implementation.
+    /// Move from GTE data register: `rt = cop2_data[rd]` (through the load
+    /// delay slot).
+    Mfc2 { rt: Reg, rd: Reg },
+    /// Move from GTE control register: `rt = cop2_ctrl[rd]` (through the load
+    /// delay slot).
+    Cfc2 { rt: Reg, rd: Reg },
+    /// Move to GTE data register: `cop2_data[rd] = rt`.
+    Mtc2 { rt: Reg, rd: Reg },
+    /// Move to GTE control register: `cop2_ctrl[rd] = rt`.
+    Ctc2 { rt: Reg, rd: Reg },
+    /// A GTE command (`CO=1`). `cmd` is the 25-bit `imm25` command word.
+    Gte { cmd: u32 },
+    /// Any other coprocessor-2 operation (an unassigned `CO=0` sub-op). Usable
+    /// via `SR.CU2`; a no-op when usable. The raw word is retained.
     Cop2 { raw: u32 },
     /// Any coprocessor-3 operation. The PSX has no COP3; usable via `SR.CU3`
     /// (CE=3) and a no-op when usable. The raw word is retained.
@@ -223,6 +235,10 @@ const fn imm(instr: u32) -> u16 {
 #[inline]
 const fn target(instr: u32) -> u32 {
     instr & 0x03FF_FFFF
+}
+#[inline]
+const fn imm25(instr: u32) -> u32 {
+    instr & 0x01FF_FFFF
 }
 
 /// Decodes a raw 32-bit instruction word into an [`Instruction`].
@@ -312,7 +328,7 @@ pub fn decode(instr: u32) -> Instruction {
         },
         0x10 => decode_cop0(instr),
         0x11 => Instruction::Cop1 { raw: instr },
-        0x12 => Instruction::Cop2 { raw: instr },
+        0x12 => decode_cop2(instr),
         0x13 => Instruction::Cop3 { raw: instr },
         0x20 => Instruction::Lb {
             rt: rt(instr),
@@ -515,6 +531,34 @@ fn decode_bcond(instr: u32) -> Instruction {
         // fall back to the primary decode for the rest.
         other if other & 1 == 0 => Instruction::Bltz { rs, imm },
         _ => Instruction::Bgez { rs, imm },
+    }
+}
+
+fn decode_cop2(instr: u32) -> Instruction {
+    // The rs field selects the COP2 (GTE) operation class. `CO=1` (rs bit 4
+    // set) is a GTE command carrying a 25-bit `imm25`; the register moves have
+    // their own `rs` selectors.
+    match rs(instr) {
+        0x00 => Instruction::Mfc2 {
+            rt: rt(instr),
+            rd: rd(instr),
+        },
+        0x02 => Instruction::Cfc2 {
+            rt: rt(instr),
+            rd: rd(instr),
+        },
+        0x04 => Instruction::Mtc2 {
+            rt: rt(instr),
+            rd: rd(instr),
+        },
+        0x06 => Instruction::Ctc2 {
+            rt: rt(instr),
+            rd: rd(instr),
+        },
+        rs if rs & 0x10 != 0 => Instruction::Gte { cmd: imm25(instr) },
+        // Any other CO=0 sub-op is an unassigned COP2 op: a no-op when usable,
+        // never a reserved-instruction trap.
+        _ => Instruction::Cop2 { raw: instr },
     }
 }
 
@@ -897,9 +941,30 @@ mod tests {
     }
 
     #[test]
-    fn decode_cop2_is_stubbed() {
-        let raw = (0x12 << 26) | 0x0048_0012;
-        assert_eq!(decode(raw), Instruction::Cop2 { raw });
+    fn decode_cop2_moves_and_commands() {
+        // MFC2 $t0, $2: rs=0, rt=8, rd=2.
+        assert_eq!(
+            decode((0x12 << 26) | (8 << 16) | (2 << 11)),
+            Instruction::Mfc2 { rt: 8, rd: 2 }
+        );
+        // CFC2 $t0, $2: rs=2.
+        assert_eq!(
+            decode((0x12 << 26) | (0x02 << 21) | (8 << 16) | (2 << 11)),
+            Instruction::Cfc2 { rt: 8, rd: 2 }
+        );
+        // MTC2 $t0, $2: rs=4.
+        assert_eq!(
+            decode((0x12 << 26) | (0x04 << 21) | (8 << 16) | (2 << 11)),
+            Instruction::Mtc2 { rt: 8, rd: 2 }
+        );
+        // CTC2 $t0, $2: rs=6.
+        assert_eq!(
+            decode((0x12 << 26) | (0x06 << 21) | (8 << 16) | (2 << 11)),
+            Instruction::Ctc2 { rt: 8, rd: 2 }
+        );
+        // A GTE command (CO=1, bit 25 set): RTPS with sf=1 → imm25 = 0x0008_0001.
+        let raw = (0x12 << 26) | 0x0200_0000 | 0x0008_0001;
+        assert_eq!(decode(raw), Instruction::Gte { cmd: 0x0008_0001 });
     }
 
     #[test]
