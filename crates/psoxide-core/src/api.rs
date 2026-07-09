@@ -1025,6 +1025,34 @@ mod tests {
     }
 
     #[test]
+    fn narrow_io_read_adapts_width_against_backed_register() {
+        // A legal narrow read of a backed I/O register returns the correctly
+        // width-adapted value (byte lane, half lane, zero-extended word) — the
+        // width-policing the ps1-tests `io-access-bitwidth` RAM/scratchpad/SPU
+        // rows exercise. No wrong-width access traps here; only misaligned word
+        // accesses (handled in the CPU) raise an address error.
+        let mut core = PsxCore::new();
+        let mut bus = CoreBus {
+            mem: &mut core.mem,
+            gpu: &mut core.gpu,
+            dma: &mut core.dma,
+            irq: &mut core.irq,
+            timers: &mut core.timers,
+            memctrl: &mut core.memctrl,
+            cache_ctrl: &mut core.cache_ctrl,
+            sio0: &mut core.sio0,
+            cdrom: &mut core.cdrom,
+            spu: &mut core.spu,
+        };
+        // SPU register file (0x1F80_1C00) is byte-addressable backing store.
+        bus.store16(0x1F80_1C00, 0xABCD);
+        assert_eq!(bus.load8(0x1F80_1C00), 0xCD, "byte lane");
+        assert_eq!(bus.load8(0x1F80_1C01), 0xAB, "high byte lane");
+        assert_eq!(bus.load16(0x1F80_1C00), 0xABCD, "half read");
+        assert_eq!(bus.load32(0x1F80_1C00), 0x0000_ABCD, "word zero-extends");
+    }
+
+    #[test]
     fn framebuffer_reflects_vram_when_enabled() {
         let mut core = PsxCore::new();
         core.gpu.display_enabled = true;

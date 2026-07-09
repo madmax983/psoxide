@@ -77,12 +77,15 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   unmapped) raises IBE before the opcode is decoded/executed; EPC/BD are set as
   usual and (unlike an address error) BadVaddr is left untouched. Main RAM and
   BIOS are legal code sources; the DMA register block (0x1F80_1080..0x1F80_10FF)
-  is also fetchable, matching real hardware (ps1-tests `code-in-io`
-  testCodeInDMA0/testCodeInDMAControl) since psoxide backs those registers. The
-  SPU register block is fetchable on hardware too but is not yet backed, so it
-  still faults (needs the SPU device stubs). The **data** bus-error (ExcCode
-  0x07, DBE) is not modelled — unmapped data accesses still read 0 / drop
-  writes rather than trapping
+  and the SPU register block (0x1F80_1C00..0x1F80_1FFF) are also fetchable,
+  matching real hardware (ps1-tests `code-in-io` testCodeInDMA0/
+  testCodeInDMAControl and testCodeInSPU — now **7/7**) since psoxide backs both
+  register files. The **data** bus-error (ExcCode 0x07, DBE) has a constant
+  (`EXC_DBE`) and `enter_exception` semantics (EPC/BD set, BadVaddr untouched),
+  but no live trigger: the regions the boot path and ps1-tests
+  `io-access-bitwidth` touch answer with open-bus reads / dropped writes (or an
+  *address* error on a misaligned word access) rather than a data bus error, so
+  wiring one would regress that open-bus behaviour
 - BIOS exception-dispatch chain — the core exception path (vectors/EPC/rfe/
   syscall) is complete, but there is no BIOS kernel in psoxide-core to dispatch a
   program's registered exception/interrupt handlers. The test harness HLEs the

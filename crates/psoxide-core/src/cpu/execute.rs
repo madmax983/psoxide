@@ -38,6 +38,22 @@ pub const EXC_ADES: u32 = 0x05;
 /// scratchpad, expansion, cache-control, unmapped). Unlike an address error, a
 /// bus error does *not* write `BadVaddr`.
 pub const EXC_IBE: u32 = 0x06;
+/// Bus error on a data load/store (`DBE`). The data counterpart of
+/// [`EXC_IBE`]: raised when a *data* access reaches a physical region that does
+/// not respond to a data bus cycle. Like the instruction bus error, and unlike
+/// an address error, a data bus error does **not** write `BadVaddr`; `EPC`/`BD`
+/// are recorded as usual by [`enter_exception`].
+///
+/// Note: no data access in psoxide currently raises this. On the PlayStation a
+/// genuine data bus error is rare — the regions the boot path and the ps1-tests
+/// `io-access-bitwidth` suite touch answer with open-bus reads / dropped writes
+/// (or, for a misaligned word access, an *address* error [`EXC_ADEL`]/
+/// [`EXC_ADES`], which is already modelled) rather than a data bus error. The
+/// constant and its [`enter_exception`] semantics exist so a future data device
+/// that must fault (or a save-state / debugger consumer) has the correct
+/// exception path available; wiring a live trigger would regress the open-bus
+/// behaviour the BIOS boot and `io-access-bitwidth` rows depend on.
+pub const EXC_DBE: u32 = 0x07;
 /// System call.
 pub const EXC_SYSCALL: u32 = 0x08;
 /// Breakpoint.
@@ -623,6 +639,12 @@ fn fetch_ok(virt: u32) -> bool {
         // real hardware executes code fetched from here, and psoxide's DMA
         // register file returns the written words.
         BusRegion::IoPorts if (0x1F80_1080..=0x1F80_10FF).contains(&phys) => true,
+        // SPU register block (0x1F80_1C00..=0x1F80_1FFF): real hardware also
+        // responds to a code fetch here, and psoxide now backs the SPU register
+        // file (`iostubs::Spu`) with write-then-read-back semantics, so a copied
+        // instruction word reads back and executes (ps1-tests `code-in-io`
+        // testCodeInSPU). See `crate::iostubs::{SPU_BASE, SPU_END}`.
+        BusRegion::IoPorts if (0x1F80_1C00..=0x1F80_1FFF).contains(&phys) => true,
         _ => false,
     }
 }
@@ -1444,6 +1466,41 @@ mod tests {
         step(&mut cpu, &mut bus);
         assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0, "no bus error");
         assert_eq!(cpu.reg(8), 7);
+    }
+
+    #[test]
+    fn instruction_fetch_from_spu_region_executes() {
+        // The SPU register block responds to a code fetch on hardware (ps1-tests
+        // testCodeInSPU); now that psoxide backs the SPU register file, a fetch
+        // there is legal and the copied opcode runs.
+        let (mut cpu, mut bus) = setup(&[]);
+        // 0x1F80_1C00 masks to 0x1C00 on the flat test bus.
+        bus.write_u32(0x1C00, i_type(0x09, 0, 8, 9)); // addiu $t0,$zero,9
+        cpu.pc = 0x1F80_1C00;
+        cpu.next_pc = 0x1F80_1C04;
+        step(&mut cpu, &mut bus);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0, "no bus error");
+        assert_eq!(cpu.reg(8), 9);
+    }
+
+    #[test]
+    fn data_bus_error_records_epc_and_leaves_badvaddr() {
+        // A data Bus Error (ExcCode 0x07) records EPC/BD via the shared
+        // `enter_exception` path and, like the instruction bus error and unlike
+        // an address error, must not write BadVaddr.
+        let mut cpu = Cpu::new();
+        cpu.cop0[COP0_SR] = SR_BEV;
+        cpu.cop0[COP0_BADVADDR] = 0xDEAD_BEEF;
+        cpu.current_pc = 0x1F80_2000;
+        cpu.delay_slot = false;
+        enter_exception(&mut cpu, EXC_DBE);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_DBE);
+        assert_eq!(cpu.cop0[COP0_EPC], 0x1F80_2000);
+        assert_eq!(cpu.pc, 0xBFC0_0180);
+        assert_eq!(
+            cpu.cop0[COP0_BADVADDR], 0xDEAD_BEEF,
+            "DBE must not write BadVaddr"
+        );
     }
 
     #[test]
