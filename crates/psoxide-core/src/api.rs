@@ -505,6 +505,44 @@ impl PsxCore {
         self.cpu.current_pc = pc;
     }
 
+    /// Reads general-purpose register `index` (architectural value). Useful for
+    /// test harnesses that high-level-emulate BIOS calls.
+    #[must_use]
+    pub fn reg(&self, index: usize) -> u32 {
+        self.cpu.regs[index]
+    }
+
+    /// Writes general-purpose register `index` directly into both register
+    /// banks so the value is immediately visible (no load-delay). For test
+    /// harnesses that stage BIOS-call results.
+    pub fn set_reg(&mut self, index: usize, value: u32) {
+        if index != 0 {
+            self.cpu.regs[index] = value;
+            self.cpu.out_regs[index] = value;
+        }
+    }
+
+    /// Reads coprocessor-0 register `index`.
+    #[must_use]
+    pub fn cop0(&self, index: usize) -> u32 {
+        self.cpu.cop0[index]
+    }
+
+    /// Writes coprocessor-0 register `index`. For test harnesses that
+    /// high-level-emulate the BIOS exception handler.
+    pub fn set_cop0(&mut self, index: usize, value: u32) {
+        self.cpu.cop0[index] = value;
+    }
+
+    /// Raises a VBlank interrupt and advances the interlace field, exactly as
+    /// [`Command::StepFrame`] does once per frame. Exposed for test harnesses
+    /// that drive the CPU via [`Command::StepCpu`] but still need `VSync`-based
+    /// programs to make progress.
+    pub fn raise_vblank(&mut self) {
+        self.gpu.field = !self.gpu.field;
+        self.irq.set(IrqLine::VBlank);
+    }
+
     /// Executes a single command.
     ///
     /// # Errors
