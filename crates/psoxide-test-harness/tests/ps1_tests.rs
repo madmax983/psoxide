@@ -106,11 +106,17 @@ fn code_in_io_executes_code_from_ram() {
     //   * testCodeInDMA0 / testCodeInDMAControl — the DMA register block responds
     //     to code fetch (no exception); psoxide backs those registers, so the
     //     copied `jr $ra` is read back and executes.
+    //   * testCodeInSPU — the SPU register block also responds to a code fetch on
+    //     hardware; psoxide now backs the SPU register file (`iostubs::Spu`), so
+    //     `fetch_ok` treats it as a legal fetch source and the copied `jr $ra`
+    //     reads back and executes. This is the full 7/7 set — a byte-for-byte
+    //     match against the vendored `psx.log` golden.
     for case in [
         "testCodeInRam",
         "testCodeInScratchpad",
         "testCodeInMDEC",
         "testCodeInInterrupts",
+        "testCodeInSPU",
         "testCodeInDMA0",
         "testCodeInDMAControl",
     ] {
@@ -120,16 +126,21 @@ fn code_in_io_executes_code_from_ram() {
         );
     }
 
-    // testCodeInSPU is the one remaining case: on hardware the SPU register block
-    // also responds to code fetch (no exception), but psoxide does not yet back
-    // the SPU register file, so the copied code cannot be read back. It therefore
-    // still faults rather than executing — it needs the SPU device stubs (a
-    // separate device-register workstream), not more CPU work. The suite runs to
-    // completion either way.
     assert!(
         tty.contains("Done."),
         "code-in-io did not run to completion:\n{tty}"
     );
+
+    // Tighten to the full golden: every non-empty line of the vendored `psx.log`
+    // must appear in the captured TTY (7/7).
+    let golden = String::from_utf8(fixture("cpu/code-in-io/psx.log")).unwrap();
+    let produced: std::collections::HashSet<&str> = tty.lines().map(str::trim_end).collect();
+    for line in golden.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
+        assert!(
+            produced.contains(line),
+            "code-in-io golden line missing from output: {line:?}\n{tty}"
+        );
+    }
 }
 
 #[test]
@@ -139,11 +150,54 @@ fn io_access_bitwidth_runs_to_completion() {
         tty.contains("cpu/io-access-bitwidth"),
         "header missing:\n{tty}"
     );
-    // RAM / scratchpad byte/half/word write-then-read paths behave correctly;
-    // the many device rows still need the missing peripherals.
     assert!(
         tty.contains("Done."),
         "io-access-bitwidth did not run to completion:\n{tty}"
+    );
+
+    // Assert the real (currently achievable) pass set against the vendored
+    // `psx.log` golden rather than just the progress marker. The generic memory
+    // regions (RAM, SCRATCHPAD) reproduce the byte/half/word write-then-read
+    // adaptation exactly across all three read widths, and the misaligned 32-bit
+    // word accesses (JOY_CTRL / SIO_CTRL / SPUCNT at 0x…A) raise the existing
+    // address-error path so the `--CRASH--` cells match. Every one of these
+    // golden lines must appear verbatim (trailing whitespace ignored).
+    let produced: std::collections::HashSet<&str> = tty.lines().map(str::trim_end).collect();
+    for line in [
+        // 32-bit read section.
+        "RAM        (0x80080000)         0x78        0x5678    0x12345678",
+        "SCRATCHPAD (0x1f800000)         0x78        0x5678    0x12345678",
+        "JOY_CTRL   (0x1f80104a)            0             0    --CRASH--",
+        // 16-bit read section.
+        "RAM        (0x80080000)         0x78        0x5678",
+        "SCRATCHPAD (0x1f800000)         0x78        0x5678",
+        // 8-bit read section.
+        "RAM        (0x80080000)         0x78",
+        "SCRATCHPAD (0x1f800000)         0x78",
+    ] {
+        assert!(
+            produced.contains(line),
+            "io-access-bitwidth golden row missing from output: {line:?}\n{tty}"
+        );
+    }
+
+    // Guard the aggregate count so device-accuracy work can only raise it: at
+    // least 28 of the 67 golden lines match today. The remaining rows need
+    // per-device narrow-access width semantics psoxide does not model yet — DMA
+    // register 32-bit-only reads, JOY/SIO/IRQ/timer/CDROM/GPU/MDEC/SPU
+    // width-adaptation, expansion open-bus, and a real BIOS image for the BIOS
+    // row (see the test-harness README). None of these are data bus errors: the
+    // only `io-access-bitwidth` traps are the misaligned-word address errors
+    // above.
+    let golden = String::from_utf8(fixture("cpu/io-access-bitwidth/psx.log")).unwrap();
+    let matched = golden
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| produced.contains(l))
+        .count();
+    assert!(
+        matched >= 28,
+        "io-access-bitwidth golden match regressed: {matched} < 28"
     );
 }
 
