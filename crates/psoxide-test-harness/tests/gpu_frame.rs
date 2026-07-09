@@ -80,6 +80,42 @@ fn textured_quad_is_visible_in_framebuffer() {
 }
 
 #[test]
+fn gouraud_line_is_visible_and_interpolated_in_framebuffer() {
+    let mut core = PsxCore::new();
+    let gpu = core.gpu_mut();
+    gpu.gp1(0x0000_0000); // reset
+    gpu.gp1(0x0500_0000); // display area (0,0)
+    gpu.gp1(0x0800_0000); // 15bpp NTSC
+    gpu.gp1(0x0300_0000); // display enable
+
+    // Drawing area covers the whole visible frame.
+    gpu.gp0(0xE300_0000);
+    gpu.gp0(0xE400_0000 | 319u32 | (239u32 << 10));
+
+    // Gouraud line (opcode 0x50) red at (0,10) → blue at (100,10).
+    gpu.gp0(0x5000_00FF); // shaded line, colour0 = red
+    gpu.gp0(0x000A_0000); // v0 (0,10)
+    gpu.gp0(0x00FF_0000); // colour1 = blue
+    gpu.gp0(0x000A_0064); // v1 (100,10)
+
+    let frame = core.framebuffer_rgba();
+    // Endpoints match their vertex colours.
+    let v0 = (10 * 320) * 4;
+    assert_eq!(&frame[v0..v0 + 4], &expected_rgba(0xFF, 0, 0), "v0 red");
+    let v1 = (10 * 320 + 100) * 4;
+    assert_eq!(&frame[v1..v1 + 4], &expected_rgba(0, 0, 0xFF), "v1 blue");
+    // The midpoint (50,10) is a red+blue blend — both channels present.
+    let mid = (10 * 320 + 50) * 4;
+    assert!(frame[mid] > 0, "midpoint has red");
+    assert!(frame[mid + 2] > 0, "midpoint has blue");
+    assert_ne!(
+        &frame[mid..mid + 4],
+        &expected_rgba(0xFF, 0, 0),
+        "midpoint is not pure red"
+    );
+}
+
+#[test]
 fn gpu_dma_linked_list_fills_visible_region() {
     let mut core = PsxCore::new();
     core.gpu_mut().gp1(0x0000_0000);
