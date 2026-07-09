@@ -32,16 +32,28 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   the DMA interrupt via DICR
 - Interrupt controller (`irq.rs`): I_STAT/I_MASK; VBlank raised once per
   `StepFrame`
+- Hardware timers (`timers.rs`): the three root counters at
+  0x1F80_1100..0x1F80_112F (value/mode/target, 16- and 32-bit access), clock
+  sources (sysclk, sysclk/8, approximated dotclock/hblank), target/overflow IRQ
+  delivery (Timer0/1/2 → I_STAT bits 4/5/6), one-shot vs repeat, read-clears the
+  reached-flags. Ticked once per CPU cycle at the top of `step_cpu`
 
 ## Not Yet Implemented
 
 - GTE (cop2) — decoded but ignored
 - SPU (audio — stubbed silent)
 - CD-ROM
-- Hardware timers (0x1F80_1100..0x1F80_112F read-as-0 / write-ignored stubs)
+- Coprocessor-unusable exception (ExcCode 0x0B) and instruction/data bus-error
+  exceptions (ExcCode 0x06) — coprocessor and unmapped accesses do not trap yet
+- BIOS exception-dispatch chain — the core exception path (vectors/EPC/rfe/
+  syscall) is complete, but there is no BIOS kernel to dispatch a program's
+  registered exception/interrupt handlers. The test harness HLEs the minimal
+  BIOS handler (syscall EnterCriticalSection/ExitCriticalSection, interrupt ack)
+  for side-loaded CPU tests; it does not run program-registered handlers
 - PSX-EXE side-loading (core `Command::LoadExe` is accepted as a no-op; the
   test harness has a standalone PS-EXE sideloader, `Harness::load_exe`, used for
-  CPU tests)
+  CPU tests. The core no-op is retained to avoid duplicating the harness
+  sideloader — no in-core consumer needs it)
 
 ### GPU/DMA gaps (implemented but partial)
 
@@ -95,7 +107,7 @@ pwsh scripts/verus-check.ps1
 
 ## Test Tiers
 
-1. CPU instruction tests **[tier-1 gate wired]** — PS-EXE sideloader + BIOS TTY HLE in psoxide-test-harness; always-on gate = synthetic PS-EXE self-test + spec-derived MIPS corner tests (`cpu_semantics.rs`). External reference suites (Amidog `psxtest_cpu` — CC BY-NC-SA, not vendored; JaCzekanski `ps1-tests` — MIT) are env-gated drivers pending timer/IRQ + BIOS syscall/exception handling to run end-to-end (see `crates/psoxide-test-harness/README.md`).
+1. CPU instruction tests **[tier-1 gate wired]** — PS-EXE sideloader + BIOS TTY/`printf`/exception HLE + hardware timers in psoxide-test-harness. Always-on gates = synthetic PS-EXE self-test, syscall-exception round-trip, spec-derived MIPS corner tests (`cpu_semantics.rs`), and the four **vendored** JaCzekanski `ps1-tests` CPU binaries (MIT, `tests/ps1_tests.rs`) driven end-to-end to their progress markers. Amidog `psxtest_cpu` (CC BY-NC-SA, not vendored) stays an env-gated `run_real_suite` driver; it now runs to completion but a full pass needs the R3000 load-delay pipeline + BIOS exception-dispatch chain (see `crates/psoxide-test-harness/README.md`).
 2. GPU rendering tests — golden-frame comparison
 3. Full boot: BIOS boots to the shell/logo, then a real game boots from a disc image
 
