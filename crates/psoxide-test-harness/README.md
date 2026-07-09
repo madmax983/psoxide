@@ -87,10 +87,10 @@ ignored `run_real_suite` driver.
   consecutive slots — including the `LWL`/`LWR` merge and chain cases) is green
   after the R3000 load-delay-slot pipeline fix (a load in another load's delay
   slot squashes the earlier load's writeback; `LWL`/`LWR` merge with the value
-  committed this cycle but still de-leak like every other load). The only
-  remaining `value error` lines are the six exception-return-address cases
-  (`syscall`/`rfe`/`break`, 2 each), which need the BIOS exception-dispatch chain
-  (see the blocker table below); the count drops from ~594 to 6.
+  committed this cycle but still de-leak like every other load). The
+  `syscall`/`rfe`/`break` exception groups also pass now that `rfe` preserves the
+  old `SR` interrupt/mode pair (bits 5:4) instead of zero-filling it: the count
+  drops from ~594 to **0** `value error` lines (`Result: 00000101`).
 
 `PSOXIDE_EXE` is required; `PSOXIDE_STEPS` (step budget, default 50,000,000) and
 `PSOXIDE_OUT` (write captured TTY to a file) are optional. The same driver runs
@@ -110,4 +110,4 @@ that is out of scope for this milestone:
 | `code-in-io` | header + `testCodeInRam` pass | instruction **bus-error** exception (ExcCode 0x06) for fetches from MDEC/IO/SPU. |
 | `io-access-bitwidth` | yes (`Done.`, RAM/scratchpad rows correct) | JOY / SIO / SPU / CD-ROM / MDEC registers with per-bitwidth semantics, plus data **bus-error** (`--CRASH--`) cases. |
 | `access-time` | yes (`Done.`) | **cycle-accurate** per-region access timing; the one-cycle-per-instruction model cannot reproduce the reference cycle counts (this test has no self-asserted pass/fail — it is a manual comparison). |
-| Amidog `psxtest_cpu` | yes (`Result:` printed; only 6 `value error` lines remain) | BIOS exception-dispatch chain for the rfe/break/syscall return-address cases. The R3000 **load-delay-slot pipeline** for back-to-back same-register loads (incl. `LWL`/`LWR`) is now modelled, so the whole load-delay matrix passes. |
+| Amidog `psxtest_cpu` | yes (`Result: 00000101`, **0** `value error` lines) | None outstanding for the CPU-core suite: the R3000 **load-delay-slot pipeline** for back-to-back same-register loads (incl. `LWL`/`LWR`) is modelled and `rfe` preserves the old `SR` interrupt/mode pair, so the load-delay matrix and the rfe/break/syscall exception groups all pass. |
