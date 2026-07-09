@@ -726,7 +726,10 @@ impl Gte {
         if last {
             let mac0d = i64::from(self.dqb) + n * i64::from(self.dqa);
             self.set_mac0(mac0d);
-            self.set_ir0(self.mac[0] >> 12);
+            // IR0 is derived from the FULL i64 depth-cue result shifted right by
+            // 12 — before MAC0 is truncated to i32. A large-negative cue wraps
+            // positive if read from the truncated MAC0, wrongly saturating IR0.
+            self.set_ir0((mac0d >> 12) as i32);
         }
     }
 
@@ -773,8 +776,11 @@ impl Gte {
 
     fn avsz3(&mut self) {
         let sum = i64::from(self.sz[1]) + i64::from(self.sz[2]) + i64::from(self.sz[3]);
-        self.set_mac0(i64::from(self.zsf3) * sum);
-        let otz = self.mac[0] >> 12;
+        let prod = i64::from(self.zsf3) * sum;
+        self.set_mac0(prod);
+        // OTZ comes from the full-precision product; the i32-truncated MAC0 can
+        // flip the saturation rail because zsf*ΣSZ overflows i32.
+        let otz = (prod >> 12) as i32;
         self.otz = self.saturate_sz(otz);
     }
 
@@ -783,8 +789,9 @@ impl Gte {
             + i64::from(self.sz[1])
             + i64::from(self.sz[2])
             + i64::from(self.sz[3]);
-        self.set_mac0(i64::from(self.zsf4) * sum);
-        let otz = self.mac[0] >> 12;
+        let prod = i64::from(self.zsf4) * sum;
+        self.set_mac0(prod);
+        let otz = (prod >> 12) as i32;
         self.otz = self.saturate_sz(otz);
     }
 
@@ -837,14 +844,21 @@ impl Gte {
             // from columns 2 and 3 alone (FC effectively dropped).
             let shift = sf * 12;
             for i in 0..3 {
+                // The FC term plus the first matrix column are used ONLY to set
+                // the IR saturation flag (always lm=false) and are then
+                // discarded — this intermediate IR is overwritten below.
                 let tmp = self.mac_ext(
                     i + 1,
                     (tr[i] << 12) + i64::from(mat[i][0]) * i64::from(vec[0]),
                 );
                 self.set_ir(i + 1, (tmp >> shift) as i32, false);
+                // The stored MAC/IR keep ONLY the 2nd and 3rd column products;
+                // MAC overflow flags come from this i64 accumulation, and IR is
+                // saturated with the real `lm`.
                 let mut acc = self.mac_ext(i + 1, i64::from(mat[i][1]) * i64::from(vec[1]));
                 acc = self.mac_ext(i + 1, acc + i64::from(mat[i][2]) * i64::from(vec[2]));
                 self.mac[i + 1] = (acc >> shift) as i32;
+                self.set_ir(i + 1, self.mac[i + 1], lm);
             }
         } else {
             self.mat_vec(mat, vec, tr, sf, lm);
