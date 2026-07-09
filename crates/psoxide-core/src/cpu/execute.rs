@@ -6,6 +6,7 @@
 
 use super::decode::{Instruction, decode};
 use super::engine::{COP0_BADVADDR, COP0_CAUSE, COP0_EPC, COP0_SR, Cpu, SR_BEV};
+use crate::bus::{BusRegion, map_region, mask_region};
 
 /// Memory interface used by the CPU. Loads return the value at `addr`; stores
 /// take `&mut self`. All accesses are little-endian.
@@ -32,6 +33,11 @@ pub const EXC_INT: u32 = 0x00;
 pub const EXC_ADEL: u32 = 0x04;
 /// Address error on store.
 pub const EXC_ADES: u32 = 0x05;
+/// Bus error on instruction fetch. Raised when the CPU fetches an opcode from a
+/// physical region that does not respond to a code-fetch bus cycle (I/O ports,
+/// scratchpad, expansion, cache-control, unmapped). Unlike an address error, a
+/// bus error does *not* write `BadVaddr`.
+pub const EXC_IBE: u32 = 0x06;
 /// System call.
 pub const EXC_SYSCALL: u32 = 0x08;
 /// Breakpoint.
@@ -90,6 +96,20 @@ pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
     if cpu.current_pc & 0x3 != 0 {
         cpu.cop0[COP0_BADVADDR] = cpu.current_pc;
         enter_exception(cpu, EXC_ADEL);
+        cpu.cycles = cpu.cycles.wrapping_add(1);
+        return;
+    }
+
+    // Instruction fetch must target a region that responds to a code-fetch bus
+    // cycle. Fetching from I/O, scratchpad, expansion, cache-control, or an
+    // unmapped address raises an instruction Bus Error (ExcCode 0x06) on the
+    // R3000; the (garbage) opcode is never decoded or executed. Like the taken-
+    // branch delay-slot handling in `poll_interrupt`, reflect `branch` into
+    // `delay_slot` first so `enter_exception` records BD/EPC correctly when the
+    // faulting fetch is itself a delay-slot instruction.
+    if !fetch_ok(cpu.current_pc) {
+        cpu.delay_slot = cpu.branch;
+        enter_exception(cpu, EXC_IBE);
         cpu.cycles = cpu.cycles.wrapping_add(1);
         return;
     }
@@ -577,6 +597,33 @@ pub fn poll_interrupt(cpu: &mut Cpu, pending: bool) -> bool {
         true
     } else {
         false
+    }
+}
+
+/// Returns whether an instruction fetch from virtual address `virt` targets a
+/// region that responds to a code-fetch bus cycle. A fetch that returns `false`
+/// raises an instruction Bus Error ([`EXC_IBE`]) instead of executing.
+///
+/// Main RAM and the BIOS ROM are the normal instruction sources. On real
+/// hardware most of the I/O region bus-errors on a code fetch — but not all of
+/// it: the ps1-tests `code-in-io` suite shows the DMA register block and the
+/// SPU register block *do* respond and execute. psoxide backs the DMA register
+/// file (`dma.rs`) with real read/write-back semantics, so a code fetch there
+/// returns the written words and executes; it is therefore treated as a legal
+/// fetch source. The SPU register file is not yet backed (its stores are
+/// dropped), so it is left faulting until that device backing lands.
+///
+/// A bus error, unlike an address error, records no `BadVaddr`.
+#[inline]
+fn fetch_ok(virt: u32) -> bool {
+    let phys = mask_region(virt);
+    match map_region(phys) {
+        BusRegion::MainRam | BusRegion::Bios => true,
+        // DMA primary control / channel register block (0x1F80_1080..=0x1F80_10FF):
+        // real hardware executes code fetched from here, and psoxide's DMA
+        // register file returns the written words.
+        BusRegion::IoPorts if (0x1F80_1080..=0x1F80_10FF).contains(&phys) => true,
+        _ => false,
     }
 }
 
@@ -1337,5 +1384,81 @@ mod tests {
             },
         );
         assert_eq!(cpu.pending_load, (10, 0x1122_3344));
+    }
+
+    #[test]
+    fn instruction_fetch_from_io_raises_bus_error() {
+        // PC in the I/O region (I_STAT, 0x1F80_1070) must raise an instruction
+        // Bus Error (ExcCode 0x06): the opcode is never fetched or executed, EPC
+        // points at the faulting PC, and BadVaddr is left untouched (bus errors,
+        // unlike address errors, do not set it).
+        let (mut cpu, mut bus) = setup(&[]);
+        // A would-be instruction at the masked test-bus address; it must NOT run.
+        bus.write_u32(0x1070, i_type(0x09, 0, 8, 5)); // addiu $t0,$zero,5
+        cpu.cop0[COP0_SR] = SR_BEV;
+        cpu.cop0[COP0_BADVADDR] = 0xDEAD_BEEF;
+        cpu.pc = 0x1F80_1070;
+        cpu.next_pc = 0x1F80_1074;
+        step(&mut cpu, &mut bus);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_IBE);
+        assert_eq!(cpu.cop0[COP0_EPC], 0x1F80_1070);
+        assert_eq!(cpu.pc, 0xBFC0_0180);
+        assert_eq!(cpu.reg(8), 0, "faulting fetch must not execute the opcode");
+        assert_eq!(
+            cpu.cop0[COP0_BADVADDR], 0xDEAD_BEEF,
+            "IBE must not write BadVaddr"
+        );
+    }
+
+    #[test]
+    fn instruction_fetch_from_scratchpad_raises_bus_error() {
+        // The scratchpad (D-cache) does not serve instruction fetches; code
+        // there bus-errors (ps1-tests testCodeInScratchpad).
+        let (mut cpu, mut bus) = setup(&[]);
+        cpu.cop0[COP0_SR] = SR_BEV;
+        cpu.pc = 0x1F80_0000;
+        cpu.next_pc = 0x1F80_0004;
+        step(&mut cpu, &mut bus);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_IBE);
+        assert_eq!(cpu.cop0[COP0_EPC], 0x1F80_0000);
+    }
+
+    #[test]
+    fn instruction_fetch_from_ram_executes_normally() {
+        // A fetch from main RAM is a legal code source: no bus error, and the
+        // opcode runs.
+        let (mut cpu, mut bus) = setup(&[i_type(0x09, 0, 8, 5)]); // addiu $t0,$zero,5
+        step(&mut cpu, &mut bus);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0, "no exception");
+        assert_eq!(cpu.reg(8), 5);
+    }
+
+    #[test]
+    fn instruction_fetch_from_dma_region_executes() {
+        // The DMA register block responds to code fetch (ps1-tests
+        // testCodeInDMA0 / testCodeInDMAControl); a fetch there is legal.
+        let (mut cpu, mut bus) = setup(&[]);
+        bus.write_u32(0x1084, i_type(0x09, 0, 8, 7)); // addiu $t0,$zero,7
+        cpu.pc = 0x1F80_1084;
+        cpu.next_pc = 0x1F80_1088;
+        step(&mut cpu, &mut bus);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0, "no bus error");
+        assert_eq!(cpu.reg(8), 7);
+    }
+
+    #[test]
+    fn instruction_bus_error_in_delay_slot_sets_bd() {
+        // When the faulting fetch is a branch delay-slot instruction (the
+        // previous step took a branch), CAUSE.BD is set and EPC points at the
+        // branch (current_pc - 4).
+        let (mut cpu, mut bus) = setup(&[]);
+        cpu.cop0[COP0_SR] = SR_BEV;
+        cpu.branch = true; // previous instruction was a taken branch
+        cpu.pc = 0x1F80_1070;
+        cpu.next_pc = 0x1F80_1074;
+        step(&mut cpu, &mut bus);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_IBE);
+        assert_ne!(cpu.cop0[COP0_CAUSE] & (1 << 31), 0, "BD should be set");
+        assert_eq!(cpu.cop0[COP0_EPC], 0x1F80_106C, "EPC points at the branch");
     }
 }

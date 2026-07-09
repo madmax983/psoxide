@@ -54,8 +54,18 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   coprocessor load/stores do **not** (they are gated purely by SR.CU0). No op
   decodes to `Illegal` / reserved-instruction (0x0A) any more except genuinely
   unassigned opcodes
-- Instruction/data bus-error exceptions (ExcCode 0x06) — unmapped accesses do
-  not trap yet
+- Instruction Bus-Error exception (ExcCode 0x06, IBE): implemented on the
+  instruction-fetch path. A code fetch from a region that does not respond to a
+  code-fetch bus cycle (I/O ports, scratchpad, expansion, cache-control,
+  unmapped) raises IBE before the opcode is decoded/executed; EPC/BD are set as
+  usual and (unlike an address error) BadVaddr is left untouched. Main RAM and
+  BIOS are legal code sources; the DMA register block (0x1F80_1080..0x1F80_10FF)
+  is also fetchable, matching real hardware (ps1-tests `code-in-io`
+  testCodeInDMA0/testCodeInDMAControl) since psoxide backs those registers. The
+  SPU register block is fetchable on hardware too but is not yet backed, so it
+  still faults (needs the SPU device stubs). The **data** bus-error (ExcCode
+  0x07, DBE) is not modelled — unmapped data accesses still read 0 / drop
+  writes rather than trapping
 - BIOS exception-dispatch chain — the core exception path (vectors/EPC/rfe/
   syscall) is complete, but there is no BIOS kernel in psoxide-core to dispatch a
   program's registered exception/interrupt handlers. The test harness HLEs the

@@ -94,11 +94,41 @@ fn cop_runs_to_completion_and_reports_passes() {
 fn code_in_io_executes_code_from_ram() {
     let tty = run_exe("cpu/code-in-io/code-in-io.exe", 1_000_000);
     assert!(tty.contains("cpu/code-in-io"), "header missing:\n{tty}");
-    // Executing code out of main RAM works; the scratchpad/MDEC/IO cases need
-    // instruction bus-error exceptions that psoxide does not model yet.
+
+    // Instruction Bus-Error (ExcCode 0x06) is now modelled: a code fetch from a
+    // region that does not respond to a code-fetch bus cycle raises IBE, which
+    // the program-registered "unresolved exception" handler observes (via the
+    // BIOS exception-dispatch chain the harness HLEs), returning to `$ra`.
+    //   * testCodeInRam        — main RAM is a legal code source (no exception).
+    //   * testCodeInScratchpad — the D-cache scratchpad bus-errors on fetch.
+    //   * testCodeInMDEC       — the MDEC I/O port bus-errors on fetch.
+    //   * testCodeInInterrupts — the interrupt I/O port bus-errors on fetch.
+    //   * testCodeInDMA0 / testCodeInDMAControl — the DMA register block responds
+    //     to code fetch (no exception); psoxide backs those registers, so the
+    //     copied `jr $ra` is read back and executes.
+    for case in [
+        "testCodeInRam",
+        "testCodeInScratchpad",
+        "testCodeInMDEC",
+        "testCodeInInterrupts",
+        "testCodeInDMA0",
+        "testCodeInDMAControl",
+    ] {
+        assert!(
+            tty.contains(&format!("pass - {case}")),
+            "expected {case} to pass:\n{tty}"
+        );
+    }
+
+    // testCodeInSPU is the one remaining case: on hardware the SPU register block
+    // also responds to code fetch (no exception), but psoxide does not yet back
+    // the SPU register file, so the copied code cannot be read back. It therefore
+    // still faults rather than executing — it needs the SPU device stubs (a
+    // separate device-register workstream), not more CPU work. The suite runs to
+    // completion either way.
     assert!(
-        tty.contains("pass - testCodeInRam"),
-        "expected testCodeInRam to pass:\n{tty}"
+        tty.contains("Done."),
+        "code-in-io did not run to completion:\n{tty}"
     );
 }
 
