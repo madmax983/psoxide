@@ -58,11 +58,43 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   loaded, no CD IRQ is delivered)
 - Coprocessor-unusable exception (ExcCode 0x0B) and instruction/data bus-error
   exceptions (ExcCode 0x06) — coprocessor and unmapped accesses do not trap yet
+- SPU (audio — stubbed silent)
+- CD-ROM
+- Coprocessor-unusable exception (ExcCode 0x0B): implemented for every
+  coprocessor op. The decoder gives COP1 (0x11), COP3 (0x13), the LWCx/SWCx
+  coprocessor load/stores (0x30-0x33 / 0x38-0x3B), and unassigned COP0 commands
+  their own instruction variants (mirrored in the Verus decoder spec,
+  `crates/psoxide-proof/src/decode.rs`). Each raises Coprocessor Unusable with
+  CAUSE.CE set to the coprocessor number when its `SR.CU{n}` bit is clear, and is
+  a no-op when usable (COP1/COP3 and the GTE datapath are absent). COP0 register
+  ops (MFC0/MTC0) keep the kernel-mode usability exemption; the LWC0/SWC0
+  coprocessor load/stores do **not** (they are gated purely by SR.CU0). No op
+  decodes to `Illegal` / reserved-instruction (0x0A) any more except genuinely
+  unassigned opcodes
+- Instruction Bus-Error exception (ExcCode 0x06, IBE): implemented on the
+  instruction-fetch path. A code fetch from a region that does not respond to a
+  code-fetch bus cycle (I/O ports, scratchpad, expansion, cache-control,
+  unmapped) raises IBE before the opcode is decoded/executed; EPC/BD are set as
+  usual and (unlike an address error) BadVaddr is left untouched. Main RAM and
+  BIOS are legal code sources; the DMA register block (0x1F80_1080..0x1F80_10FF)
+  is also fetchable, matching real hardware (ps1-tests `code-in-io`
+  testCodeInDMA0/testCodeInDMAControl) since psoxide backs those registers. The
+  SPU register block is fetchable on hardware too but is not yet backed, so it
+  still faults (needs the SPU device stubs). The **data** bus-error (ExcCode
+  0x07, DBE) is not modelled — unmapped data accesses still read 0 / drop
+  writes rather than trapping
 - BIOS exception-dispatch chain — the core exception path (vectors/EPC/rfe/
-  syscall) is complete, but there is no BIOS kernel to dispatch a program's
-  registered exception/interrupt handlers. The test harness HLEs the minimal
-  BIOS handler (syscall EnterCriticalSection/ExitCriticalSection, interrupt ack)
-  for side-loaded CPU tests; it does not run program-registered handlers
+  syscall) is complete, but there is no BIOS kernel in psoxide-core to dispatch a
+  program's registered exception/interrupt handlers. The test harness HLEs the
+  minimal BIOS handler (syscall EnterCriticalSection/ExitCriticalSection,
+  interrupt ack) for side-loaded CPU tests, and now also HLEs the
+  **exception-dispatch chain** for programs that register an "unresolved
+  exception" handler via the A0[0x40]/RAM-0x300 hook (as the ps1-tests runtime
+  does): it stands up the kernel Process/Thread globals (`*(*(Process**)0x108)`),
+  saves context to the TCB, runs the registered handler, and resumes at the
+  handler's chosen return PC. This makes the `cpu/cop` "Disabled" cases observe
+  their traps. This is harness test-infra only — psoxide-core still has no BIOS
+  kernel
 - PSX-EXE side-loading (core `Command::LoadExe` is accepted as a no-op; the
   test harness has a standalone PS-EXE sideloader, `Harness::load_exe`, used for
   CPU tests. The core no-op is retained to avoid duplicating the harness
@@ -120,7 +152,7 @@ pwsh scripts/verus-check.ps1
 
 ## Test Tiers
 
-1. CPU instruction tests **[tier-1 gate wired]** — PS-EXE sideloader + BIOS TTY/`printf`/exception HLE + hardware timers in psoxide-test-harness. Always-on gates = synthetic PS-EXE self-test, syscall-exception round-trip, spec-derived MIPS corner tests (`cpu_semantics.rs`), and the four **vendored** JaCzekanski `ps1-tests` CPU binaries (MIT, `tests/ps1_tests.rs`) driven end-to-end to their progress markers. Amidog `psxtest_cpu` (CC BY-NC-SA, not vendored) stays an env-gated `run_real_suite` driver; it now runs to completion but a full pass needs the R3000 load-delay pipeline + BIOS exception-dispatch chain (see `crates/psoxide-test-harness/README.md`).
+1. CPU instruction tests **[tier-1 gate wired]** — PS-EXE sideloader + BIOS TTY/`printf`/exception HLE + hardware timers in psoxide-test-harness. Always-on gates = synthetic PS-EXE self-test, syscall-exception round-trip, spec-derived MIPS corner tests (`cpu_semantics.rs`), and the four **vendored** JaCzekanski `ps1-tests` CPU binaries (MIT, `tests/ps1_tests.rs`) driven end-to-end to their progress markers. Amidog `psxtest_cpu` (CC BY-NC-SA, not vendored) stays an env-gated `run_real_suite` driver; it now runs to completion with 0 `value error` lines: the R3000 load-delay pipeline is modelled (the whole back-to-back same-register load-delay matrix passes) and `rfe` preserves the old SR interrupt/mode pair, so the rfe/break/syscall exception groups also pass (see `crates/psoxide-test-harness/README.md`).
 2. GPU rendering tests — golden-frame comparison
 3. Full boot: BIOS boots to the shell/logo, then a real game boots from a disc image
 

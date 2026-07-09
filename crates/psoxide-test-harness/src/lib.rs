@@ -25,6 +25,50 @@ pub const HLE_RETURN_ADDR: u32 = 0x0000_0000;
 /// cycle-accurate (a real NTSC frame is ~564k CPU cycles).
 const VBLANK_INTERVAL_STEPS: usize = 100_000;
 
+// ── BIOS exception-dispatch-chain HLE ───────────────────────────────────────
+//
+// The ps1-tests common runtime registers its "unresolved exception" handler by
+// storing the function pointer into the BIOS kernel A-function table slot 0x40
+// — a plain store to RAM word `0x300` (`A0 = (uint32_t*)0x200; A0[0x40] = fn`).
+// On a general exception the real BIOS default handler saves the interrupted
+// context into the *current thread's* TCB and, if no chain handler claims the
+// exception, invokes that hook; afterwards it reloads the context from the TCB
+// and returns to the (possibly handler-adjusted) return PC.
+//
+// The runtime finds the current thread through the kernel process list:
+// `getCurrentThread()` evaluates `*(*(Process**)0x108)` — read a `Process*` at
+// `0x108`, whose first word is the `Thread*`. `wasExceptionThrown()` /
+// `getExceptionType()` then read the flags the hook wrote at `Thread.unknown[]`.
+//
+// With no BIOS image loaded these kernel globals are absent (word `0x108` reads
+// 0), so the harness stands up a minimal Process + Thread (TCB) in low kernel
+// RAM and drives the same save-context / call-hook / restore-context / return
+// sequence the BIOS would.
+
+/// BIOS A-function table hook slot the runtime writes (`A0[0x40]`, RAM word).
+const EXC_HOOK_SLOT: u32 = 0x0000_0300;
+/// Process-list pointer the runtime dereferences in `getCurrentThread()`.
+const EXC_PROCESS_LIST_PTR: u32 = 0x0000_0108;
+/// Harness-owned `Process` struct (word 0 = `Thread*`), in low kernel RAM.
+const EXC_PROC_ADDR: u32 = 0x0000_04F0;
+/// Harness-owned `Thread` (TCB), in low kernel RAM.
+const EXC_THREAD_ADDR: u32 = 0x0000_0500;
+/// Offset of `Registers.r[0]` within `Thread` (after `flags`, `flags2`).
+const TCB_R0: u32 = 8;
+/// Offset of `Registers.returnPC` within `Thread` (`r[32]` = 128 bytes follow).
+const TCB_RETURNPC: u32 = TCB_R0 + 32 * 4;
+/// Offset of `Registers.sr` within `Thread` (after returnPC, hi, lo).
+const TCB_SR: u32 = TCB_RETURNPC + 3 * 4;
+/// Offset of `Registers.cause` within `Thread`.
+const TCB_CAUSE: u32 = TCB_SR + 4;
+/// Sentinel return address staged into `$ra` before entering a registered
+/// handler; reaching it means the handler has returned. Word-aligned and in the
+/// otherwise-empty low exception-vector area so it is never real handler code.
+const EXC_HANDLER_SENTINEL: u32 = 0x0000_0010;
+/// Instruction budget for running a registered exception handler to completion
+/// (guards against a malformed handler hanging the test).
+const EXC_HANDLER_BUDGET: u32 = 100_000;
+
 /// A thin wrapper around [`PsxCore`] for writing deterministic CPU tests.
 pub struct Harness {
     core: PsxCore,
@@ -254,6 +298,20 @@ impl Harness {
         const EXC_INT: u32 = 0x00;
         const EXC_SYSCALL: u32 = 0x08;
 
+        // BIOS exception-dispatch chain. Interrupts and `syscall` are serviced
+        // by the BIOS default handler (the critical-section path below); every
+        // other general exception (reserved-instruction, coprocessor-unusable,
+        // overflow, break, address/bus error) is what the runtime's registered
+        // "unresolved exception" handler observes. If the program installed such
+        // a handler (nonzero A0[0x40] at RAM 0x300), run it exactly as the BIOS
+        // would so `wasExceptionThrown()` / `getExceptionType()` can see the
+        // trap; otherwise fall through to the minimal skip below.
+        let handler = self.registered_exception_handler();
+        if handler != 0 && exccode != EXC_INT && exccode != EXC_SYSCALL {
+            self.dispatch_registered_handler(handler, cause, epc);
+            return;
+        }
+
         // Return-from-exception first: pop the SR mode/interrupt-enable stack
         // exactly as the CPU's `rfe` does, restoring the pre-exception mode.
         // EnterCriticalSection / ExitCriticalSection then adjust IEc *on this
@@ -287,6 +345,91 @@ impl Harness {
             _ => epc.wrapping_add(4),
         };
 
+        self.core.set_cop0(COP0_SR, sr);
+        self.core.set_pc(resume);
+    }
+
+    /// Reads the unresolved-exception handler the program registered via
+    /// `hookUnresolvedExceptionHandler` — a plain store to the BIOS A-function
+    /// table hook slot (`A0[0x40]`, RAM word `0x300`). Returns 0 if unset.
+    fn registered_exception_handler(&self) -> u32 {
+        self.read_word(EXC_HOOK_SLOT)
+    }
+
+    /// Writes a 32-bit little-endian word into main RAM.
+    fn write_word(&mut self, addr: u32, value: u32) {
+        let bytes = value.to_le_bytes();
+        let mem = self.core.memory_mut();
+        for (b, byte) in bytes.iter().enumerate() {
+            mem.write8(addr + b as u32, *byte);
+        }
+    }
+
+    /// Runs a program-registered unresolved-exception handler, mirroring the
+    /// BIOS default handler: stand up the kernel process/thread globals the
+    /// runtime dereferences, save the interrupted context into the TCB, call the
+    /// handler as an ordinary function, then reload the register file and resume
+    /// at the return PC the handler chose (it advances past the faulting
+    /// instruction, or — for an instruction bus error — returns to `$ra`).
+    ///
+    /// The register file is snapshotted and restored around the call: the real
+    /// BIOS reloads every register from the TCB on return, and the hook only
+    /// rewrites `returnPC`, so restoring the interrupted values is equivalent
+    /// for a well-behaved handler and keeps the handler's temp-register churn
+    /// from leaking into the resumed program.
+    fn dispatch_registered_handler(&mut self, handler: u32, cause: u32, epc: u32) {
+        // Kernel globals: process list ptr -> Process -> Thread (TCB).
+        self.write_word(EXC_PROCESS_LIST_PTR, EXC_PROC_ADDR);
+        self.write_word(EXC_PROC_ADDR, EXC_THREAD_ADDR);
+
+        // Save the interrupted context into the TCB (and keep a copy of the
+        // GPRs to restore afterwards). The handler reads `registers.cause`
+        // (exception code), and — on the bus-error path — `registers.r[31]`.
+        let sr = self.core.cop0(COP0_SR);
+        let mut saved = [0u32; 32];
+        for (i, slot) in saved.iter_mut().enumerate() {
+            let v = self.core.reg(i);
+            *slot = v;
+            self.write_word(EXC_THREAD_ADDR + TCB_R0 + (i as u32) * 4, v);
+        }
+        self.write_word(EXC_THREAD_ADDR + TCB_RETURNPC, epc);
+        self.write_word(EXC_THREAD_ADDR + TCB_SR, sr);
+        self.write_word(EXC_THREAD_ADDR + TCB_CAUSE, cause);
+
+        // Enter the handler as a call: PC = handler, $ra = sentinel.
+        self.core.set_reg(31, EXC_HANDLER_SENTINEL);
+        self.core.set_pc(handler);
+
+        // Step until the handler returns to the sentinel, bounded so a
+        // malformed handler cannot hang the test.
+        let mut completed = false;
+        let mut ran = 0u32;
+        loop {
+            if self.core.pc() == EXC_HANDLER_SENTINEL {
+                completed = true;
+                break;
+            }
+            if ran >= EXC_HANDLER_BUDGET {
+                break;
+            }
+            let _ = self.core.execute(Command::StepCpu);
+            ran += 1;
+        }
+
+        // Resume where the handler asked (default: skip the faulting
+        // instruction if the handler did not run to completion, to guarantee
+        // forward progress). Reload the interrupted registers, pop the SR
+        // mode/interrupt stack (rfe), and continue.
+        let resume = if completed {
+            self.read_word(EXC_THREAD_ADDR + TCB_RETURNPC)
+        } else {
+            epc.wrapping_add(4)
+        };
+        for (i, &v) in saved.iter().enumerate().skip(1) {
+            self.core.set_reg(i, v);
+        }
+        let mode = sr & 0x3F;
+        let sr = (sr & !0x3F) | (mode >> 2);
         self.core.set_cop0(COP0_SR, sr);
         self.core.set_pc(resume);
     }

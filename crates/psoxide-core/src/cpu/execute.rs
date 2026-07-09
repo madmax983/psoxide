@@ -6,6 +6,7 @@
 
 use super::decode::{Instruction, decode};
 use super::engine::{COP0_BADVADDR, COP0_CAUSE, COP0_EPC, COP0_SR, Cpu, SR_BEV};
+use crate::bus::{BusRegion, map_region, mask_region};
 
 /// Memory interface used by the CPU. Loads return the value at `addr`; stores
 /// take `&mut self`. All accesses are little-endian.
@@ -32,12 +33,22 @@ pub const EXC_INT: u32 = 0x00;
 pub const EXC_ADEL: u32 = 0x04;
 /// Address error on store.
 pub const EXC_ADES: u32 = 0x05;
+/// Bus error on instruction fetch. Raised when the CPU fetches an opcode from a
+/// physical region that does not respond to a code-fetch bus cycle (I/O ports,
+/// scratchpad, expansion, cache-control, unmapped). Unlike an address error, a
+/// bus error does *not* write `BadVaddr`.
+pub const EXC_IBE: u32 = 0x06;
 /// System call.
 pub const EXC_SYSCALL: u32 = 0x08;
 /// Breakpoint.
 pub const EXC_BREAK: u32 = 0x09;
 /// Reserved (illegal) instruction.
 pub const EXC_RI: u32 = 0x0A;
+/// Coprocessor unusable. Raised when a coprocessor instruction targets a
+/// coprocessor whose `SR` usable (`CU`) bit is clear (COP0 is additionally
+/// usable in kernel mode). `CAUSE.CE` (bits 28-29) records the offending
+/// coprocessor number.
+pub const EXC_CPU: u32 = 0x0B;
 /// Arithmetic overflow.
 pub const EXC_OVERFLOW: u32 = 0x0C;
 
@@ -50,6 +61,32 @@ fn sign_extend(imm: u16) -> u32 {
     imm as i16 as i32 as u32
 }
 
+/// Queues a delayed load of `value` into `rt`, first squashing any delayed load
+/// that was committed into `rt` at the start of this instruction.
+///
+/// On the R3000 the load delay slot holds a single pending target. When the
+/// instruction in a load's delay slot is *itself* a load into the same register,
+/// the newer load wins and the older load's value is **never** published to
+/// `rt`. The step loop has already committed the older load into the output bank
+/// (`out_regs[rt]`) before this instruction ran, so left alone that stale value
+/// would leak into the register file when the step publishes `out_regs`.
+/// Resetting `out_regs[rt]` back to the input-bank value (its value before this
+/// cycle's commit) cancels that leak; the freshly queued `value` then becomes
+/// visible one instruction later, exactly as on hardware.
+///
+/// This applies to *every* load, pure-overwrite and merging alike. The two kinds
+/// differ only in how `value` is computed by the caller: pure-overwrite loads
+/// (`LB/LBU/LH/LHU/LW/MFC0`) synthesise a fresh value, whereas `LWL`/`LWR` first
+/// read `out_regs[rt]` (which still holds the load committed this cycle) and
+/// merge into it — so a load→`LWL` chain or an `LWL`/`LWR` pair composes — before
+/// handing the merged result here to be queued and de-leaked.
+#[inline]
+fn queue_load(cpu: &mut Cpu, rt: u8, value: u32) {
+    let preserved = cpu.reg(rt);
+    cpu.set_reg(rt, preserved);
+    cpu.pending_load = (rt, value);
+}
+
 /// Fetches, decodes, and executes one instruction, advancing the branch and
 /// load delay slots.
 pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
@@ -59,6 +96,20 @@ pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
     if cpu.current_pc & 0x3 != 0 {
         cpu.cop0[COP0_BADVADDR] = cpu.current_pc;
         enter_exception(cpu, EXC_ADEL);
+        cpu.cycles = cpu.cycles.wrapping_add(1);
+        return;
+    }
+
+    // Instruction fetch must target a region that responds to a code-fetch bus
+    // cycle. Fetching from I/O, scratchpad, expansion, cache-control, or an
+    // unmapped address raises an instruction Bus Error (ExcCode 0x06) on the
+    // R3000; the (garbage) opcode is never decoded or executed. Like the taken-
+    // branch delay-slot handling in `poll_interrupt`, reflect `branch` into
+    // `delay_slot` first so `enter_exception` records BD/EPC correctly when the
+    // faulting fetch is itself a delay-slot instruction.
+    if !fetch_ok(cpu.current_pc) {
+        cpu.delay_slot = cpu.branch;
+        enter_exception(cpu, EXC_IBE);
         cpu.cycles = cpu.cycles.wrapping_add(1);
         return;
     }
@@ -276,12 +327,12 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
         Instruction::Lb { rt, rs, imm } => {
             let addr = cpu.reg(rs).wrapping_add(sign_extend(imm));
             let value = bus.load8(addr) as i8 as i32 as u32;
-            cpu.pending_load = (rt, value);
+            queue_load(cpu, rt, value);
         }
         Instruction::Lbu { rt, rs, imm } => {
             let addr = cpu.reg(rs).wrapping_add(sign_extend(imm));
             let value = u32::from(bus.load8(addr));
-            cpu.pending_load = (rt, value);
+            queue_load(cpu, rt, value);
         }
         Instruction::Lh { rt, rs, imm } => {
             let addr = cpu.reg(rs).wrapping_add(sign_extend(imm));
@@ -290,7 +341,7 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 enter_exception(cpu, EXC_ADEL);
             } else {
                 let value = bus.load16(addr) as i16 as i32 as u32;
-                cpu.pending_load = (rt, value);
+                queue_load(cpu, rt, value);
             }
         }
         Instruction::Lhu { rt, rs, imm } => {
@@ -300,7 +351,7 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 enter_exception(cpu, EXC_ADEL);
             } else {
                 let value = u32::from(bus.load16(addr));
-                cpu.pending_load = (rt, value);
+                queue_load(cpu, rt, value);
             }
         }
         Instruction::Lw { rt, rs, imm } => {
@@ -310,13 +361,15 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 enter_exception(cpu, EXC_ADEL);
             } else {
                 let value = bus.load32(addr);
-                cpu.pending_load = (rt, value);
+                queue_load(cpu, rt, value);
             }
         }
         Instruction::Lwl { rt, rs, imm } => {
             let addr = cpu.reg(rs).wrapping_add(sign_extend(imm));
             // Merge with the value currently in the load delay slot so that a
-            // back-to-back LWL/LWR pair targeting the same register composes.
+            // back-to-back LWL/LWR pair (or a load→LWL chain) targeting the same
+            // register composes: `out_regs[rt]` still holds the delayed load
+            // committed at the top of this step.
             let current = cpu.out_regs[rt as usize];
             let aligned = bus.load32(addr & !3);
             let value = match addr & 3 {
@@ -325,7 +378,7 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 2 => (current & 0x0000_00FF) | (aligned << 8),
                 _ => aligned,
             };
-            cpu.pending_load = (rt, value);
+            queue_load(cpu, rt, value);
         }
         Instruction::Lwr { rt, rs, imm } => {
             let addr = cpu.reg(rs).wrapping_add(sign_extend(imm));
@@ -337,7 +390,7 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 2 => (current & 0xFFFF_0000) | (aligned >> 16),
                 _ => (current & 0xFFFF_FF00) | (aligned >> 24),
             };
-            cpu.pending_load = (rt, value);
+            queue_load(cpu, rt, value);
         }
 
         // ── Stores ──────────────────────────────────────────────────────
@@ -398,16 +451,72 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
 
         // ── Coprocessor 0 ───────────────────────────────────────────────
         Instruction::Mfc0 { rt, rd } => {
-            // Coprocessor moves also occupy the load delay slot.
-            cpu.pending_load = (rt, cpu.cop0[rd as usize]);
+            if !cop_usable(cpu, 0) {
+                enter_cop_unusable(cpu, 0);
+            } else {
+                // Coprocessor moves also occupy the load delay slot and are pure
+                // overwrites, so they squash a same-cycle delayed load into `rt`.
+                let value = cpu.cop0[rd as usize];
+                queue_load(cpu, rt, value);
+            }
         }
         Instruction::Mtc0 { rt, rd } => {
-            cpu.cop0[rd as usize] = cpu.reg(rt);
+            if !cop_usable(cpu, 0) {
+                enter_cop_unusable(cpu, 0);
+            } else {
+                cpu.cop0[rd as usize] = cpu.reg(rt);
+            }
         }
-        Instruction::Rfe => rfe(cpu),
+        Instruction::Rfe => {
+            if !cop_usable(cpu, 0) {
+                enter_cop_unusable(cpu, 0);
+            } else {
+                rfe(cpu);
+            }
+        }
+        // An unassigned COP0 command (CO=1, non-RFE). Usable in kernel mode or
+        // with `SR.CU0`; a no-op when usable, else Coprocessor Unusable (CE=0).
+        // Never a reserved-instruction trap.
+        Instruction::Cop0 { .. } => {
+            if !cop_usable(cpu, 0) {
+                enter_cop_unusable(cpu, 0);
+            }
+        }
 
-        // ── Coprocessor 2 (GTE): decoded but not executed ───────────────
-        Instruction::Cop2 { .. } => {}
+        // ── Coprocessors 1 / 2 / 3 ──────────────────────────────────────
+        // The PSX has no COP1/COP3, and the COP2 (GTE) datapath is
+        // unimplemented, but the usability trap is real: a COP{n} op with its
+        // `SR.CU{n}` bit clear raises Coprocessor Unusable (CE=n). When usable
+        // each stays a no-op.
+        Instruction::Cop1 { .. } => {
+            if !cop_usable(cpu, 1) {
+                enter_cop_unusable(cpu, 1);
+            }
+        }
+        Instruction::Cop2 { .. } => {
+            if !cop_usable(cpu, 2) {
+                enter_cop_unusable(cpu, 2);
+            }
+        }
+        Instruction::Cop3 { .. } => {
+            if !cop_usable(cpu, 3) {
+                enter_cop_unusable(cpu, 3);
+            }
+        }
+
+        // ── Coprocessor loads / stores ──────────────────────────────────
+        // LWC{n}/SWC{n} usability is gated purely by the `SR.CU{n}` bit (CE =
+        // the coprocessor number). Unlike the COP0 register ops (MFC0/MTC0),
+        // LWC0/SWC0 get *no* kernel-mode exemption: on the R3000 a coprocessor
+        // load/store with its CU bit clear raises Coprocessor Unusable even in
+        // kernel mode. No coprocessor load/store target is implemented, so a
+        // usable LWC/SWC is a no-op.
+        Instruction::Lwc { cop, .. } | Instruction::Swc { cop, .. } => {
+            let cop = u32::from(cop);
+            if cpu.sr() & (1 << (28 + cop)) == 0 {
+                enter_cop_unusable(cpu, cop);
+            }
+        }
 
         // ── Traps ───────────────────────────────────────────────────────
         Instruction::Syscall => enter_exception(cpu, EXC_SYSCALL),
@@ -427,6 +536,34 @@ fn branch(cpu: &mut Cpu, imm: u16) {
 #[inline]
 fn cache_isolated(cpu: &Cpu) -> bool {
     cpu.sr() & SR_ISOLATE_CACHE != 0
+}
+
+/// `SR` bit 1 (`KUc`): the current kernel/user mode bit. `0` = kernel.
+const SR_KUC: u32 = 1 << 1;
+
+/// Returns whether coprocessor `cop` (0-3) is usable by the current
+/// instruction, following the R3000 rules:
+///
+/// * The per-coprocessor usable bit `SR.CU{cop}` (bits 28-31) grants access.
+/// * COP0 is additionally always usable in kernel mode (`SR.KUc == 0`),
+///   regardless of `CU0` — the kernel needs system-control access at all times.
+#[inline]
+fn cop_usable(cpu: &Cpu, cop: u32) -> bool {
+    let sr = cpu.sr();
+    let cu = sr & (1 << (28 + cop)) != 0;
+    if cop == 0 {
+        cu || (sr & SR_KUC == 0)
+    } else {
+        cu
+    }
+}
+
+/// Raises a Coprocessor Unusable exception (ExcCode 0x0B) for coprocessor
+/// `cop`, recording `cop` in the `CAUSE.CE` field (bits 28-29) before vectoring
+/// through the standard exception path (which preserves those bits).
+fn enter_cop_unusable(cpu: &mut Cpu, cop: u32) {
+    cpu.cop0[COP0_CAUSE] = (cpu.cop0[COP0_CAUSE] & !0x3000_0000) | ((cop & 0x3) << 28);
+    enter_exception(cpu, EXC_CPU);
 }
 
 /// Cop0 CAUSE bit 10: the hardware interrupt line (IP2) driven by the
@@ -460,6 +597,33 @@ pub fn poll_interrupt(cpu: &mut Cpu, pending: bool) -> bool {
         true
     } else {
         false
+    }
+}
+
+/// Returns whether an instruction fetch from virtual address `virt` targets a
+/// region that responds to a code-fetch bus cycle. A fetch that returns `false`
+/// raises an instruction Bus Error ([`EXC_IBE`]) instead of executing.
+///
+/// Main RAM and the BIOS ROM are the normal instruction sources. On real
+/// hardware most of the I/O region bus-errors on a code fetch — but not all of
+/// it: the ps1-tests `code-in-io` suite shows the DMA register block and the
+/// SPU register block *do* respond and execute. psoxide backs the DMA register
+/// file (`dma.rs`) with real read/write-back semantics, so a code fetch there
+/// returns the written words and executes; it is therefore treated as a legal
+/// fetch source. The SPU register file is not yet backed (its stores are
+/// dropped), so it is left faulting until that device backing lands.
+///
+/// A bus error, unlike an address error, records no `BadVaddr`.
+#[inline]
+fn fetch_ok(virt: u32) -> bool {
+    let phys = mask_region(virt);
+    match map_region(phys) {
+        BusRegion::MainRam | BusRegion::Bios => true,
+        // DMA primary control / channel register block (0x1F80_1080..=0x1F80_10FF):
+        // real hardware executes code fetched from here, and psoxide's DMA
+        // register file returns the written words.
+        BusRegion::IoPorts if (0x1F80_1080..=0x1F80_10FF).contains(&phys) => true,
+        _ => false,
     }
 }
 
@@ -499,10 +663,17 @@ fn enter_exception(cpu: &mut Cpu, cause: u32) {
 }
 
 /// Restore-from-exception: pops the SR mode/interrupt-enable stack.
+///
+/// On the R3000 `rfe` pops the current pair off the 3-deep kernel/interrupt
+/// stack in `SR` bits 0..=5: `IEc/KUc ← IEp/KUp` and `IEp/KUp ← IEo/KUo`. The
+/// *old* pair (`IEo/KUo`, bits 4..=5) is **left unchanged** — it is not
+/// zero-filled. Preserving it is required for nested-exception correctness and
+/// is exactly what Amidog's `rfe`/`syscall`/`break` return-value checks assert.
 fn rfe(cpu: &mut Cpu) {
-    let mode = cpu.cop0[COP0_SR] & 0x3F;
-    cpu.cop0[COP0_SR] &= !0x3F;
-    cpu.cop0[COP0_SR] |= mode >> 2;
+    let stack = cpu.cop0[COP0_SR] & 0x3F;
+    // bits 1:0 ← bits 3:2, bits 3:2 ← bits 5:4 (`stack >> 2`); bits 5:4 kept.
+    let restored = (stack & 0x30) | (stack >> 2);
+    cpu.cop0[COP0_SR] = (cpu.cop0[COP0_SR] & !0x3F) | restored;
 }
 
 #[cfg(test)]
@@ -724,6 +895,110 @@ mod tests {
     }
 
     #[test]
+    fn back_to_back_load_same_reg_second_wins_first_squashed() {
+        // On the R3000 two loads into the same register back-to-back: the second
+        // load squashes the first, so the first's value is NEVER visible in rt.
+        //   addiu $t0,$zero,0x100  ; a0
+        //   addiu $t1,$zero,0x200  ; a1
+        //   addiu $t2,$zero,0xAAA  ; rt seed (old value V0)
+        //   lw    $t2,0($t0)       ; queue rt = memA
+        //   lw    $t2,0($t1)       ; queue rt = memB, squashing memA
+        //   addu  $t3,$t2,$zero    ; delay slot of 2nd lw: reads rt -> V0, not memA
+        //   addu  $t4,$t2,$zero    ; now rt = memB is visible
+        let (mut cpu, mut bus) = setup(&[
+            i_type(0x09, 0, 8, 0x100),  // $t0 = 0x100
+            i_type(0x09, 0, 9, 0x200),  // $t1 = 0x200
+            i_type(0x09, 0, 10, 0xAAA), // $t2 = 0xAAA (V0)
+            i_type(0x23, 8, 10, 0),     // lw $t2,0($t0)  -> memA
+            i_type(0x23, 9, 10, 0),     // lw $t2,0($t1)  -> memB
+            r_type(10, 0, 11, 0, 0x21), // addu $t3,$t2,$zero
+            r_type(10, 0, 12, 0, 0x21), // addu $t4,$t2,$zero
+        ]);
+        bus.write_u32(0x100, 0x1111_1111); // memA
+        bus.write_u32(0x200, 0x2222_2222); // memB
+        run(&mut cpu, &mut bus, 7);
+        // The delay-slot reader saw the OLD value; memA (0x1111_1111) is never
+        // observed because the second load squashed it.
+        assert_eq!(cpu.reg(11), 0xAAA);
+        // memB becomes visible one instruction later, and rt ends as memB.
+        assert_eq!(cpu.reg(12), 0x2222_2222);
+        assert_eq!(cpu.reg(10), 0x2222_2222);
+    }
+
+    #[test]
+    fn load_then_reg_write_same_reg_write_wins() {
+        // A load into rt followed by an ALU write into rt: the ALU write wins;
+        // the loaded value must not clobber it.
+        //   addiu $t0,$zero,0x100  ; a0
+        //   addiu $t2,$zero,0xAAA  ; rt seed
+        //   lw    $t2,0($t0)       ; queue rt = memA
+        //   addiu $t2,$t2,5        ; delay slot reads OLD rt(0xAAA), writes 0xAAF
+        //   addu  $t3,$t2,$zero    ; observe final rt
+        let (mut cpu, mut bus) = setup(&[
+            i_type(0x09, 0, 8, 0x100),  // $t0 = 0x100
+            i_type(0x09, 0, 10, 0xAAA), // $t2 = 0xAAA
+            i_type(0x23, 8, 10, 0),     // lw $t2,0($t0) -> memA
+            i_type(0x09, 10, 10, 5),    // addiu $t2,$t2,5
+            r_type(10, 0, 11, 0, 0x21), // addu $t3,$t2,$zero
+        ]);
+        bus.write_u32(0x100, 0x1111_1111); // memA (must be discarded)
+        run(&mut cpu, &mut bus, 5);
+        // Delay-slot ADDIU read the OLD rt (0xAAA) and its write survived the
+        // load; memA never reached rt.
+        assert_eq!(cpu.reg(10), 0xAAF);
+        assert_eq!(cpu.reg(11), 0xAAF);
+    }
+
+    #[test]
+    fn back_to_back_load_different_regs_both_land() {
+        // Loads into distinct registers do not interfere; both values commit.
+        //   addiu $t0,$zero,0x100  ; a0
+        //   addiu $t1,$zero,0x200  ; a1
+        //   lw    $t2,0($t0)       ; rt = memA
+        //   lw    $t3,0($t1)       ; rd = memB (different reg)
+        //   nop
+        let (mut cpu, mut bus) = setup(&[
+            i_type(0x09, 0, 8, 0x100), // $t0 = 0x100
+            i_type(0x09, 0, 9, 0x200), // $t1 = 0x200
+            i_type(0x23, 8, 10, 0),    // lw $t2,0($t0)
+            i_type(0x23, 9, 11, 0),    // lw $t3,0($t1)
+            i_type(0x09, 0, 0, 0),     // nop (commit the second load)
+        ]);
+        bus.write_u32(0x100, 0x1111_1111); // memA
+        bus.write_u32(0x200, 0x2222_2222); // memB
+        run(&mut cpu, &mut bus, 5);
+        assert_eq!(cpu.reg(10), 0x1111_1111);
+        assert_eq!(cpu.reg(11), 0x2222_2222);
+    }
+
+    #[test]
+    fn lwl_merges_with_pending_load_of_same_reg() {
+        // LWL is NOT a pure-overwrite load: it merges with the register value,
+        // including a load committed the same cycle. A regular LW followed by an
+        // LWL into the same register must therefore merge, not squash.
+        //   addiu $t0,$zero,0x100  ; a0 -> full word source
+        //   addiu $t1,$zero,0x204  ; a1 -> aligned LWL source
+        //   lw    $t2,0($t0)       ; queue rt = W1 (0x1111_1111)
+        //   lwl   $t2,0($t1)       ; merge aligned word with pending W1
+        //   nop
+        let (mut cpu, mut bus) = setup(&[
+            i_type(0x09, 0, 8, 0x100), // $t0 = 0x100
+            i_type(0x09, 0, 9, 0x204), // $t1 = 0x204
+            i_type(0x23, 8, 10, 0),    // lw  $t2,0($t0)
+            i_type(0x22, 9, 10, 0),    // lwl $t2,0($t1)
+            i_type(0x09, 0, 0, 0),     // nop
+        ]);
+        bus.write_u32(0x100, 0x1111_1111); // W1
+        bus.write_u32(0x204, 0xAABB_CCDD); // LWL aligned source
+        run(&mut cpu, &mut bus, 5);
+        // addr & 3 == 0: value = (W1 & 0x00FF_FFFF) | (aligned << 24)
+        //             = 0x0011_1111 | 0xDD00_0000 = 0xDD11_1111.
+        // If LWL had squashed the pending LW (like a pure-overwrite load), the
+        // low bytes would be 0 (0xDD00_0000) instead.
+        assert_eq!(cpu.reg(10), 0xDD11_1111);
+    }
+
+    #[test]
     fn mult_and_mfhi_mflo() {
         // $t0 = 0x0001_0000 ; $t1 = 0x0001_0000 ; mult -> hi:lo = 0x1_0000_0000
         let (mut cpu, mut bus) = setup(&[
@@ -864,15 +1139,85 @@ mod tests {
     }
 
     #[test]
+    fn rfe_preserves_old_interrupt_mode_pair() {
+        // The R3000 `rfe` pops the stack but leaves the *old* pair (SR bits
+        // 5:4, IEo/KUo) unchanged rather than zero-filling it. Amidog's rfe /
+        // syscall / break return-value checks assert exactly this.
+        let mut cpu = Cpu::new();
+        let mut bus = TestBus::new();
+        // IEo=1, KUo=1 in the old slot; current/previous slots clear.
+        cpu.cop0[COP0_SR] = 0b11_0000;
+        execute_instruction(&mut cpu, &mut bus, Instruction::Rfe);
+        // bits 1:0 ← bits 3:2 (0), bits 3:2 ← bits 5:4 (0b11), bits 5:4 kept.
+        assert_eq!(cpu.cop0[COP0_SR] & 0x3F, 0b11_1100);
+        // In particular the old pair is preserved, not cleared.
+        assert_eq!(cpu.cop0[COP0_SR] & 0x30, 0x30);
+    }
+
+    #[test]
     fn mtc0_mfc0_round_trip_through_load_delay() {
+        // The written SR value keeps KUc=0 (kernel mode) so the follow-up mfc0
+        // is a usable COP0 access rather than a coprocessor-unusable trap.
         let (mut cpu, mut bus) = setup(&[
-            i_type(0x09, 0, 8, 0x1F),                             // $t0 = 0x1F
+            i_type(0x09, 0, 8, 0x1D),                             // $t0 = 0x1D (KUc=0)
             (0x10 << 26) | (0x04 << 21) | (8 << 16) | (12 << 11), // mtc0 $t0,$12 (SR)
             (0x10 << 26) | (9 << 16) | (12 << 11),                // mfc0 $t1,$12
             i_type(0x09, 0, 0, 0), // nop to commit the mfc0 load delay
         ]);
         run(&mut cpu, &mut bus, 4);
-        assert_eq!(cpu.reg(9), 0x1F);
+        assert_eq!(cpu.reg(9), 0x1D);
+    }
+
+    /// Assembles a COP0 `mfc0 rt, rd` instruction word (rs field = 0).
+    fn mfc0(rt: u32, rd: u32) -> u32 {
+        (0x10 << 26) | (rt << 16) | (rd << 11)
+    }
+
+    #[test]
+    fn cop0_in_user_mode_with_cu0_clear_traps() {
+        // mfc0 in user mode (KUc=1) with CU0 clear raises Coprocessor Unusable
+        // (ExcCode 0x0B) with CAUSE.CE == 0; the destination is not written.
+        let (mut cpu, mut bus) = setup(&[mfc0(9, 12)]);
+        cpu.cop0[COP0_SR] = SR_BEV | SR_KUC; // user mode, CU0 clear
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 0); // CE == 0
+        assert_eq!(cpu.cop0[COP0_EPC], 0x0);
+        assert_eq!(cpu.pc, 0xBFC0_0180);
+        assert_eq!(cpu.reg(9), 0);
+    }
+
+    #[test]
+    fn cop0_in_kernel_mode_with_cu0_clear_is_allowed() {
+        // In kernel mode (KUc=0) COP0 is usable even with CU0 clear: no trap,
+        // and mfc0 delivers cop0[12] (SR) after the load delay slot.
+        let (mut cpu, mut bus) = setup(&[mfc0(9, 12), i_type(0x09, 0, 0, 0)]);
+        cpu.cop0[COP0_SR] = 0x1234; // KUc=0 (kernel), CU0 clear
+        run(&mut cpu, &mut bus, 2);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.reg(9), 0x1234);
+    }
+
+    #[test]
+    fn cop2_with_cu2_clear_traps() {
+        // A COP2 (GTE) op with SR.CU2 clear raises Coprocessor Unusable, CE == 2.
+        let (mut cpu, mut bus) = setup(&[0x12 << 26]);
+        cpu.cop0[COP0_SR] = SR_BEV; // CU2 clear, kernel mode
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 2); // CE == 2
+        assert_eq!(cpu.cop0[COP0_EPC], 0x0);
+        assert_eq!(cpu.pc, 0xBFC0_0180);
+    }
+
+    #[test]
+    fn cop2_with_cu2_set_does_not_trap() {
+        // With SR.CU2 set the GTE op stays a no-op but must not trap.
+        let (mut cpu, mut bus) = setup(&[0x12 << 26]);
+        cpu.cop0[COP0_SR] = 1 << 30; // CU2 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4); // fell through normally
     }
 
     #[test]
@@ -881,6 +1226,106 @@ mod tests {
         cpu.cop0[COP0_SR] = SR_BEV;
         run(&mut cpu, &mut bus, 1);
         assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_RI);
+    }
+
+    #[test]
+    fn cop1_with_cu1_clear_traps_ce1() {
+        // COP1 (opcode 0x11) op with SR.CU1 clear raises Coprocessor Unusable,
+        // CE == 1. The PSX has no COP1, so a reserved-instruction trap would be
+        // wrong.
+        let (mut cpu, mut bus) = setup(&[0x11 << 26]);
+        cpu.cop0[COP0_SR] = SR_BEV; // CU1 clear, kernel mode
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 1); // CE == 1
+    }
+
+    #[test]
+    fn cop1_with_cu1_set_does_not_trap() {
+        // With SR.CU1 set the COP1 op is a no-op and must not trap.
+        let (mut cpu, mut bus) = setup(&[0x11 << 26]);
+        cpu.cop0[COP0_SR] = 1 << 29; // CU1 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4); // fell through normally
+    }
+
+    #[test]
+    fn cop3_with_cu3_clear_traps_ce3() {
+        // COP3 (opcode 0x13) op with SR.CU3 clear raises Coprocessor Unusable,
+        // CE == 3.
+        let (mut cpu, mut bus) = setup(&[0x13 << 26]);
+        cpu.cop0[COP0_SR] = SR_BEV; // CU3 clear, kernel mode
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 3); // CE == 3
+    }
+
+    #[test]
+    fn cop3_with_cu3_set_does_not_trap() {
+        let (mut cpu, mut bus) = setup(&[0x13 << 26]);
+        cpu.cop0[COP0_SR] = 1 << 31; // CU3 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4);
+    }
+
+    #[test]
+    fn lwc2_swc2_with_cu2_clear_trap_ce2() {
+        // Coprocessor load/store (LWC2 = 0x32, SWC2 = 0x3A) obey the COP2 usable
+        // rule: with SR.CU2 clear they raise Coprocessor Unusable, CE == 2.
+        for op in [0x32u32, 0x3A] {
+            let (mut cpu, mut bus) = setup(&[op << 26]);
+            cpu.cop0[COP0_SR] = SR_BEV; // CU2 clear
+            run(&mut cpu, &mut bus, 1);
+            assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+            assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 2); // CE == 2
+        }
+    }
+
+    #[test]
+    fn swc2_with_cu2_set_does_not_trap() {
+        // A usable SWC2 is a no-op (no GTE store target), and must not trap.
+        let (mut cpu, mut bus) = setup(&[0x3A << 26]);
+        cpu.cop0[COP0_SR] = 1 << 30; // CU2 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4);
+    }
+
+    #[test]
+    fn swc0_with_cu0_clear_traps_ce0_even_in_kernel_mode() {
+        // SWC0 (0x38) is gated purely by SR.CU0: with CU0 clear it raises
+        // Coprocessor Unusable (CE == 0) even in kernel mode. Unlike MFC0/MTC0,
+        // the COP0 kernel-mode exemption does NOT apply to coprocessor
+        // load/stores (this is what ps1-tests `testSwc0Disabled` checks).
+        let (mut cpu, mut bus) = setup(&[0x38 << 26]);
+        cpu.cop0[COP0_SR] = SR_BEV; // kernel mode, CU0 clear
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 0); // CE == 0
+    }
+
+    #[test]
+    fn swc0_with_cu0_set_does_not_trap() {
+        // With SR.CU0 set the SWC0 is a usable no-op and must not trap
+        // (ps1-tests `testSwc0Enabled`).
+        let (mut cpu, mut bus) = setup(&[0x38 << 26]);
+        cpu.cop0[COP0_SR] = 1 << 28; // CU0 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4);
+    }
+
+    #[test]
+    fn unassigned_cop0_op_with_cu0_set_does_not_trap() {
+        // An unassigned COP0 command (rs=0x1F, CO=1) with COP0 usable is a
+        // no-op, not a reserved-instruction trap.
+        let (mut cpu, mut bus) = setup(&[(0x10 << 26) | (0x1F << 21)]);
+        cpu.cop0[COP0_SR] = 1 << 28; // CU0 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4);
     }
 
     #[test]
@@ -939,5 +1384,81 @@ mod tests {
             },
         );
         assert_eq!(cpu.pending_load, (10, 0x1122_3344));
+    }
+
+    #[test]
+    fn instruction_fetch_from_io_raises_bus_error() {
+        // PC in the I/O region (I_STAT, 0x1F80_1070) must raise an instruction
+        // Bus Error (ExcCode 0x06): the opcode is never fetched or executed, EPC
+        // points at the faulting PC, and BadVaddr is left untouched (bus errors,
+        // unlike address errors, do not set it).
+        let (mut cpu, mut bus) = setup(&[]);
+        // A would-be instruction at the masked test-bus address; it must NOT run.
+        bus.write_u32(0x1070, i_type(0x09, 0, 8, 5)); // addiu $t0,$zero,5
+        cpu.cop0[COP0_SR] = SR_BEV;
+        cpu.cop0[COP0_BADVADDR] = 0xDEAD_BEEF;
+        cpu.pc = 0x1F80_1070;
+        cpu.next_pc = 0x1F80_1074;
+        step(&mut cpu, &mut bus);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_IBE);
+        assert_eq!(cpu.cop0[COP0_EPC], 0x1F80_1070);
+        assert_eq!(cpu.pc, 0xBFC0_0180);
+        assert_eq!(cpu.reg(8), 0, "faulting fetch must not execute the opcode");
+        assert_eq!(
+            cpu.cop0[COP0_BADVADDR], 0xDEAD_BEEF,
+            "IBE must not write BadVaddr"
+        );
+    }
+
+    #[test]
+    fn instruction_fetch_from_scratchpad_raises_bus_error() {
+        // The scratchpad (D-cache) does not serve instruction fetches; code
+        // there bus-errors (ps1-tests testCodeInScratchpad).
+        let (mut cpu, mut bus) = setup(&[]);
+        cpu.cop0[COP0_SR] = SR_BEV;
+        cpu.pc = 0x1F80_0000;
+        cpu.next_pc = 0x1F80_0004;
+        step(&mut cpu, &mut bus);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_IBE);
+        assert_eq!(cpu.cop0[COP0_EPC], 0x1F80_0000);
+    }
+
+    #[test]
+    fn instruction_fetch_from_ram_executes_normally() {
+        // A fetch from main RAM is a legal code source: no bus error, and the
+        // opcode runs.
+        let (mut cpu, mut bus) = setup(&[i_type(0x09, 0, 8, 5)]); // addiu $t0,$zero,5
+        step(&mut cpu, &mut bus);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0, "no exception");
+        assert_eq!(cpu.reg(8), 5);
+    }
+
+    #[test]
+    fn instruction_fetch_from_dma_region_executes() {
+        // The DMA register block responds to code fetch (ps1-tests
+        // testCodeInDMA0 / testCodeInDMAControl); a fetch there is legal.
+        let (mut cpu, mut bus) = setup(&[]);
+        bus.write_u32(0x1084, i_type(0x09, 0, 8, 7)); // addiu $t0,$zero,7
+        cpu.pc = 0x1F80_1084;
+        cpu.next_pc = 0x1F80_1088;
+        step(&mut cpu, &mut bus);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0, "no bus error");
+        assert_eq!(cpu.reg(8), 7);
+    }
+
+    #[test]
+    fn instruction_bus_error_in_delay_slot_sets_bd() {
+        // When the faulting fetch is a branch delay-slot instruction (the
+        // previous step took a branch), CAUSE.BD is set and EPC points at the
+        // branch (current_pc - 4).
+        let (mut cpu, mut bus) = setup(&[]);
+        cpu.cop0[COP0_SR] = SR_BEV;
+        cpu.branch = true; // previous instruction was a taken branch
+        cpu.pc = 0x1F80_1070;
+        cpu.next_pc = 0x1F80_1074;
+        step(&mut cpu, &mut bus);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_IBE);
+        assert_ne!(cpu.cop0[COP0_CAUSE] & (1 << 31), 0, "BD should be set");
+        assert_eq!(cpu.cop0[COP0_EPC], 0x1F80_106C, "EPC points at the branch");
     }
 }

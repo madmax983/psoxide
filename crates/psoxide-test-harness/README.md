@@ -32,6 +32,19 @@ run it. Finally, `run_hle` injects a VBlank interrupt roughly once per frame's
 worth of stepping so `VSync`-polling programs make progress (`StepCpu` alone
 never raises VBlank).
 
+It further HLEs the **BIOS exception-dispatch chain** for programs that register
+an "unresolved exception" handler the way the `ps1-tests` runtime does — a plain
+store of the handler pointer into the kernel A-function table hook slot
+(`A0[0x40]`, RAM word `0x300`). On a general exception (anything other than an
+interrupt or `syscall`), if that slot is nonzero the harness reproduces what the
+BIOS default handler does: it stands up the minimal kernel globals the runtime
+dereferences (`getCurrentThread()` reads `*(*(Process**)0x108)`), saves the
+interrupted context into that thread's TCB, calls the registered handler as an
+ordinary function, then reloads the register file and resumes at the return PC
+the handler chose (which advances past the faulting instruction). This is what
+lets `cpu/cop`'s "Disabled" cases actually observe their traps via
+`wasExceptionThrown()` / `getExceptionType()`.
+
 ## Always-on CPU gate (runs in CI, no external assets)
 
 These tests are self-contained and run on every `cargo test --workspace`:
@@ -82,11 +95,15 @@ ignored `run_real_suite` driver.
 - Expected: with timers + the syscall/`printf`/exception HLE, the suite now runs
   end-to-end and prints its per-instruction test log (`Running <op> test` / `Done`)
   down to a final `Result: <errors>` line. Every ALU, shift, mul/div, immediate,
-  and branch group passes. The remaining errors are the exhaustive **back-to-back
-  load-delay matrix** (`nop_<load>_<load>_d`, i.e. two loads targeting the same
-  register in consecutive slots) plus a few exception-return-address cases — both
-  require precise R3000 load-delay-slot pipeline modelling, tracked as a CPU-
-  accuracy follow-up (see below).
+  branch, and **load-delay** group passes: the exhaustive back-to-back load-delay
+  matrix (`nop_<load>_<load>_d`, i.e. two loads targeting the same register in
+  consecutive slots — including the `LWL`/`LWR` merge and chain cases) is green
+  after the R3000 load-delay-slot pipeline fix (a load in another load's delay
+  slot squashes the earlier load's writeback; `LWL`/`LWR` merge with the value
+  committed this cycle but still de-leak like every other load). The
+  `syscall`/`rfe`/`break` exception groups also pass now that `rfe` preserves the
+  old `SR` interrupt/mode pair (bits 5:4) instead of zero-filling it: the count
+  drops from ~594 to **0** `value error` lines (`Result: 00000101`).
 
 `PSOXIDE_EXE` is required; `PSOXIDE_STEPS` (step budget, default 50,000,000) and
 `PSOXIDE_OUT` (write captured TTY to a file) are optional. The same driver runs
@@ -102,8 +119,8 @@ that is out of scope for this milestone:
 
 | Suite | Runs to completion | Remaining hardware for a full pass |
 |-------|--------------------|------------------------------------|
-| `cop` | yes (`Done.`, coprocessor-*enabled* cases pass) | BIOS **exception-dispatch chain** (so a program-registered handler actually runs and can observe the trap) + the **coprocessor-unusable** exception (ExcCode 0x0B). Our HLE services the trap itself but does not invoke a test-installed handler. |
+| `cop` | yes (`Done.`; the enabled COP0/COP2 cases **and** all six "Disabled" cases pass) | The BIOS **exception-dispatch chain** now runs the program-registered handler (via the `A0[0x40]`/`0x300` hook), so the "Disabled" cases observe their traps and `testCop2Disabled` sees the real Coprocessor-Unusable exception (ExcCode 0x0B). Still failing: `testDisabledCoprocessorThrowsCoprocessorUnusable` (asserts the exception *type* is 0x0B) and the enabled `testSwc0/1/2/3Enabled` / `testCop1/3Enabled` / `testCop0InvalidOpcode` cases — all blocked on a **decoder** change: COP1/COP3 and LWCx/SWCx decode to `Illegal` (reserved-instruction, 0x0A) instead of distinct coprocessor ops, so a usable-coprocessor op traps when it should not and a disabled one reports 0x0A rather than 0x0B. |
 | `code-in-io` | header + `testCodeInRam` pass | instruction **bus-error** exception (ExcCode 0x06) for fetches from MDEC/IO/SPU. |
 | `io-access-bitwidth` | yes (`Done.`, RAM/scratchpad rows correct) | JOY / SIO / SPU / CD-ROM / MDEC registers with per-bitwidth semantics, plus data **bus-error** (`--CRASH--`) cases. |
 | `access-time` | yes (`Done.`) | **cycle-accurate** per-region access timing; the one-cycle-per-instruction model cannot reproduce the reference cycle counts (this test has no self-asserted pass/fail — it is a manual comparison). |
-| Amidog `psxtest_cpu` | yes (`Result:` printed) | precise R3000 **load-delay-slot pipeline** for back-to-back same-register loads; BIOS exception-dispatch chain for the rfe/break/syscall return-address cases. |
+| Amidog `psxtest_cpu` | yes (`Result: 00000101`, **0** `value error` lines) | None outstanding for the CPU-core suite: the R3000 **load-delay-slot pipeline** for back-to-back same-register loads (incl. `LWL`/`LWR`) is modelled and `rfe` preserves the old `SR` interrupt/mode pair, so the load-delay matrix and the rfe/break/syscall exception groups all pass. |
