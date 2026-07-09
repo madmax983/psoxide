@@ -14,6 +14,7 @@ pub mod cpu;
 pub mod dma;
 pub mod gpu;
 pub mod irq;
+pub mod timers;
 
 pub use api::{
     BIOS_IMAGE_SIZE, Button, Command, CoreError, CoreQuery, CoreSnapshot, EmulatorState,
@@ -24,3 +25,4 @@ pub use cpu::{Cpu, CpuSnapshot, Instruction, decode};
 pub use dma::Dma;
 pub use gpu::Gpu;
 pub use irq::{Irq, IrqLine};
+pub use timers::Timers;
