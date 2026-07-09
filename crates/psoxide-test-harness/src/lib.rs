@@ -115,6 +115,16 @@ impl Harness {
         self.core.execute(Command::LoadBios(image))
     }
 
+    /// Inserts a disc into the CD-ROM drive (`Command::LoadDisc`).
+    pub fn load_disc(&mut self, disc: psoxide_core::Disc) {
+        let _ = self.core.execute(Command::LoadDisc(disc));
+    }
+
+    /// Ejects the currently inserted disc, if any (`Command::EjectDisc`).
+    pub fn eject_disc(&mut self) {
+        let _ = self.core.execute(Command::EjectDisc);
+    }
+
     /// Runs `n` CPU instructions.
     pub fn run(&mut self, n: usize) {
         for _ in 0..n {

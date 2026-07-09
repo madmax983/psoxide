@@ -31,11 +31,6 @@ pub const SIO0_BASE: u32 = 0x1F80_1040;
 /// Physical end (inclusive) of the SIO0 / joypad register window.
 pub const SIO0_END: u32 = 0x1F80_105F;
 
-/// Physical base of the CD-ROM controller register window.
-pub const CDROM_BASE: u32 = 0x1F80_1800;
-/// Physical end (inclusive) of the CD-ROM controller register window.
-pub const CDROM_END: u32 = 0x1F80_1803;
-
 /// Physical base of the SPU register window.
 pub const SPU_BASE: u32 = 0x1F80_1C00;
 /// Physical end (inclusive) of the SPU register window.
@@ -227,106 +222,6 @@ impl Sio0 {
     pub fn write8(&mut self, _phys: u32, _val: u8) {}
 }
 
-/// CD-ROM controller stub. Enough of the port that a BIOS that polls the
-/// status/index register during boot does not busy-loop forever: the busy
-/// bit stays clear and the response/data FIFOs read empty. No commands are
-/// executed; writes to the command port are dropped.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CdRom {
-    /// 0x1F80_1800 — status / index register. Low two bits are the port
-    /// index (persisted). Other bits are synthesized on read.
-    pub index: u8,
-    /// 0x1F80_1803 mirror — interrupt enable / flag. The BIOS writes here to
-    /// arm and acknowledge CD IRQs; we latch it.
-    pub int_reg: u8,
-}
-
-impl Default for CdRom {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CdRom {
-    /// Creates a fresh controller reporting "no disc, no command in flight".
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            index: 0,
-            int_reg: 0,
-        }
-    }
-
-    /// Returns `true` if `phys` falls in the CD-ROM register window.
-    #[must_use]
-    pub fn contains(phys: u32) -> bool {
-        matches!(phys, CDROM_BASE..=CDROM_END)
-    }
-
-    /// Reads an 8-bit CD-ROM register. All ports are 8-bit natively on
-    /// hardware; sized reads decompose to this.
-    #[must_use]
-    pub fn read8(&self, phys: u32) -> u8 {
-        match phys {
-            // Status: bits 5-6 =parameter/response FIFO empty flags, bit 7 =
-            // busy. With no command in flight we report "param FIFO empty
-            // (bit 3), response FIFO empty (bit 5=0 means empty per SPX),
-            // data FIFO empty, not busy". The low two bits echo the index.
-            0x1F80_1800 => (self.index & 0x3) | (1 << 3) | (1 << 4),
-            // Response FIFO / data FIFO — empty, so return 0.
-            0x1F80_1801 | 0x1F80_1802 => 0,
-            // Interrupt enable/flag mirror — return latched value.
-            0x1F80_1803 => self.int_reg,
-            _ => 0,
-        }
-    }
-
-    /// Reads a 16-bit value (compose from two byte reads).
-    #[must_use]
-    pub fn read16(&self, phys: u32) -> u16 {
-        u16::from_le_bytes([self.read8(phys), self.read8(phys.wrapping_add(1))])
-    }
-
-    /// Reads a 32-bit value (compose from four byte reads).
-    #[must_use]
-    pub fn read32(&self, phys: u32) -> u32 {
-        u32::from_le_bytes([
-            self.read8(phys),
-            self.read8(phys.wrapping_add(1)),
-            self.read8(phys.wrapping_add(2)),
-            self.read8(phys.wrapping_add(3)),
-        ])
-    }
-
-    /// Writes an 8-bit CD-ROM register.
-    pub fn write8(&mut self, phys: u32, val: u8) {
-        match phys {
-            0x1F80_1800 => self.index = val & 0x3,
-            // The command / parameter / interrupt-enable ports differ by
-            // index. Without executing anything we just remember the last
-            // value written to 0x1803 (the interrupt flag / enable mirror
-            // that both boot-poll paths care about) and drop the others.
-            0x1F80_1803 => self.int_reg = val,
-            _ => {}
-        }
-    }
-
-    /// Writes a 16-bit value (decomposes to two byte writes).
-    pub fn write16(&mut self, phys: u32, val: u16) {
-        self.write8(phys, val as u8);
-        self.write8(phys.wrapping_add(1), (val >> 8) as u8);
-    }
-
-    /// Writes a 32-bit value (decomposes to four byte writes).
-    pub fn write32(&mut self, phys: u32, val: u32) {
-        let b = val.to_le_bytes();
-        self.write8(phys, b[0]);
-        self.write8(phys.wrapping_add(1), b[1]);
-        self.write8(phys.wrapping_add(2), b[2]);
-        self.write8(phys.wrapping_add(3), b[3]);
-    }
-}
-
 /// SPU register stub. The SPU occupies a full 0x400-byte window (0x1F80_1C00..
 /// 0x1F80_1FFF). Real audio emulation is out of scope for boot; this stub is
 /// a plain byte-addressable backing store so the BIOS's SPU-reset sequence
@@ -508,35 +403,6 @@ mod tests {
         assert_eq!(sio.read16(0x1F80_1048), 0x1234);
         assert_eq!(sio.read16(0x1F80_104A), 0x5678);
         assert_eq!(sio.read16(0x1F80_104E), 0x9ABC);
-    }
-
-    #[test]
-    fn cdrom_status_not_busy() {
-        let cd = CdRom::new();
-        let stat = cd.read8(0x1F80_1800);
-        assert_eq!(stat & 0x80, 0, "not busy");
-        assert_ne!(stat & (1 << 3), 0, "param FIFO reported ready");
-    }
-
-    #[test]
-    fn cdrom_index_latches() {
-        let mut cd = CdRom::new();
-        cd.write8(0x1F80_1800, 0x2);
-        assert_eq!(cd.read8(0x1F80_1800) & 0x3, 0x2);
-    }
-
-    #[test]
-    fn cdrom_response_and_data_fifo_empty() {
-        let cd = CdRom::new();
-        assert_eq!(cd.read8(0x1F80_1801), 0);
-        assert_eq!(cd.read8(0x1F80_1802), 0);
-    }
-
-    #[test]
-    fn cdrom_int_reg_readback() {
-        let mut cd = CdRom::new();
-        cd.write8(0x1F80_1803, 0x1F);
-        assert_eq!(cd.read8(0x1F80_1803), 0x1F);
     }
 
     #[test]

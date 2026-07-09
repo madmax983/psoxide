@@ -13,11 +13,12 @@ use crate::bus::{
     self, BIOS_SIZE, BusRegion, MAIN_RAM_MASK, MAIN_RAM_SIZE, SCRATCHPAD_SIZE, map_region,
     mask_region,
 };
+use crate::cdrom::{Cdrom, Disc};
 use crate::cpu::execute::Bus;
 use crate::cpu::{Cpu, CpuSnapshot, poll_interrupt, step};
 use crate::dma::Dma;
 use crate::gpu::Gpu;
-use crate::iostubs::{CACHE_CTRL_REG, CacheCtrl, CdRom, MemCtrl, Sio0, Spu};
+use crate::iostubs::{CACHE_CTRL_REG, CacheCtrl, MemCtrl, Sio0, Spu};
 use crate::irq::{Irq, IrqLine};
 use crate::timers::{TIMERS_BASE, TIMERS_END, Timers};
 
@@ -92,6 +93,10 @@ pub enum Command {
     LoadBios(Vec<u8>),
     /// Side-load a PSX-EXE image (currently a stub — accepted but ignored).
     LoadExe(Vec<u8>),
+    /// Insert a disc into the CD-ROM drive.
+    LoadDisc(Disc),
+    /// Eject the currently inserted disc, if any.
+    EjectDisc,
     /// Reset the CPU to the BIOS entry vector.
     Reset,
     /// Execute one CPU instruction.
@@ -265,7 +270,7 @@ struct CoreBus<'a> {
     memctrl: &'a mut MemCtrl,
     cache_ctrl: &'a mut CacheCtrl,
     sio0: &'a mut Sio0,
-    cdrom: &'a mut CdRom,
+    cdrom: &'a mut Cdrom,
     spu: &'a mut Spu,
 }
 
@@ -286,7 +291,7 @@ impl CoreBus<'_> {
             TIMERS_BASE..=TIMERS_END => self.timers.read32(phys),
             _ if MemCtrl::contains(phys) => self.memctrl.read32(phys),
             _ if Sio0::contains(phys) => self.sio0.read32(phys),
-            _ if CdRom::contains(phys) => self.cdrom.read32(phys),
+            _ if Cdrom::contains(phys) => self.cdrom.read32(phys),
             _ if Spu::contains(phys) => self.spu.read32(phys),
             _ => 0,
         }
@@ -299,12 +304,13 @@ impl CoreBus<'_> {
             0x1F80_1070 => self.irq.write_stat(val),
             0x1F80_1074 => self.irq.write_mask(val),
             0x1F80_1080..=0x1F80_10FF => {
-                self.dma.write32(phys, val, self.mem, self.gpu, self.irq);
+                self.dma
+                    .write32(phys, val, self.mem, self.gpu, self.cdrom, self.irq);
             }
             TIMERS_BASE..=TIMERS_END => self.timers.write32(phys, val),
             _ if MemCtrl::contains(phys) => self.memctrl.write32(phys, val),
             _ if Sio0::contains(phys) => self.sio0.write32(phys, val),
-            _ if CdRom::contains(phys) => self.cdrom.write32(phys, val),
+            _ if Cdrom::contains(phys) => self.cdrom.write32(phys, val),
             _ if Spu::contains(phys) => self.spu.write32(phys, val),
             // Other I/O ports are stubbed (ignored).
             _ => {}
@@ -318,7 +324,7 @@ impl CoreBus<'_> {
             TIMERS_BASE..=TIMERS_END => self.timers.read16(phys),
             _ if MemCtrl::contains(phys) => self.memctrl.read32(phys & !0x3) as u16,
             _ if Sio0::contains(phys) => self.sio0.read16(phys),
-            _ if CdRom::contains(phys) => self.cdrom.read16(phys),
+            _ if Cdrom::contains(phys) => self.cdrom.read16(phys),
             _ if Spu::contains(phys) => self.spu.read16(phys),
             _ => 0,
         }
@@ -334,7 +340,7 @@ impl CoreBus<'_> {
             }
             TIMERS_BASE..=TIMERS_END => self.timers.write16(phys, val),
             _ if Sio0::contains(phys) => self.sio0.write16(phys, val),
-            _ if CdRom::contains(phys) => self.cdrom.write16(phys, val),
+            _ if Cdrom::contains(phys) => self.cdrom.write16(phys, val),
             _ if Spu::contains(phys) => self.spu.write16(phys, val),
             _ => {}
         }
@@ -343,7 +349,7 @@ impl CoreBus<'_> {
     fn io_read8(&mut self, phys: u32) -> u8 {
         match phys {
             _ if Sio0::contains(phys) => self.sio0.read8(phys),
-            _ if CdRom::contains(phys) => self.cdrom.read8(phys),
+            _ if Cdrom::contains(phys) => self.cdrom.read8(phys),
             _ if Spu::contains(phys) => self.spu.read8(phys),
             _ => 0,
         }
@@ -352,7 +358,7 @@ impl CoreBus<'_> {
     fn io_write8(&mut self, phys: u32, val: u8) {
         match phys {
             _ if Sio0::contains(phys) => self.sio0.write8(phys, val),
-            _ if CdRom::contains(phys) => self.cdrom.write8(phys, val),
+            _ if Cdrom::contains(phys) => self.cdrom.write8(phys, val),
             _ if Spu::contains(phys) => self.spu.write8(phys, val),
             _ => {}
         }
@@ -461,7 +467,7 @@ pub struct CoreSnapshot {
     pub sio0: Sio0,
     /// CD-ROM register stub.
     #[serde(default)]
-    pub cdrom: CdRom,
+    pub cdrom: Cdrom,
     /// SPU register file stub.
     #[serde(default)]
     pub spu: Spu,
@@ -490,7 +496,7 @@ pub struct PsxCore {
     memctrl: MemCtrl,
     cache_ctrl: CacheCtrl,
     sio0: Sio0,
-    cdrom: CdRom,
+    cdrom: Cdrom,
     spu: Spu,
     paused: bool,
     controllers: [u16; 2],
@@ -516,7 +522,7 @@ impl PsxCore {
             memctrl: MemCtrl::new(),
             cache_ctrl: CacheCtrl::new(),
             sio0: Sio0::new(),
-            cdrom: CdRom::new(),
+            cdrom: Cdrom::new(),
             spu: Spu::new(),
             paused: false,
             controllers: [0; 2],
@@ -623,6 +629,52 @@ impl PsxCore {
         self.irq.set(IrqLine::VBlank);
     }
 
+    /// Builds a transient [`CoreBus`] borrowing every peripheral, for one-off
+    /// bus accesses that are not part of a CPU instruction step.
+    fn core_bus(&mut self) -> CoreBus<'_> {
+        CoreBus {
+            mem: &mut self.mem,
+            gpu: &mut self.gpu,
+            dma: &mut self.dma,
+            irq: &mut self.irq,
+            timers: &mut self.timers,
+            memctrl: &mut self.memctrl,
+            cache_ctrl: &mut self.cache_ctrl,
+            sio0: &mut self.sio0,
+            cdrom: &mut self.cdrom,
+            spu: &mut self.spu,
+        }
+    }
+
+    /// Performs an 8-bit store through the full system bus, routing to device
+    /// registers exactly as a CPU `sb` would.
+    ///
+    /// This is the frontend/integration seam for driving memory-mapped
+    /// peripherals (e.g. the CD-ROM controller at `0x1F80_1800..=0x1F80_1803`)
+    /// without hand-assembling guest code.
+    pub fn store8(&mut self, addr: u32, value: u8) {
+        self.core_bus().store8(addr, value);
+    }
+
+    /// Performs a 32-bit store through the full system bus (device routing
+    /// included), exactly as a CPU `sw` would. Used to program the DMA and
+    /// interrupt-controller register files from a frontend/test.
+    pub fn store32(&mut self, addr: u32, value: u32) {
+        self.core_bus().store32(addr, value);
+    }
+
+    /// Performs an 8-bit load through the full system bus, popping device FIFOs
+    /// exactly as a CPU `lb` would.
+    pub fn load8(&mut self, addr: u32) -> u8 {
+        self.core_bus().load8(addr)
+    }
+
+    /// Performs a 32-bit load through the full system bus (device routing
+    /// included), exactly as a CPU `lw` would.
+    pub fn load32(&mut self, addr: u32) -> u32 {
+        self.core_bus().load32(addr)
+    }
+
     /// Executes a single command.
     ///
     /// # Errors
@@ -644,6 +696,8 @@ impl PsxCore {
             Command::LoadExe(_image) => {
                 // PSX-EXE side-loading is not yet implemented; accepted as a no-op.
             }
+            Command::LoadDisc(disc) => self.cdrom.insert_disc(disc),
+            Command::EjectDisc => self.cdrom.eject(),
             Command::Reset => self.cpu.reset(),
             Command::StepCpu => self.step_cpu(),
             Command::StepFrame => {
@@ -692,6 +746,9 @@ impl PsxCore {
         // reaches its target/overflow this cycle can deliver its interrupt at
         // this same instruction boundary.
         self.timers.tick(1, &mut self.irq);
+        // Advance the CD-ROM controller so a queued command response can latch
+        // and raise its interrupt this cycle.
+        self.cdrom.tick(1, &mut self.irq);
 
         // Deliver a pending, unmasked hardware interrupt at the instruction
         // boundary before fetching the next instruction. With reset state

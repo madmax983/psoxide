@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 psoxide-core = { path = "../psoxide-core" }
+# CUE/BIN disc-image parsing lives in the `disc` module of psoxide-config.
 psoxide-config = { path = "../psoxide-config" }
 pixels = "0.15"
 winit = "0.30"
