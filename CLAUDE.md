@@ -43,8 +43,15 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 - GTE (cop2) — decoded but ignored
 - SPU (audio — stubbed silent)
 - CD-ROM
-- Coprocessor-unusable exception (ExcCode 0x0B) and instruction/data bus-error
-  exceptions (ExcCode 0x06) — coprocessor and unmapped accesses do not trap yet
+- Coprocessor-unusable exception (ExcCode 0x0B): partially implemented. COP0
+  ops (usable in kernel mode or with SR.CU0) and COP2/GTE ops (usable with
+  SR.CU2) now raise it with CAUSE.CE set to the coprocessor number. COP1/COP3
+  and the LWCx/SWCx coprocessor load/store opcodes still decode to `Illegal`
+  (the decoder is a Verus proof target), so they raise a reserved-instruction
+  trap rather than cop-unusable — surfacing them as distinct coprocessor ops
+  needs a decoder change
+- Instruction/data bus-error exceptions (ExcCode 0x06) — unmapped accesses do
+  not trap yet
 - BIOS exception-dispatch chain — the core exception path (vectors/EPC/rfe/
   syscall) is complete, but there is no BIOS kernel to dispatch a program's
   registered exception/interrupt handlers. The test harness HLEs the minimal

@@ -40,9 +40,15 @@ fn run_exe(rel: &str, budget: usize) -> String {
 fn cop_runs_to_completion_and_reports_passes() {
     let tty = run_exe("cpu/cop/cop.exe", 1_000_000);
     assert!(tty.contains("cpu/cop"), "cop header missing:\n{tty}");
-    // The coprocessor-enabled paths pass today. The "Disabled" cases still need
-    // the BIOS exception-dispatch chain (to run the program's registered handler)
-    // plus the coprocessor-unusable exception, so they are not asserted here.
+    // The coprocessor-enabled paths pass today. The core now raises the
+    // Coprocessor Unusable exception (ExcCode 0x0B, CAUSE.CE) for a disabled
+    // COP0/COP2 op, but the "Disabled" cases still cannot be asserted here:
+    // this test registers its checker via `hookUnresolvedExceptionHandler`,
+    // which needs the BIOS exception-dispatch chain to invoke it (the RAM
+    // vector 0x80000080 is empty without a BIOS, so the harness HLE handles
+    // the trap and never calls the program's handler). The COP1/COP3/SWCx
+    // disabled cases additionally need the decoder to surface those opcodes as
+    // distinct coprocessor ops (they currently decode to `Illegal`).
     assert!(
         tty.contains("pass - testCop0Enabled"),
         "expected testCop0Enabled to pass:\n{tty}"

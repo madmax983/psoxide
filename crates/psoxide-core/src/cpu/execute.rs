@@ -38,6 +38,11 @@ pub const EXC_SYSCALL: u32 = 0x08;
 pub const EXC_BREAK: u32 = 0x09;
 /// Reserved (illegal) instruction.
 pub const EXC_RI: u32 = 0x0A;
+/// Coprocessor unusable. Raised when a coprocessor instruction targets a
+/// coprocessor whose `SR` usable (`CU`) bit is clear (COP0 is additionally
+/// usable in kernel mode). `CAUSE.CE` (bits 28-29) records the offending
+/// coprocessor number.
+pub const EXC_CPU: u32 = 0x0B;
 /// Arithmetic overflow.
 pub const EXC_OVERFLOW: u32 = 0x0C;
 
@@ -426,18 +431,39 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
 
         // ── Coprocessor 0 ───────────────────────────────────────────────
         Instruction::Mfc0 { rt, rd } => {
-            // Coprocessor moves also occupy the load delay slot and are pure
-            // overwrites, so they squash a same-cycle delayed load into `rt`.
-            let value = cpu.cop0[rd as usize];
-            queue_load(cpu, rt, value);
+            if !cop_usable(cpu, 0) {
+                enter_cop_unusable(cpu, 0);
+            } else {
+                // Coprocessor moves also occupy the load delay slot and are pure
+                // overwrites, so they squash a same-cycle delayed load into `rt`.
+                let value = cpu.cop0[rd as usize];
+                queue_load(cpu, rt, value);
+            }
         }
         Instruction::Mtc0 { rt, rd } => {
-            cpu.cop0[rd as usize] = cpu.reg(rt);
+            if !cop_usable(cpu, 0) {
+                enter_cop_unusable(cpu, 0);
+            } else {
+                cpu.cop0[rd as usize] = cpu.reg(rt);
+            }
         }
-        Instruction::Rfe => rfe(cpu),
+        Instruction::Rfe => {
+            if !cop_usable(cpu, 0) {
+                enter_cop_unusable(cpu, 0);
+            } else {
+                rfe(cpu);
+            }
+        }
 
         // ── Coprocessor 2 (GTE): decoded but not executed ───────────────
-        Instruction::Cop2 { .. } => {}
+        // The GTE itself is unimplemented, but the usability trap is real: a
+        // COP2 op with `SR.CU2` clear raises Coprocessor Unusable (CE=2). When
+        // usable it stays a no-op (GTE ops are still ignored).
+        Instruction::Cop2 { .. } => {
+            if !cop_usable(cpu, 2) {
+                enter_cop_unusable(cpu, 2);
+            }
+        }
 
         // ── Traps ───────────────────────────────────────────────────────
         Instruction::Syscall => enter_exception(cpu, EXC_SYSCALL),
@@ -457,6 +483,34 @@ fn branch(cpu: &mut Cpu, imm: u16) {
 #[inline]
 fn cache_isolated(cpu: &Cpu) -> bool {
     cpu.sr() & SR_ISOLATE_CACHE != 0
+}
+
+/// `SR` bit 1 (`KUc`): the current kernel/user mode bit. `0` = kernel.
+const SR_KUC: u32 = 1 << 1;
+
+/// Returns whether coprocessor `cop` (0-3) is usable by the current
+/// instruction, following the R3000 rules:
+///
+/// * The per-coprocessor usable bit `SR.CU{cop}` (bits 28-31) grants access.
+/// * COP0 is additionally always usable in kernel mode (`SR.KUc == 0`),
+///   regardless of `CU0` — the kernel needs system-control access at all times.
+#[inline]
+fn cop_usable(cpu: &Cpu, cop: u32) -> bool {
+    let sr = cpu.sr();
+    let cu = sr & (1 << (28 + cop)) != 0;
+    if cop == 0 {
+        cu || (sr & SR_KUC == 0)
+    } else {
+        cu
+    }
+}
+
+/// Raises a Coprocessor Unusable exception (ExcCode 0x0B) for coprocessor
+/// `cop`, recording `cop` in the `CAUSE.CE` field (bits 28-29) before vectoring
+/// through the standard exception path (which preserves those bits).
+fn enter_cop_unusable(cpu: &mut Cpu, cop: u32) {
+    cpu.cop0[COP0_CAUSE] = (cpu.cop0[COP0_CAUSE] & !0x3000_0000) | ((cop & 0x3) << 28);
+    enter_exception(cpu, EXC_CPU);
 }
 
 /// Cop0 CAUSE bit 10: the hardware interrupt line (IP2) driven by the
@@ -1022,14 +1076,68 @@ mod tests {
 
     #[test]
     fn mtc0_mfc0_round_trip_through_load_delay() {
+        // The written SR value keeps KUc=0 (kernel mode) so the follow-up mfc0
+        // is a usable COP0 access rather than a coprocessor-unusable trap.
         let (mut cpu, mut bus) = setup(&[
-            i_type(0x09, 0, 8, 0x1F),                             // $t0 = 0x1F
+            i_type(0x09, 0, 8, 0x1D),                             // $t0 = 0x1D (KUc=0)
             (0x10 << 26) | (0x04 << 21) | (8 << 16) | (12 << 11), // mtc0 $t0,$12 (SR)
             (0x10 << 26) | (9 << 16) | (12 << 11),                // mfc0 $t1,$12
             i_type(0x09, 0, 0, 0), // nop to commit the mfc0 load delay
         ]);
         run(&mut cpu, &mut bus, 4);
-        assert_eq!(cpu.reg(9), 0x1F);
+        assert_eq!(cpu.reg(9), 0x1D);
+    }
+
+    /// Assembles a COP0 `mfc0 rt, rd` instruction word (rs field = 0).
+    fn mfc0(rt: u32, rd: u32) -> u32 {
+        (0x10 << 26) | (rt << 16) | (rd << 11)
+    }
+
+    #[test]
+    fn cop0_in_user_mode_with_cu0_clear_traps() {
+        // mfc0 in user mode (KUc=1) with CU0 clear raises Coprocessor Unusable
+        // (ExcCode 0x0B) with CAUSE.CE == 0; the destination is not written.
+        let (mut cpu, mut bus) = setup(&[mfc0(9, 12)]);
+        cpu.cop0[COP0_SR] = SR_BEV | SR_KUC; // user mode, CU0 clear
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 0); // CE == 0
+        assert_eq!(cpu.cop0[COP0_EPC], 0x0);
+        assert_eq!(cpu.pc, 0xBFC0_0180);
+        assert_eq!(cpu.reg(9), 0);
+    }
+
+    #[test]
+    fn cop0_in_kernel_mode_with_cu0_clear_is_allowed() {
+        // In kernel mode (KUc=0) COP0 is usable even with CU0 clear: no trap,
+        // and mfc0 delivers cop0[12] (SR) after the load delay slot.
+        let (mut cpu, mut bus) = setup(&[mfc0(9, 12), i_type(0x09, 0, 0, 0)]);
+        cpu.cop0[COP0_SR] = 0x1234; // KUc=0 (kernel), CU0 clear
+        run(&mut cpu, &mut bus, 2);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.reg(9), 0x1234);
+    }
+
+    #[test]
+    fn cop2_with_cu2_clear_traps() {
+        // A COP2 (GTE) op with SR.CU2 clear raises Coprocessor Unusable, CE == 2.
+        let (mut cpu, mut bus) = setup(&[0x12 << 26]);
+        cpu.cop0[COP0_SR] = SR_BEV; // CU2 clear, kernel mode
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 2); // CE == 2
+        assert_eq!(cpu.cop0[COP0_EPC], 0x0);
+        assert_eq!(cpu.pc, 0xBFC0_0180);
+    }
+
+    #[test]
+    fn cop2_with_cu2_set_does_not_trap() {
+        // With SR.CU2 set the GTE op stays a no-op but must not trap.
+        let (mut cpu, mut bus) = setup(&[0x12 << 26]);
+        cpu.cop0[COP0_SR] = 1 << 30; // CU2 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4); // fell through normally
     }
 
     #[test]
