@@ -26,6 +26,8 @@ pub trait Bus {
 
 // ── Exception codes (CAUSE ExcCode field) ───────────────────────────────
 
+/// External interrupt.
+pub const EXC_INT: u32 = 0x00;
 /// Address error on load / instruction fetch.
 pub const EXC_ADEL: u32 = 0x04;
 /// Address error on store.
@@ -425,6 +427,40 @@ fn branch(cpu: &mut Cpu, imm: u16) {
 #[inline]
 fn cache_isolated(cpu: &Cpu) -> bool {
     cpu.sr() & SR_ISOLATE_CACHE != 0
+}
+
+/// Cop0 CAUSE bit 10: the hardware interrupt line (IP2) driven by the
+/// interrupt controller.
+pub const CAUSE_HW_IRQ: u32 = 1 << 10;
+
+/// Reflects the external hardware interrupt line into cop0 CAUSE (bit 10) and,
+/// if interrupts are globally enabled (SR bit 0 / IEc) and the line is unmasked
+/// (SR interrupt-mask bits 8-15), takes the interrupt exception at an
+/// instruction boundary via the standard [`enter_exception`] path.
+///
+/// This is additive: with reset state (IEc=0, IM=0) no interrupt is taken, so
+/// existing CPU behaviour is unaffected. Call it between instructions, before
+/// fetching the next one; returns `true` when an interrupt was taken.
+pub fn poll_interrupt(cpu: &mut Cpu, pending: bool) -> bool {
+    if pending {
+        cpu.cop0[COP0_CAUSE] |= CAUSE_HW_IRQ;
+    } else {
+        cpu.cop0[COP0_CAUSE] &= !CAUSE_HW_IRQ;
+    }
+
+    let sr = cpu.sr();
+    let ie = sr & 0x1 != 0;
+    let pending_masked = ((cpu.cop0[COP0_CAUSE] >> 8) & 0xFF) & ((sr >> 8) & 0xFF);
+    if ie && pending_masked != 0 {
+        // Interrupts are taken at an instruction boundary: EPC points at the
+        // instruction that would have executed next.
+        cpu.current_pc = cpu.pc;
+        cpu.delay_slot = cpu.branch;
+        enter_exception(cpu, EXC_INT);
+        true
+    } else {
+        false
+    }
 }
 
 /// Enters the exception handler: saves `EPC`, records the cause (with the `BD`
