@@ -454,14 +454,47 @@ pub fn execute_instruction<B: Bus>(cpu: &mut Cpu, bus: &mut B, insn: Instruction
                 rfe(cpu);
             }
         }
+        // An unassigned COP0 command (CO=1, non-RFE). Usable in kernel mode or
+        // with `SR.CU0`; a no-op when usable, else Coprocessor Unusable (CE=0).
+        // Never a reserved-instruction trap.
+        Instruction::Cop0 { .. } => {
+            if !cop_usable(cpu, 0) {
+                enter_cop_unusable(cpu, 0);
+            }
+        }
 
-        // ── Coprocessor 2 (GTE): decoded but not executed ───────────────
-        // The GTE itself is unimplemented, but the usability trap is real: a
-        // COP2 op with `SR.CU2` clear raises Coprocessor Unusable (CE=2). When
-        // usable it stays a no-op (GTE ops are still ignored).
+        // ── Coprocessors 1 / 2 / 3 ──────────────────────────────────────
+        // The PSX has no COP1/COP3, and the COP2 (GTE) datapath is
+        // unimplemented, but the usability trap is real: a COP{n} op with its
+        // `SR.CU{n}` bit clear raises Coprocessor Unusable (CE=n). When usable
+        // each stays a no-op.
+        Instruction::Cop1 { .. } => {
+            if !cop_usable(cpu, 1) {
+                enter_cop_unusable(cpu, 1);
+            }
+        }
         Instruction::Cop2 { .. } => {
             if !cop_usable(cpu, 2) {
                 enter_cop_unusable(cpu, 2);
+            }
+        }
+        Instruction::Cop3 { .. } => {
+            if !cop_usable(cpu, 3) {
+                enter_cop_unusable(cpu, 3);
+            }
+        }
+
+        // ── Coprocessor loads / stores ──────────────────────────────────
+        // LWC{n}/SWC{n} usability is gated purely by the `SR.CU{n}` bit (CE =
+        // the coprocessor number). Unlike the COP0 register ops (MFC0/MTC0),
+        // LWC0/SWC0 get *no* kernel-mode exemption: on the R3000 a coprocessor
+        // load/store with its CU bit clear raises Coprocessor Unusable even in
+        // kernel mode. No coprocessor load/store target is implemented, so a
+        // usable LWC/SWC is a no-op.
+        Instruction::Lwc { cop, .. } | Instruction::Swc { cop, .. } => {
+            let cop = u32::from(cop);
+            if cpu.sr() & (1 << (28 + cop)) == 0 {
+                enter_cop_unusable(cpu, cop);
             }
         }
 
@@ -1146,6 +1179,106 @@ mod tests {
         cpu.cop0[COP0_SR] = SR_BEV;
         run(&mut cpu, &mut bus, 1);
         assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_RI);
+    }
+
+    #[test]
+    fn cop1_with_cu1_clear_traps_ce1() {
+        // COP1 (opcode 0x11) op with SR.CU1 clear raises Coprocessor Unusable,
+        // CE == 1. The PSX has no COP1, so a reserved-instruction trap would be
+        // wrong.
+        let (mut cpu, mut bus) = setup(&[0x11 << 26]);
+        cpu.cop0[COP0_SR] = SR_BEV; // CU1 clear, kernel mode
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 1); // CE == 1
+    }
+
+    #[test]
+    fn cop1_with_cu1_set_does_not_trap() {
+        // With SR.CU1 set the COP1 op is a no-op and must not trap.
+        let (mut cpu, mut bus) = setup(&[0x11 << 26]);
+        cpu.cop0[COP0_SR] = 1 << 29; // CU1 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4); // fell through normally
+    }
+
+    #[test]
+    fn cop3_with_cu3_clear_traps_ce3() {
+        // COP3 (opcode 0x13) op with SR.CU3 clear raises Coprocessor Unusable,
+        // CE == 3.
+        let (mut cpu, mut bus) = setup(&[0x13 << 26]);
+        cpu.cop0[COP0_SR] = SR_BEV; // CU3 clear, kernel mode
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 3); // CE == 3
+    }
+
+    #[test]
+    fn cop3_with_cu3_set_does_not_trap() {
+        let (mut cpu, mut bus) = setup(&[0x13 << 26]);
+        cpu.cop0[COP0_SR] = 1 << 31; // CU3 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4);
+    }
+
+    #[test]
+    fn lwc2_swc2_with_cu2_clear_trap_ce2() {
+        // Coprocessor load/store (LWC2 = 0x32, SWC2 = 0x3A) obey the COP2 usable
+        // rule: with SR.CU2 clear they raise Coprocessor Unusable, CE == 2.
+        for op in [0x32u32, 0x3A] {
+            let (mut cpu, mut bus) = setup(&[op << 26]);
+            cpu.cop0[COP0_SR] = SR_BEV; // CU2 clear
+            run(&mut cpu, &mut bus, 1);
+            assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+            assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 2); // CE == 2
+        }
+    }
+
+    #[test]
+    fn swc2_with_cu2_set_does_not_trap() {
+        // A usable SWC2 is a no-op (no GTE store target), and must not trap.
+        let (mut cpu, mut bus) = setup(&[0x3A << 26]);
+        cpu.cop0[COP0_SR] = 1 << 30; // CU2 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4);
+    }
+
+    #[test]
+    fn swc0_with_cu0_clear_traps_ce0_even_in_kernel_mode() {
+        // SWC0 (0x38) is gated purely by SR.CU0: with CU0 clear it raises
+        // Coprocessor Unusable (CE == 0) even in kernel mode. Unlike MFC0/MTC0,
+        // the COP0 kernel-mode exemption does NOT apply to coprocessor
+        // load/stores (this is what ps1-tests `testSwc0Disabled` checks).
+        let (mut cpu, mut bus) = setup(&[0x38 << 26]);
+        cpu.cop0[COP0_SR] = SR_BEV; // kernel mode, CU0 clear
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, EXC_CPU);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 28) & 0x3, 0); // CE == 0
+    }
+
+    #[test]
+    fn swc0_with_cu0_set_does_not_trap() {
+        // With SR.CU0 set the SWC0 is a usable no-op and must not trap
+        // (ps1-tests `testSwc0Enabled`).
+        let (mut cpu, mut bus) = setup(&[0x38 << 26]);
+        cpu.cop0[COP0_SR] = 1 << 28; // CU0 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4);
+    }
+
+    #[test]
+    fn unassigned_cop0_op_with_cu0_set_does_not_trap() {
+        // An unassigned COP0 command (rs=0x1F, CO=1) with COP0 usable is a
+        // no-op, not a reserved-instruction trap.
+        let (mut cpu, mut bus) = setup(&[(0x10 << 26) | (0x1F << 21)]);
+        cpu.cop0[COP0_SR] = 1 << 28; // CU0 set
+        run(&mut cpu, &mut bus, 1);
+        assert_eq!((cpu.cop0[COP0_CAUSE] >> 2) & 0x1F, 0); // no exception
+        assert_eq!(cpu.pc, 0x4);
     }
 
     #[test]

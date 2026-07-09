@@ -130,11 +130,32 @@ pub enum Instruction {
     Mtc0 { rt: Reg, rd: Reg },
     /// Restore from exception (pops the SR mode stack).
     Rfe,
+    /// Any other coprocessor-0 operation (a `CO=1` command that is not `RFE`,
+    /// e.g. an unassigned COP0 opcode). Usable in kernel mode or via `SR.CU0`
+    /// (CE=0); a no-op when usable rather than a reserved-instruction trap. The
+    /// raw word is retained.
+    Cop0 { raw: u32 },
 
-    // ── COP2 (GTE) ──────────────────────────────────────────────────────
+    // ── COP1 / COP2 (GTE) / COP3 ────────────────────────────────────────
+    /// Any coprocessor-1 operation. The PSX has no COP1; usable via `SR.CU1`
+    /// (CE=1) and a no-op when usable. The raw word is retained.
+    Cop1 { raw: u32 },
     /// Any coprocessor-2 (GTE) operation. Decoded but not executed; the raw
     /// instruction word is retained for future implementation.
     Cop2 { raw: u32 },
+    /// Any coprocessor-3 operation. The PSX has no COP3; usable via `SR.CU3`
+    /// (CE=3) and a no-op when usable. The raw word is retained.
+    Cop3 { raw: u32 },
+
+    // ── Coprocessor loads / stores ──────────────────────────────────────
+    /// Coprocessor load word `LWC{cop}` (`cop` is 0-3). Governed by the same
+    /// coprocessor-usable rule as any `COP{cop}` op (CE=`cop`). No coprocessor
+    /// load target is implemented, so it is a no-op when usable.
+    Lwc { cop: u8, raw: u32 },
+    /// Coprocessor store word `SWC{cop}` (`cop` is 0-3). Governed by the same
+    /// coprocessor-usable rule as any `COP{cop}` op (CE=`cop`). No coprocessor
+    /// store target is implemented, so it is a no-op when usable.
+    Swc { cop: u8, raw: u32 },
 
     // ── Loads ───────────────────────────────────────────────────────────
     /// Load byte (sign-extended).
@@ -290,7 +311,9 @@ pub fn decode(instr: u32) -> Instruction {
             imm: imm(instr),
         },
         0x10 => decode_cop0(instr),
+        0x11 => Instruction::Cop1 { raw: instr },
         0x12 => Instruction::Cop2 { raw: instr },
+        0x13 => Instruction::Cop3 { raw: instr },
         0x20 => Instruction::Lb {
             rt: rt(instr),
             rs: rs(instr),
@@ -351,6 +374,16 @@ pub fn decode(instr: u32) -> Instruction {
             rs: rs(instr),
             imm: imm(instr),
         },
+        // Coprocessor loads (LWC0-3) and stores (SWC0-3): the coprocessor
+        // number is the low two bits of the primary opcode.
+        0x30 => Instruction::Lwc { cop: 0, raw: instr },
+        0x31 => Instruction::Lwc { cop: 1, raw: instr },
+        0x32 => Instruction::Lwc { cop: 2, raw: instr },
+        0x33 => Instruction::Lwc { cop: 3, raw: instr },
+        0x38 => Instruction::Swc { cop: 0, raw: instr },
+        0x39 => Instruction::Swc { cop: 1, raw: instr },
+        0x3A => Instruction::Swc { cop: 2, raw: instr },
+        0x3B => Instruction::Swc { cop: 3, raw: instr },
         _ => Instruction::Illegal { raw: instr },
     }
 }
@@ -497,9 +530,12 @@ fn decode_cop0(instr: u32) -> Instruction {
             rd: rd(instr),
         },
         // CO=1 (rs bit 4 set): coprocessor operation selected by funct.
+        // `RFE` is the only one psoxide interprets; any other CO=1 command is a
+        // COP0 op that is a no-op when usable (never a reserved-instruction
+        // trap), so it decodes to `Cop0` rather than `Illegal`.
         rs if rs & 0x10 != 0 => match funct(instr) {
             0x10 => Instruction::Rfe,
-            _ => Instruction::Illegal { raw: instr },
+            _ => Instruction::Cop0 { raw: instr },
         },
         _ => Instruction::Illegal { raw: instr },
     }
@@ -864,6 +900,34 @@ mod tests {
     fn decode_cop2_is_stubbed() {
         let raw = (0x12 << 26) | 0x0048_0012;
         assert_eq!(decode(raw), Instruction::Cop2 { raw });
+    }
+
+    #[test]
+    fn decode_cop1_cop3_have_own_variants() {
+        // COP1 (opcode 0x11) and COP3 (opcode 0x13) are distinct coprocessor
+        // ops, not `Illegal`.
+        let raw1 = 0x11 << 26;
+        assert_eq!(decode(raw1), Instruction::Cop1 { raw: raw1 });
+        let raw3 = 0x13 << 26;
+        assert_eq!(decode(raw3), Instruction::Cop3 { raw: raw3 });
+    }
+
+    #[test]
+    fn decode_cop0_unassigned_op_is_cop0_not_illegal() {
+        // A CO=1 COP0 command that is not RFE (here rs=0x1F, funct=0) is a COP0
+        // op, not a reserved-instruction encoding.
+        let raw = (0x10 << 26) | (0x1F << 21);
+        assert_eq!(decode(raw), Instruction::Cop0 { raw });
+    }
+
+    #[test]
+    fn decode_coprocessor_loads_and_stores() {
+        for cop in 0u8..4 {
+            let lwc = (0x30 | u32::from(cop)) << 26;
+            assert_eq!(decode(lwc), Instruction::Lwc { cop, raw: lwc });
+            let swc = (0x38 | u32::from(cop)) << 26;
+            assert_eq!(decode(swc), Instruction::Swc { cop, raw: swc });
+        }
     }
 
     #[test]

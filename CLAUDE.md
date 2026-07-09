@@ -43,13 +43,17 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 - GTE (cop2) — decoded but ignored
 - SPU (audio — stubbed silent)
 - CD-ROM
-- Coprocessor-unusable exception (ExcCode 0x0B): partially implemented. COP0
-  ops (usable in kernel mode or with SR.CU0) and COP2/GTE ops (usable with
-  SR.CU2) now raise it with CAUSE.CE set to the coprocessor number. COP1/COP3
-  and the LWCx/SWCx coprocessor load/store opcodes still decode to `Illegal`
-  (the decoder is a Verus proof target), so they raise a reserved-instruction
-  trap rather than cop-unusable — surfacing them as distinct coprocessor ops
-  needs a decoder change
+- Coprocessor-unusable exception (ExcCode 0x0B): implemented for every
+  coprocessor op. The decoder gives COP1 (0x11), COP3 (0x13), the LWCx/SWCx
+  coprocessor load/stores (0x30-0x33 / 0x38-0x3B), and unassigned COP0 commands
+  their own instruction variants (mirrored in the Verus decoder spec,
+  `crates/psoxide-proof/src/decode.rs`). Each raises Coprocessor Unusable with
+  CAUSE.CE set to the coprocessor number when its `SR.CU{n}` bit is clear, and is
+  a no-op when usable (COP1/COP3 and the GTE datapath are absent). COP0 register
+  ops (MFC0/MTC0) keep the kernel-mode usability exemption; the LWC0/SWC0
+  coprocessor load/stores do **not** (they are gated purely by SR.CU0). No op
+  decodes to `Illegal` / reserved-instruction (0x0A) any more except genuinely
+  unassigned opcodes
 - Instruction/data bus-error exceptions (ExcCode 0x06) — unmapped accesses do
   not trap yet
 - BIOS exception-dispatch chain — the core exception path (vectors/EPC/rfe/

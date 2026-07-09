@@ -6,16 +6,17 @@
 //! These gates prove the real-PS-EXE execution path works end-to-end — a
 //! regression guard for the sideloader, the syscall/`printf` HLE, and the timer
 //! interrupt path. They intentionally do **not** assert a full byte-for-byte
-//! match against the shipped `psx.log`: each suite still exercises hardware
+//! match against the shipped `psx.log`: several suites still exercise hardware
 //! psoxide has not implemented yet (instruction/data bus-error exceptions,
-//! the COP1/COP3/LWCx/SWCx decoder split, cycle-accurate access timing, and the
-//! JOY / SIO / SPU / CD-ROM / MDEC peripherals). The BIOS exception-dispatch
-//! chain that invokes program-registered handlers is now HLE'd by the harness
-//! (see `src/lib.rs`), so `cpu/cop`'s "Disabled" cases pass. See `tests/README.md`
-//! and
-//! `tests/fixtures/ps1-tests/README.md` for the blocker details. The `psx.log`
-//! goldens are vendored so these gates can be tightened to a golden diff as that
-//! hardware lands.
+//! cycle-accurate access timing, and the JOY / SIO / SPU / CD-ROM / MDEC
+//! peripherals). The BIOS exception-dispatch chain that invokes
+//! program-registered handlers is HLE'd by the harness (see `src/lib.rs`), and
+//! the decoder now surfaces COP1/COP3/LWCx/SWCx (and unassigned COP0 commands)
+//! as distinct coprocessor ops with correct Coprocessor-Unusable behaviour, so
+//! `cpu/cop` passes in full against its golden. See `tests/README.md` and
+//! `tests/fixtures/ps1-tests/README.md` for the remaining blocker details. The
+//! `psx.log` goldens are vendored so these gates can be tightened to a golden
+//! diff as that hardware lands.
 
 use psoxide_test_harness::Harness;
 use std::path::PathBuf;
@@ -43,35 +44,43 @@ fn cop_runs_to_completion_and_reports_passes() {
     let tty = run_exe("cpu/cop/cop.exe", 1_000_000);
     assert!(tty.contains("cpu/cop"), "cop header missing:\n{tty}");
 
-    // The coprocessor-*enabled* COP0/COP2 paths pass today.
-    for case in ["testCop0Enabled", "testCop2Enabled"] {
-        assert!(
-            tty.contains(&format!("pass - {case}")),
-            "expected {case} to pass:\n{tty}"
-        );
-    }
-
-    // The **exception-dispatch chain** now invokes the program-registered
-    // "unresolved exception" handler (hooked via `hookUnresolvedExceptionHandler`
-    // into RAM 0x300), so the "Disabled" cases are finally observable: each
-    // faulting coprocessor op raises an exception the handler records, and the
-    // test sees `wasExceptionThrown()`. Before this landed the harness serviced
-    // the trap itself and never called the handler, so all six of these reported
-    // `given 0x0, expected 0x1` and failed. `testCop2Disabled` additionally
-    // proves the real Coprocessor-Unusable exception (ExcCode 0x0B) reaches the
-    // handler; the others reach it via the reserved-instruction trap the decoder
-    // currently raises for COP1/COP3/SWCx (see the follow-up note below).
+    // Every `cpu/cop` case now passes, matching the vendored `psx.log` golden.
+    // The decoder surfaces COP1/COP3/LWCx/SWCx (and unassigned COP0 commands) as
+    // distinct coprocessor ops, so:
+    //   * the coprocessor-*enabled* and *invalid-opcode* cases stay no-ops and
+    //     raise no exception (a usable coprocessor op must not trap);
+    //   * the *disabled* cases raise the real Coprocessor-Unusable exception
+    //     (ExcCode 0x0B) with CAUSE.CE = the coprocessor number, which the
+    //     program-registered "unresolved exception" handler observes via the
+    //     BIOS exception-dispatch chain the harness HLEs;
+    //   * `testDisabledCoprocessorThrowsCoprocessorUnusable` sees the exception
+    //     *type* is 0x0B (previously it saw the reserved-instruction 0x0A).
+    // COP0 register ops (MFC0) keep their kernel-mode usability exemption, so
+    // `testCop0Disabled` correctly raises nothing in kernel mode, while
+    // `testSwc0Disabled` still traps because coprocessor load/stores are gated
+    // purely by SR.CU0 (no kernel-mode exemption).
     for case in [
+        "testCop0Disabled",
+        "testCop0Enabled",
+        "testCop0InvalidOpcode",
         "testSwc0Disabled",
+        "testSwc0Enabled",
         "testCop1Disabled",
+        "testCop1Enabled",
         "testCop2Disabled",
+        "testCop2Enabled",
+        "testCop2InvalidOpcode",
         "testSwc2Disabled",
+        "testSwc2Enabled",
         "testCop3Disabled",
+        "testCop3Enabled",
         "testSwc3Disabled",
+        "testSwc3Enabled",
+        "testDisabledCoprocessorThrowsCoprocessorUnusable",
     ] {
         assert!(
             tty.contains(&format!("pass - {case}")),
-            "expected {case} to pass via the exception-dispatch chain:\n{tty}"
+            "expected {case} to pass:\n{tty}"
         );
     }
 
@@ -79,22 +88,6 @@ fn cop_runs_to_completion_and_reports_passes() {
         tty.contains("Done."),
         "cop did not run to completion:\n{tty}"
     );
-
-    // Known follow-up (a decoder change, deliberately out of scope here): the
-    // COP1/COP3 and LWCx/SWCx opcodes decode to `Illegal`, so they raise a
-    // reserved-instruction trap (ExcCode 0x0A) instead of Coprocessor-Unusable
-    // (0x0B). That makes:
-    //   * `testDisabledCoprocessorThrowsCoprocessorUnusable` still fail (it
-    //     asserts the exception *type* is 0x0B; it currently sees 0x0A), and
-    //   * the coprocessor-*enabled* `testSwc0/1/2/3Enabled` and
-    //     `testCop1/3Enabled` cases fail (a usable-coprocessor op should not
-    //     trap, but the reserved-instruction decode makes it trap regardless),
-    //   * plus `testCop0InvalidOpcode` (an unknown COP0 command should be a
-    //     no-op, but decodes to `Illegal`).
-    // Before the dispatch chain those enabled/invalid cases "passed" only because
-    // the harness silently swallowed the spurious trap; exposing them here is the
-    // dispatch chain working correctly. They turn green once the decoder surfaces
-    // COP1/COP3/LWCx/SWCx as distinct coprocessor ops.
 }
 
 #[test]
