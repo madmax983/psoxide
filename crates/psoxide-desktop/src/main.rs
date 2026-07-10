@@ -8,10 +8,13 @@
 //! ```
 //!
 //! The GPU is rendered via `framebuffer_rgba()` into a Pixels surface. Input is
-//! driven by the keyboard and, when present, a gamepad (via gilrs); both feed
-//! digital-pad state to controller port 0. Audio is produced by the core's SPU
-//! and played back through the host device via `rodio` (see the [`audio`]
-//! module); if no audio device is available the emulator continues silently.
+//! driven by the keyboard and, when present, a gamepad (via gilrs), both on
+//! controller port 0: the keyboard drives a digital pad, and a connected
+//! gamepad attaches a DualShock (analog) pad with both sticks and L2/R2/L3/R3.
+//! See [`pad_button_to_psx`] for the full mapping table. Audio is produced by
+//! the core's SPU and played back through the host device via `rodio` (see the
+//! [`audio`] module); if no audio device is available the emulator continues
+//! silently.
 
 mod audio;
 
@@ -20,10 +23,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use gilrs::{Button as PadButton, EventType, Gilrs};
+use gilrs::{Axis, Button as PadButton, EventType, Gilrs};
 use pixels::{Pixels, SurfaceTexture};
 use psoxide_config::PsxConfig;
-use psoxide_core::{Button, Command, CoreQuery, FRAME_HEIGHT, FRAME_WIDTH, PsxCore, QueryResult};
+use psoxide_core::{
+    Button, Command, ControllerKind, CoreQuery, FRAME_HEIGHT, FRAME_WIDTH, PsxCore, QueryResult,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -175,6 +180,20 @@ fn cmd_run(
         }
     };
 
+    // If a gamepad is already connected at startup, attach a DualShock (analog)
+    // pad to port 0 so the sticks are live immediately. Keyboard-only sessions
+    // keep the default digital pad (see the input-mapping doc comment below).
+    let mut analog_attached = false;
+    if let Some(gilrs) = &gilrs
+        && gilrs.gamepads().any(|(_, gp)| gp.is_connected())
+    {
+        let _ = core.execute(Command::SetControllerType {
+            port: 0,
+            kind: ControllerKind::Analog,
+        });
+        analog_attached = true;
+    }
+
     let event_loop = EventLoop::new().context("failed to create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
@@ -187,6 +206,12 @@ fn cmd_run(
         audio: AudioOutput::try_new(),
         gilrs,
         memcard_path: memcard,
+        analog_attached,
+        analog_lx: 0x80,
+        analog_ly: 0x80,
+        analog_rx: 0x80,
+        analog_ry: 0x80,
+        last_rumble: (0, 0),
     };
     event_loop.run_app(&mut app).context("event loop error")?;
     Ok(())
@@ -204,6 +229,32 @@ struct App {
     /// Slot-0 memory-card file to persist to (`None` when `--memcard` was not
     /// passed, in which case no card is inserted and none is written).
     memcard_path: Option<PathBuf>,
+    /// Whether a DualShock (analog) pad has been attached to port 0 for the
+    /// gamepad. Set once, on first gamepad presence/connect, to avoid re-sending
+    /// `SetControllerType` every frame.
+    analog_attached: bool,
+    /// Latest analog-axis bytes (`0x80` = centre) for the gamepad's sticks, in
+    /// PSX convention (Y already inverted vs gilrs). Left stick X/Y and right
+    /// stick X/Y; pushed to the core on any axis change via
+    /// [`Command::SetControllerSticks`].
+    analog_lx: u8,
+    analog_ly: u8,
+    analog_rx: u8,
+    analog_ry: u8,
+    /// Last rumble-motor actuation (small, large) logged for port 0, so the
+    /// log-only readback only fires on a change rather than every frame.
+    last_rumble: (u8, u8),
+}
+
+/// Converts a gilrs analog-axis value (`f32` in `-1.0..=1.0`) to a PSX analog
+/// axis byte (`0..=255`, `0x80` = centre): `0.0 -> 0x80`, `+1.0 -> 0xFF`,
+/// `-1.0 -> 0x00`. Out-of-range inputs are clamped.
+///
+/// The caller is responsible for the PSX Y-axis inversion (gilrs up is `+1.0`,
+/// PSX up is `0x00`): pass `-value` for the two Y axes.
+fn axis_f32_to_u8(value: f32) -> u8 {
+    let scaled = value.clamp(-1.0, 1.0) * 128.0 + 128.0;
+    scaled.round().clamp(0.0, 255.0) as u8
 }
 
 impl App {
@@ -258,13 +309,41 @@ fn key_to_button(key: KeyCode) -> Option<Button> {
     }
 }
 
-/// Maps a gilrs gamepad button to a PSX digital-pad button.
+/// # Desktop input mapping
 ///
-/// Standard SNES/PS-style layout:
-/// - D-pad Up/Down/Left/Right → Up/Down/Left/Right
-/// - South → Cross (✕), East → Circle (○), West → Square (□), North → Triangle (△)
-/// - Left trigger (or bumper) → L1, Right trigger (or bumper) → R1
-/// - Start → Start, Select → Select
+/// The two host input devices map onto two different PSX pad kinds:
+///
+/// - **Keyboard = digital pad only.** Keyboard input drives the port-0 button
+///   bitfield through [`Command::SetControllerState`]; a keyboard-only session
+///   keeps the default (digital) pad and no analog sticks. See
+///   [`key_to_button`].
+/// - **Gamepad = DualShock (analog).** When a gilrs gamepad is present the
+///   frontend attaches a [`ControllerKind::Analog`] pad to port 0, so both
+///   sticks (and L3/R3) are live in addition to the digital buttons.
+///
+/// Gamepad button/axis table:
+///
+/// | gilrs input                    | PSX      |
+/// |--------------------------------|----------|
+/// | `DPadUp/Down/Left/Right`       | `Up/Down/Left/Right` |
+/// | `South`                        | `Cross` (✕)   |
+/// | `East`                         | `Circle` (○)  |
+/// | `West`                         | `Square` (□)  |
+/// | `North`                        | `Triangle` (△) |
+/// | `LeftTrigger` (bumper)         | `L1`     |
+/// | `RightTrigger` (bumper)        | `R1`     |
+/// | `LeftTrigger2` (trigger)       | `L2`     |
+/// | `RightTrigger2` (trigger)      | `R2`     |
+/// | `LeftThumb` (stick click)      | `L3`     |
+/// | `RightThumb` (stick click)     | `R3`     |
+/// | `Start`                        | `Start`  |
+/// | `Select`                       | `Select` |
+/// | `LeftStickX/Y`                 | left analog stick  |
+/// | `RightStickX/Y`                | right analog stick |
+///
+/// Analog axes: gilrs `f32` (`-1.0..=1.0`) → PSX byte (`0x80` centre) via
+/// [`axis_f32_to_u8`]; the PSX Y axis is inverted vs gilrs (see the axis
+/// handler in `about_to_wait`).
 ///
 /// Returns `None` for buttons with no PSX equivalent.
 fn pad_button_to_psx(button: PadButton) -> Option<Button> {
@@ -277,8 +356,12 @@ fn pad_button_to_psx(button: PadButton) -> Option<Button> {
         PadButton::East => Button::Circle,
         PadButton::West => Button::Square,
         PadButton::North => Button::Triangle,
-        PadButton::LeftTrigger | PadButton::LeftTrigger2 => Button::L1,
-        PadButton::RightTrigger | PadButton::RightTrigger2 => Button::R1,
+        PadButton::LeftTrigger => Button::L1,
+        PadButton::RightTrigger => Button::R1,
+        PadButton::LeftTrigger2 => Button::L2,
+        PadButton::RightTrigger2 => Button::R2,
+        PadButton::LeftThumb => Button::L3,
+        PadButton::RightThumb => Button::R3,
         PadButton::Start => Button::Start,
         PadButton::Select => Button::Select,
         _ => return None,
@@ -375,28 +458,105 @@ impl ApplicationHandler for App {
         // Drain gamepad events into the port-0 button bitfield, mirroring the
         // keyboard path's whole-bitfield `SetControllerState` update.
         if let Some(gilrs) = &mut self.gilrs {
-            let mut changed = false;
+            let mut buttons_changed = false;
+            let mut sticks_changed = false;
+            let mut newly_connected = false;
             while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
-                let (pad_button, pressed) = match event {
-                    EventType::ButtonPressed(b, _) => (b, true),
-                    EventType::ButtonReleased(b, _) => (b, false),
-                    _ => continue,
-                };
-                if let Some(button) = pad_button_to_psx(pad_button) {
-                    if pressed {
-                        self.buttons |= button.bit_mask();
-                    } else {
-                        self.buttons &= !button.bit_mask();
+                match event {
+                    EventType::Connected => newly_connected = true,
+                    EventType::ButtonPressed(b, _) | EventType::ButtonReleased(b, _) => {
+                        let pressed = matches!(event, EventType::ButtonPressed(_, _));
+                        if let Some(button) = pad_button_to_psx(b) {
+                            if pressed {
+                                self.buttons |= button.bit_mask();
+                            } else {
+                                self.buttons &= !button.bit_mask();
+                            }
+                            buttons_changed = true;
+                        }
                     }
-                    changed = true;
+                    EventType::AxisChanged(axis, value, _) => {
+                        // gilrs value is -1.0..=1.0; PSX Y axis is inverted vs
+                        // gilrs (gilrs up = +1.0, PSX up = 0x00) so negate Y.
+                        match axis {
+                            Axis::LeftStickX => self.analog_lx = axis_f32_to_u8(value),
+                            Axis::LeftStickY => self.analog_ly = axis_f32_to_u8(-value),
+                            Axis::RightStickX => self.analog_rx = axis_f32_to_u8(value),
+                            Axis::RightStickY => self.analog_ry = axis_f32_to_u8(-value),
+                            _ => continue,
+                        }
+                        sticks_changed = true;
+                    }
+                    _ => {}
                 }
             }
-            if changed {
+
+            // Attach a DualShock (analog) pad to port 0 on the first gamepad
+            // connect, so hotplugged pads get live sticks too.
+            if newly_connected && !self.analog_attached {
+                let _ = self.core.execute(Command::SetControllerType {
+                    port: 0,
+                    kind: ControllerKind::Analog,
+                });
+                self.analog_attached = true;
+            }
+            if buttons_changed {
                 let _ = self.core.execute(Command::SetControllerState {
                     port: 0,
                     buttons: self.buttons,
                 });
             }
+            if sticks_changed {
+                let _ = self.core.execute(Command::SetControllerSticks {
+                    port: 0,
+                    right: (self.analog_rx, self.analog_ry),
+                    left: (self.analog_lx, self.analog_ly),
+                });
+            }
+
+            // Log-only rumble readback: report the analog pad's motor state when
+            // it changes, so a future host rumble backend has a clear hook point
+            // (the desktop has none yet, so actuation is logged, not played).
+            if let QueryResult::ControllerRumble {
+                present: true,
+                small,
+                large,
+            } = self.core.query(CoreQuery::ControllerRumble { port: 0 })
+                && (small, large) != self.last_rumble
+            {
+                self.last_rumble = (small, large);
+                if small != 0 || large != 0 {
+                    eprintln!(
+                        "Rumble port 0: small={small:#04x} large={large:#04x} (no host backend; ignored)"
+                    );
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::axis_f32_to_u8;
+
+    #[test]
+    fn axis_centre_maps_to_0x80() {
+        assert_eq!(axis_f32_to_u8(0.0), 0x80);
+    }
+
+    #[test]
+    fn axis_full_positive_maps_to_0xff() {
+        assert_eq!(axis_f32_to_u8(1.0), 0xFF);
+    }
+
+    #[test]
+    fn axis_full_negative_maps_to_0x00() {
+        assert_eq!(axis_f32_to_u8(-1.0), 0x00);
+    }
+
+    #[test]
+    fn axis_out_of_range_is_clamped() {
+        assert_eq!(axis_f32_to_u8(2.5), 0xFF);
+        assert_eq!(axis_f32_to_u8(-2.5), 0x00);
     }
 }
