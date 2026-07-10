@@ -94,13 +94,13 @@ fn build_mem() -> Harness {
     // 0x14 beq   $zero,$zero,-4  ;       -> 0x08
     // 0x18 nop                   ; delay slot
     let program = [
-        i_type(0x09, 0, 9, 0x0100),  // addiu $t1,$zero,0x100
-        i_type(0x09, 0, 8, 0),       // addiu $t0,$zero,0
-        i_type(0x2B, 9, 8, 0),       // sw    $t0,0($t1)
-        i_type(0x23, 9, 10, 0),      // lw    $t2,0($t1)
-        i_type(0x09, 8, 8, 1),       // addiu $t0,$t0,1
-        i_type(0x04, 0, 0, 0xFFFC),  // beq   $zero,$zero,-4 -> 0x08
-        0,                           // nop (delay slot)
+        i_type(0x09, 0, 9, 0x0100), // addiu $t1,$zero,0x100
+        i_type(0x09, 0, 8, 0),      // addiu $t0,$zero,0
+        i_type(0x2B, 9, 8, 0),      // sw    $t0,0($t1)
+        i_type(0x23, 9, 10, 0),     // lw    $t2,0($t1)
+        i_type(0x09, 8, 8, 1),      // addiu $t0,$t0,1
+        i_type(0x04, 0, 0, 0xFFFC), // beq   $zero,$zero,-4 -> 0x08
+        0,                          // nop (delay slot)
     ];
     let mut h = Harness::new();
     h.load_program(&program);
@@ -125,23 +125,22 @@ fn build_gte() -> Harness {
     // 0x20 beq   $zero,$zero,-3  ;       -> 0x18
     // 0x24 nop                   ; delay slot
     let program = [
-        i_type(0x0F, 0, 8, 0x0040),  // lui   $t0,0x0040
-        cop2_move(0x04, 8, 0),       // mtc2  $t0,$0
-        cop2_move(0x04, 8, 1),       // mtc2  $t0,$1
-        cop2_move(0x04, 8, 2),       // mtc2  $t0,$2
-        cop2_move(0x06, 8, 0),       // ctc2  $t0,$0
-        cop2_move(0x06, 8, 6),       // ctc2  $t0,$6
-        gte_cmd(0x30),               // RTPT (loop head @ 0x18)
-        i_type(0x09, 11, 11, 1),     // addiu $t3,$t3,1
-        i_type(0x04, 0, 0, 0xFFFD),  // beq   $zero,$zero,-3 -> 0x18
-        0,                           // nop (delay slot)
+        i_type(0x0F, 0, 8, 0x0040), // lui   $t0,0x0040
+        cop2_move(0x04, 8, 0),      // mtc2  $t0,$0
+        cop2_move(0x04, 8, 1),      // mtc2  $t0,$1
+        cop2_move(0x04, 8, 2),      // mtc2  $t0,$2
+        cop2_move(0x06, 8, 0),      // ctc2  $t0,$0
+        cop2_move(0x06, 8, 6),      // ctc2  $t0,$6
+        gte_cmd(0x30),              // RTPT (loop head @ 0x18)
+        i_type(0x09, 11, 11, 1),    // addiu $t3,$t3,1
+        i_type(0x04, 0, 0, 0xFFFD), // beq   $zero,$zero,-3 -> 0x18
+        0,                          // nop (delay slot)
     ];
     let mut h = Harness::new();
     h.load_program(&program);
     // Enable COP2 usability (SR.CU2 = bit 30) so the GTE ops do not raise
     // Coprocessor-Unusable.
-    h.core_mut()
-        .set_cop0(psoxide_core::COP0_SR, 1 << 30);
+    h.core_mut().set_cop0(psoxide_core::COP0_SR, 1 << 30);
     h
 }
 
