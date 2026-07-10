@@ -11,7 +11,25 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 - **psoxide-config**: TOML config, `PsxConfig::load_or_default()`
 - **psoxide-desktop**: CLI frontend. Winit + Pixels + rodio (SPU audio
   playback; falls back to silent if no audio device). Keyboard and gilrs gamepad
-  input both drive controller port 0 through `Command::SetControllerState`.
+  input both drive controller port 0 through `Command::SetControllerState`. The
+  run loop also provides desktop-polish controls: save states (`save_state`/
+  `load_state` serde snapshots written beside the content as `<stem>.ss<slot>`,
+  slots 1-9), pause/frame-step/fast-forward/reset, fullscreen + window rescale,
+  a title-bar HUD (fps / emulation-speed% / audio-underruns), a ~60fps frontend
+  frame pacer, and memory-card + config flush on every exit path. Runtime
+  keybindings and last-used paths persist through `psoxide-config`
+  (`PsxConfig::save`); CLI flags override the config.
+
+  | Key | Action | Key | Action |
+  |-----|--------|-----|--------|
+  | Arrows | D-pad | `P` | Pause/resume |
+  | Z/X/A/S | ✕/○/□/△ | `F` | Frame-step (paused) |
+  | Q/W | L1/R1 | `Space` | Fast-forward (hold) |
+  | Enter | Start | `R` | Reset |
+  | RShift | Select | `F11` | Fullscreen |
+  | `1`-`9` | Select slot | `=`/`-` | Scale up/down |
+  | `F5` | Save state | `F9` | Load state |
+  | `Esc` | Quit | | |
 - **psoxide-proof**: Verus proof scaffold (checked out-of-band; see below).
 - **psoxide-test-harness**: Program/ROM-based integration tests.
 

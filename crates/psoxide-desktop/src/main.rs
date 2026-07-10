@@ -17,15 +17,18 @@
 //! silently.
 
 mod audio;
+mod savestate;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gilrs::{Axis, Button as PadButton, EventType, Gilrs};
 use pixels::{Pixels, SurfaceTexture};
 use psoxide_config::PsxConfig;
+use psoxide_core::api::FRAMES_PER_SECOND;
 use psoxide_core::{
     Button, Command, ControllerKind, CoreQuery, FRAME_HEIGHT, FRAME_WIDTH, PsxCore, QueryResult,
 };
@@ -34,9 +37,13 @@ use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::audio::AudioOutput;
+
+/// Minimum / maximum integer window scale reachable with the rescale hotkeys.
+const MIN_SCALE: u32 = 1;
+const MAX_SCALE: u32 = 8;
 
 #[derive(Parser)]
 #[command(name = "psoxide", about = "Sony PlayStation emulator")]
@@ -62,9 +69,12 @@ enum CliCommand {
         /// (all-zero) if the path does not exist; flushed back on write + exit.
         #[arg(long)]
         memcard: Option<PathBuf>,
-        /// Window scale factor.
-        #[arg(long, default_value = "2")]
-        scale: u32,
+        /// Window scale factor (overrides the config's `window_scale`).
+        #[arg(long)]
+        scale: Option<u32>,
+        /// Start in fullscreen (overrides the config's `fullscreen`).
+        #[arg(long)]
+        fullscreen: bool,
         /// Config file path.
         #[arg(long, default_value = "psoxide.toml")]
         config: PathBuf,
@@ -85,6 +95,7 @@ fn main() -> Result<()> {
             disc,
             memcard,
             scale,
+            fullscreen,
             config,
         } => cmd_run(
             &bios,
@@ -92,6 +103,7 @@ fn main() -> Result<()> {
             disc.as_deref(),
             memcard,
             scale,
+            fullscreen,
             &config,
         ),
         CliCommand::Info { bios } => cmd_info(&bios),
@@ -114,15 +126,26 @@ fn cmd_info(bios_path: &Path) -> Result<()> {
 /// Memory-card image size in bytes (128 KB).
 const MEMCARD_BYTES: usize = 128 * 1024;
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     bios_name: &str,
     exe: Option<&Path>,
     disc: Option<&Path>,
     memcard: Option<PathBuf>,
-    scale: u32,
+    scale: Option<u32>,
+    fullscreen: bool,
     config_path: &Path,
 ) -> Result<()> {
-    let config = PsxConfig::load(config_path).unwrap_or_default();
+    let mut config = PsxConfig::load(config_path).unwrap_or_default();
+    // CLI flags override the persisted config; otherwise fall back to it.
+    let scale = scale
+        .unwrap_or(config.desktop.window_scale)
+        .clamp(MIN_SCALE, MAX_SCALE);
+    let fullscreen = fullscreen || config.desktop.fullscreen;
+    // Resolve the runtime keybindings once (config strings → winit KeyCodes,
+    // falling back to the built-in default for any unrecognised name).
+    let keys = Keys::from_config(&config.keybindings);
+
     let bios_path = config.resolve_disc(bios_name);
     let bios_data = fs::read(&bios_path)
         .with_context(|| format!("failed to read BIOS: {}", bios_path.display()))?;
@@ -130,6 +153,12 @@ fn cmd_run(
     let mut core = PsxCore::new();
     core.execute(Command::LoadBios(bios_data))
         .map_err(|e| anyhow::anyhow!("failed to load BIOS: {e}"))?;
+
+    // Base path for save-state files: the most specific loaded artefact.
+    let save_base = disc
+        .map(Path::to_path_buf)
+        .or_else(|| exe.map(Path::to_path_buf))
+        .unwrap_or_else(|| bios_path.clone());
 
     if let Some(exe_path) = exe {
         let exe_data = fs::read(exe_path)
@@ -194,9 +223,25 @@ fn cmd_run(
         analog_attached = true;
     }
 
+    // Remember the resolved paths + window settings so the next launch can
+    // reuse them (persisted on exit).
+    config.desktop.bios_path = bios_path.to_string_lossy().into_owned();
+    config.desktop.last_bios = bios_path.to_string_lossy().into_owned();
+    if let Some(d) = disc {
+        config.desktop.last_disc = d.to_string_lossy().into_owned();
+    }
+    if let Some(m) = &memcard {
+        config.desktop.last_memcard = m.to_string_lossy().into_owned();
+    }
+    config.desktop.window_scale = scale;
+    config.desktop.fullscreen = fullscreen;
+
+    print_controls_banner(&config.keybindings);
+
     let event_loop = EventLoop::new().context("failed to create event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
+    let frame_duration = Duration::from_secs_f64(1.0 / FRAMES_PER_SECOND as f64);
     let mut app = App {
         core,
         scale,
@@ -212,9 +257,40 @@ fn cmd_run(
         analog_rx: 0x80,
         analog_ry: 0x80,
         last_rumble: (0, 0),
+        keys,
+        config,
+        config_path: config_path.to_path_buf(),
+        save_base,
+        paused: false,
+        fast_forward: false,
+        fullscreen,
+        active_slot: savestate::MIN_SLOT,
+        frame_duration,
+        last_frame_time: None,
+        fps_window_start: Instant::now(),
+        fps_window_frames: 0,
+        hud_fps: 0.0,
     };
     event_loop.run_app(&mut app).context("event loop error")?;
     Ok(())
+}
+
+/// Prints a one-time controls banner to the terminal at startup.
+fn print_controls_banner(kb: &psoxide_config::Keybindings) {
+    eprintln!("psoxide controls:");
+    eprintln!("  {:<7} pause / resume", kb.pause);
+    eprintln!("  {:<7} frame-step (while paused)", kb.frame_step);
+    eprintln!("  {:<7} fast-forward (hold)", kb.fast_forward);
+    eprintln!("  {:<7} reset", kb.reset);
+    eprintln!("  {:<7} fullscreen", kb.fullscreen);
+    eprintln!(
+        "  {} / {}  window scale up / down",
+        kb.scale_up, kb.scale_down
+    );
+    eprintln!("  1-9     select save-state slot");
+    eprintln!("  {:<7} save state to active slot", kb.save_state);
+    eprintln!("  {:<7} load state from active slot", kb.load_state);
+    eprintln!("  Esc     quit");
 }
 
 struct App {
@@ -244,6 +320,130 @@ struct App {
     /// Last rumble-motor actuation (small, large) logged for port 0, so the
     /// log-only readback only fires on a change rather than every frame.
     last_rumble: (u8, u8),
+    /// Resolved runtime-control keybindings.
+    keys: Keys,
+    /// Live config, persisted (with last-used paths + window settings) on exit.
+    config: PsxConfig,
+    /// Path the config is loaded from / saved back to.
+    config_path: PathBuf,
+    /// Base path for save-state slot files (disc, else EXE, else BIOS).
+    save_base: PathBuf,
+    /// Whether emulation stepping is paused (frontend-driven; the core's
+    /// `StepFrame` does not itself honour a paused flag).
+    paused: bool,
+    /// Whether fast-forward is held (uncaps the frame pacer).
+    fast_forward: bool,
+    /// Whether the window is currently fullscreen.
+    fullscreen: bool,
+    /// Currently selected save-state slot (`1..=9`).
+    active_slot: u8,
+    /// Target wall-clock duration of one emulated frame at 1x speed.
+    frame_duration: Duration,
+    /// Instant the last frame finished, for pacing.
+    last_frame_time: Option<Instant>,
+    /// Start of the current ~1s HUD measurement window.
+    fps_window_start: Instant,
+    /// Frames rendered in the current HUD window.
+    fps_window_frames: u32,
+    /// Most recently measured frames-per-second (for the title-bar HUD).
+    hud_fps: f64,
+}
+
+/// Runtime-control keybindings resolved to concrete winit key codes.
+struct Keys {
+    pause: KeyCode,
+    frame_step: KeyCode,
+    fast_forward: KeyCode,
+    reset: KeyCode,
+    fullscreen: KeyCode,
+    scale_up: KeyCode,
+    scale_down: KeyCode,
+    save_state: KeyCode,
+    load_state: KeyCode,
+}
+
+impl Keys {
+    /// Resolves each configured binding, falling back to the built-in default
+    /// name when the configured string does not name a known key.
+    fn from_config(kb: &psoxide_config::Keybindings) -> Self {
+        let d = psoxide_config::Keybindings::default();
+        let resolve = |name: &str, fallback: &str| {
+            parse_keycode(name)
+                .or_else(|| parse_keycode(fallback))
+                .unwrap_or(KeyCode::Escape)
+        };
+        Self {
+            pause: resolve(&kb.pause, &d.pause),
+            frame_step: resolve(&kb.frame_step, &d.frame_step),
+            fast_forward: resolve(&kb.fast_forward, &d.fast_forward),
+            reset: resolve(&kb.reset, &d.reset),
+            fullscreen: resolve(&kb.fullscreen, &d.fullscreen),
+            scale_up: resolve(&kb.scale_up, &d.scale_up),
+            scale_down: resolve(&kb.scale_down, &d.scale_down),
+            save_state: resolve(&kb.save_state, &d.save_state),
+            load_state: resolve(&kb.load_state, &d.load_state),
+        }
+    }
+}
+
+/// Parses a winit [`KeyCode`] from its variant name (as written in the config).
+///
+/// Covers the letter/function/digit keys and the handful of punctuation keys
+/// the default bindings use. Returns `None` for an unrecognised name so the
+/// caller can fall back to a default.
+fn parse_keycode(name: &str) -> Option<KeyCode> {
+    Some(match name {
+        "KeyA" => KeyCode::KeyA,
+        "KeyB" => KeyCode::KeyB,
+        "KeyC" => KeyCode::KeyC,
+        "KeyD" => KeyCode::KeyD,
+        "KeyE" => KeyCode::KeyE,
+        "KeyF" => KeyCode::KeyF,
+        "KeyG" => KeyCode::KeyG,
+        "KeyH" => KeyCode::KeyH,
+        "KeyI" => KeyCode::KeyI,
+        "KeyJ" => KeyCode::KeyJ,
+        "KeyK" => KeyCode::KeyK,
+        "KeyL" => KeyCode::KeyL,
+        "KeyM" => KeyCode::KeyM,
+        "KeyN" => KeyCode::KeyN,
+        "KeyO" => KeyCode::KeyO,
+        "KeyP" => KeyCode::KeyP,
+        "KeyQ" => KeyCode::KeyQ,
+        "KeyR" => KeyCode::KeyR,
+        "KeyS" => KeyCode::KeyS,
+        "KeyT" => KeyCode::KeyT,
+        "KeyU" => KeyCode::KeyU,
+        "KeyV" => KeyCode::KeyV,
+        "KeyW" => KeyCode::KeyW,
+        "KeyX" => KeyCode::KeyX,
+        "KeyY" => KeyCode::KeyY,
+        "KeyZ" => KeyCode::KeyZ,
+        "F1" => KeyCode::F1,
+        "F2" => KeyCode::F2,
+        "F3" => KeyCode::F3,
+        "F4" => KeyCode::F4,
+        "F5" => KeyCode::F5,
+        "F6" => KeyCode::F6,
+        "F7" => KeyCode::F7,
+        "F8" => KeyCode::F8,
+        "F9" => KeyCode::F9,
+        "F10" => KeyCode::F10,
+        "F11" => KeyCode::F11,
+        "F12" => KeyCode::F12,
+        "Space" => KeyCode::Space,
+        "Tab" => KeyCode::Tab,
+        "Enter" => KeyCode::Enter,
+        "Equal" => KeyCode::Equal,
+        "Minus" => KeyCode::Minus,
+        "BracketLeft" => KeyCode::BracketLeft,
+        "BracketRight" => KeyCode::BracketRight,
+        "Backslash" => KeyCode::Backslash,
+        "Period" => KeyCode::Period,
+        "Comma" => KeyCode::Comma,
+        "Backspace" => KeyCode::Backspace,
+        _ => return None,
+    })
 }
 
 /// Converts a gilrs analog-axis value (`f32` in `-1.0..=1.0`) to a PSX analog
@@ -289,6 +489,171 @@ impl App {
             ),
         }
     }
+
+    /// Saves the current machine state to the active slot. Failures are logged,
+    /// never fatal.
+    fn save_state_slot(&mut self) {
+        let snap = self.core.save_state();
+        match savestate::write_slot(&self.save_base, self.active_slot, &snap) {
+            Ok(path) => eprintln!(
+                "Saved state to slot {} ({})",
+                self.active_slot,
+                path.display()
+            ),
+            Err(e) => eprintln!("Warning: {e}"),
+        }
+    }
+
+    /// Loads the active slot into the machine. A missing or invalid slot is
+    /// reported and otherwise ignored (the running game is left untouched).
+    fn load_state_slot(&mut self) {
+        match savestate::read_slot(&self.save_base, self.active_slot) {
+            Ok(snap) => {
+                self.core.load_state(&snap);
+                eprintln!("Loaded state from slot {}", self.active_slot);
+            }
+            Err(e) => eprintln!("Warning: {e}"),
+        }
+    }
+
+    /// Applies a new integer window scale (clamped) and resizes the window.
+    fn set_scale(&mut self, scale: u32) {
+        let scale = scale.clamp(MIN_SCALE, MAX_SCALE);
+        if scale == self.scale {
+            return;
+        }
+        self.scale = scale;
+        if let Some(window) = self.window.as_ref() {
+            let _ = window.request_inner_size(LogicalSize::new(
+                FRAME_WIDTH as u32 * scale,
+                FRAME_HEIGHT as u32 * scale,
+            ));
+        }
+        eprintln!("Window scale: {scale}x");
+    }
+
+    /// Toggles fullscreen (borderless on the current monitor).
+    fn toggle_fullscreen(&mut self) {
+        self.fullscreen = !self.fullscreen;
+        if let Some(window) = self.window.as_ref() {
+            window.set_fullscreen(if self.fullscreen {
+                Some(Fullscreen::Borderless(None))
+            } else {
+                None
+            });
+        }
+    }
+
+    /// Updates the title-bar HUD (fps, emulation speed, audio underruns) once
+    /// per ~1s measurement window.
+    fn update_hud(&mut self) {
+        self.fps_window_frames += 1;
+        let elapsed = self.fps_window_start.elapsed();
+        if elapsed < Duration::from_millis(500) {
+            return;
+        }
+        self.hud_fps = self.fps_window_frames as f64 / elapsed.as_secs_f64();
+        self.fps_window_frames = 0;
+        self.fps_window_start = Instant::now();
+
+        let speed = self.hud_fps / FRAMES_PER_SECOND as f64 * 100.0;
+        let underruns = self.audio.as_ref().map_or(0, AudioOutput::underruns);
+        let status = if self.paused {
+            " [paused]"
+        } else if self.fast_forward {
+            " [ff]"
+        } else {
+            ""
+        };
+        if let Some(window) = self.window.as_ref() {
+            window.set_title(&format!(
+                "psoxide — {:.0} fps  {:.0}%  slot {}  underruns {}{}",
+                self.hud_fps, speed, self.active_slot, underruns, status
+            ));
+        }
+    }
+
+    /// Handles a runtime-control hotkey (edge-triggered on key-down). Returns
+    /// `true` when the key was consumed as a control and must not also drive the
+    /// pad. Fast-forward is handled by the caller (it needs both key edges).
+    fn handle_hotkey(&mut self, key: KeyCode) -> bool {
+        // Digit keys 1-9 select the active save-state slot.
+        if let Some(slot) = digit_slot(key) {
+            self.active_slot = slot;
+            eprintln!("Save-state slot: {slot}");
+            return true;
+        }
+        if key == self.keys.pause {
+            self.paused = !self.paused;
+            let _ = self.core.execute(if self.paused {
+                Command::Pause
+            } else {
+                Command::Resume
+            });
+            eprintln!("{}", if self.paused { "Paused" } else { "Resumed" });
+            true
+        } else if key == self.keys.frame_step {
+            if self.paused {
+                // The core's StepFrame ignores the paused flag, so a single call
+                // advances exactly one frame while we stay logically paused.
+                let _ = self.core.execute(Command::StepFrame);
+            }
+            true
+        } else if key == self.keys.reset {
+            let _ = self.core.execute(Command::Reset);
+            eprintln!("Reset");
+            true
+        } else if key == self.keys.fullscreen {
+            self.toggle_fullscreen();
+            true
+        } else if key == self.keys.scale_up {
+            self.set_scale(self.scale + 1);
+            true
+        } else if key == self.keys.scale_down {
+            self.set_scale(self.scale.saturating_sub(1));
+            true
+        } else if key == self.keys.save_state {
+            self.save_state_slot();
+            true
+        } else if key == self.keys.load_state {
+            self.load_state_slot();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Persists the memory card and config on any exit path.
+    fn on_exit(&mut self) {
+        self.flush_memcard();
+        self.config.desktop.window_scale = self.scale;
+        self.config.desktop.fullscreen = self.fullscreen;
+        if let Err(e) = self.config.save(&self.config_path) {
+            eprintln!(
+                "Warning: failed to write config {}: {e}",
+                self.config_path.display()
+            );
+        }
+        if let Some(audio) = self.audio.as_ref() {
+            audio.shutdown();
+        }
+    }
+}
+
+/// Maps digit keys `1..=9` to a save-state slot number.
+fn digit_slot(key: KeyCode) -> Option<u8> {
+    Some(match key {
+        KeyCode::Digit1 => 1,
+        KeyCode::Digit2 => 2,
+        KeyCode::Digit3 => 3,
+        KeyCode::Digit4 => 4,
+        KeyCode::Digit5 => 5,
+        KeyCode::Digit6 => 6,
+        KeyCode::Digit7 => 7,
+        KeyCode::Digit8 => 8,
+        KeyCode::Digit9 => 9,
+        _ => return None,
+    })
 }
 
 fn key_to_button(key: KeyCode) -> Option<Button> {
@@ -377,10 +742,13 @@ impl ApplicationHandler for App {
             FRAME_WIDTH as u32 * self.scale,
             FRAME_HEIGHT as u32 * self.scale,
         );
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title("psoxide")
             .with_inner_size(size)
             .with_min_inner_size(LogicalSize::new(FRAME_WIDTH as u32, FRAME_HEIGHT as u32));
+        if self.fullscreen {
+            attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
         let window = event_loop
             .create_window(attrs)
             .expect("failed to create window");
@@ -406,31 +774,55 @@ impl ApplicationHandler for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                // Flush the memory card one last time before exiting.
-                self.flush_memcard();
+                // Flush the memory card + config one last time before exiting.
+                self.on_exit();
                 event_loop.exit();
             }
+            WindowEvent::Resized(size) => {
+                // Keep the pixel surface matched to the window (rescale +
+                // fullscreen both land here); the 320x240 buffer is unchanged
+                // and Pixels scales it up to the surface.
+                if let Some(pixels) = self.pixels.as_mut() {
+                    let _ = pixels.resize_surface(size.width.max(1), size.height.max(1));
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
+                let pressed = event.state.is_pressed();
                 if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
-                    event_loop.exit();
+                    if pressed {
+                        self.on_exit();
+                        event_loop.exit();
+                    }
                     return;
                 }
-                if let PhysicalKey::Code(key) = event.physical_key
-                    && let Some(button) = key_to_button(key)
-                {
-                    if event.state.is_pressed() {
-                        self.buttons |= button.bit_mask();
-                    } else {
-                        self.buttons &= !button.bit_mask();
+                if let PhysicalKey::Code(key) = event.physical_key {
+                    // Runtime-control hotkeys are edge-triggered on key-down.
+                    if pressed && self.handle_hotkey(key) {
+                        return;
                     }
-                    let _ = self.core.execute(Command::SetControllerState {
-                        port: 0,
-                        buttons: self.buttons,
-                    });
+                    // Otherwise route to the digital pad.
+                    if let Some(button) = key_to_button(key) {
+                        if pressed {
+                            self.buttons |= button.bit_mask();
+                        } else {
+                            self.buttons &= !button.bit_mask();
+                        }
+                        let _ = self.core.execute(Command::SetControllerState {
+                            port: 0,
+                            buttons: self.buttons,
+                        });
+                    } else if key == self.keys.fast_forward {
+                        // Fast-forward is a hold: track both edges.
+                        self.fast_forward = pressed;
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
-                let _ = self.core.execute(Command::StepFrame);
+                // Advance the machine unless paused. When paused we still
+                // re-render the last frame and drain audio so nothing backs up.
+                if !self.paused {
+                    let _ = self.core.execute(Command::StepFrame);
+                }
                 if let Some(pixels) = self.pixels.as_mut() {
                     let frame = self.core.framebuffer_rgba();
                     pixels.frame_mut().copy_from_slice(&frame);
@@ -440,15 +832,15 @@ impl ApplicationHandler for App {
                 // drain the core queue so it cannot grow unbounded even when
                 // there is no audio device.
                 let samples = self.core.drain_audio();
-                if let Some(audio) = self.audio.as_ref() {
+                if let Some(audio) = self.audio.as_mut() {
                     audio.queue(samples);
                 }
                 // Persistence policy: flush on dirty each frame + on exit. This
                 // only touches the disk when the card was actually written.
                 self.flush_memcard();
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+                self.update_hud();
+                // The next redraw is requested from `about_to_wait`, after the
+                // frame pacer has slept off the slack.
             }
             _ => {}
         }
@@ -532,12 +924,79 @@ impl ApplicationHandler for App {
                 }
             }
         }
+
+        // Frame pacing: cap to ~60 fps at 1x speed by sleeping off the slack
+        // since the previous frame. Fast-forward (and the paused re-render loop)
+        // skip the sleep so they run as fast as the host allows.
+        if !self.fast_forward
+            && let Some(last) = self.last_frame_time
+        {
+            let elapsed = last.elapsed();
+            if elapsed < self.frame_duration {
+                std::thread::sleep(self.frame_duration - elapsed);
+            }
+        }
+        self.last_frame_time = Some(Instant::now());
+
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::axis_f32_to_u8;
+    use super::{Keys, axis_f32_to_u8, digit_slot, parse_keycode};
+    use psoxide_config::Keybindings;
+    use winit::keyboard::KeyCode;
+
+    #[test]
+    fn parse_keycode_known_and_unknown() {
+        assert_eq!(parse_keycode("KeyP"), Some(KeyCode::KeyP));
+        assert_eq!(parse_keycode("F5"), Some(KeyCode::F5));
+        assert_eq!(parse_keycode("Space"), Some(KeyCode::Space));
+        assert_eq!(parse_keycode("Equal"), Some(KeyCode::Equal));
+        assert_eq!(parse_keycode("NotAKey"), None);
+    }
+
+    #[test]
+    fn keys_default_bindings_resolve() {
+        let keys = Keys::from_config(&Keybindings::default());
+        assert_eq!(keys.pause, KeyCode::KeyP);
+        assert_eq!(keys.save_state, KeyCode::F5);
+        assert_eq!(keys.load_state, KeyCode::F9);
+        assert_eq!(keys.fast_forward, KeyCode::Space);
+        assert_eq!(keys.reset, KeyCode::KeyR);
+    }
+
+    #[test]
+    fn keys_unknown_binding_falls_back_to_default() {
+        let kb = Keybindings {
+            pause: "TotallyBogus".into(),
+            ..Default::default()
+        };
+        let keys = Keys::from_config(&kb);
+        // Unrecognised name → the default binding for that action is used.
+        assert_eq!(keys.pause, KeyCode::KeyP);
+    }
+
+    #[test]
+    fn keys_custom_binding_applies() {
+        let kb = Keybindings {
+            pause: "KeyM".into(),
+            ..Default::default()
+        };
+        let keys = Keys::from_config(&kb);
+        assert_eq!(keys.pause, KeyCode::KeyM);
+    }
+
+    #[test]
+    fn digit_slot_maps_1_to_9() {
+        assert_eq!(digit_slot(KeyCode::Digit1), Some(1));
+        assert_eq!(digit_slot(KeyCode::Digit9), Some(9));
+        assert_eq!(digit_slot(KeyCode::Digit0), None);
+        assert_eq!(digit_slot(KeyCode::KeyA), None);
+    }
 
     #[test]
     fn axis_centre_maps_to_0x80() {

@@ -2002,6 +2002,7 @@ dependencies = [
  "psoxide-config",
  "psoxide-core",
  "rodio",
+ "serde_json",
  "winit",
 ]
 
