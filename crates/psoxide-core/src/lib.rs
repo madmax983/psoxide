@@ -18,6 +18,7 @@ pub mod gpu;
 pub mod gte;
 pub mod iostubs;
 pub mod irq;
+pub mod mdec;
 pub mod spu;
 pub mod timers;
 pub mod timing;
@@ -35,6 +36,7 @@ pub use dma::Dma;
 pub use gpu::Gpu;
 pub use gte::Gte;
 pub use irq::{Irq, IrqLine};
+pub use mdec::Mdec;
 pub use spu::Spu;
 pub use timers::Timers;
 pub use timing::{

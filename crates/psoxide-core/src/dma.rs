@@ -26,11 +26,16 @@ use crate::bus::MAIN_RAM_MASK;
 use crate::cdrom::Cdrom;
 use crate::gpu::Gpu;
 use crate::irq::{Irq, IrqLine};
+use crate::mdec::Mdec;
 use crate::spu::Spu;
 
 /// Number of DMA channels.
 pub const CHANNELS: usize = 7;
 
+/// MDEC input DMA channel index (RAM → macroblock decoder).
+pub const CH_MDEC_IN: usize = 0;
+/// MDEC output DMA channel index (macroblock decoder → RAM).
+pub const CH_MDEC_OUT: usize = 1;
 /// GPU DMA channel index.
 pub const CH_GPU: usize = 2;
 /// CD-ROM DMA channel index.
@@ -108,6 +113,7 @@ impl Dma {
         gpu: &mut Gpu,
         cdrom: &mut Cdrom,
         spu: &mut Spu,
+        mdec: &mut Mdec,
         irq: &mut Irq,
     ) {
         match addr {
@@ -129,7 +135,7 @@ impl Dma {
                     0x8 => {
                         self.chcr[ch] = val;
                         if Self::is_triggered(val) {
-                            self.run_channel(ch, mem, gpu, cdrom, spu, irq);
+                            self.run_channel(ch, mem, gpu, cdrom, spu, mdec, irq);
                         }
                     }
                     _ => {}
@@ -151,6 +157,9 @@ impl Dma {
         }
     }
 
+    // Same crossbar rationale as `write32`: dispatching a triggered transfer
+    // needs mutable access to RAM and every DMA-capable device plus the IRQ line.
+    #[allow(clippy::too_many_arguments)]
     fn run_channel(
         &mut self,
         ch: usize,
@@ -158,9 +167,12 @@ impl Dma {
         gpu: &mut Gpu,
         cdrom: &mut Cdrom,
         spu: &mut Spu,
+        mdec: &mut Mdec,
         irq: &mut Irq,
     ) {
         match ch {
+            CH_MDEC_IN => self.run_mdec_in(ch, mem, mdec),
+            CH_MDEC_OUT => self.run_mdec_out(ch, mem, mdec),
             CH_GPU => self.run_gpu(ch, mem, gpu),
             CH_CDROM => self.run_cdrom(ch, mem, cdrom),
             CH_SPU => self.run_spu(ch, mem, spu),
@@ -192,6 +204,42 @@ impl Dma {
                 let word = spu.dma_read_word();
                 write_ram(mem, addr, word);
             }
+            addr = (addr as i64 + step) as u32 & 0x1F_FFFC;
+        }
+        self.madr[ch] = addr;
+    }
+
+    /// MDEC-in DMA (channel 0): a RAM→device block copy that feeds command /
+    /// compressed-data words into the macroblock decoder. Word count is
+    /// `size * blocks` from BCR.
+    fn run_mdec_in(&mut self, ch: usize, mem: &mut Memory, mdec: &mut Mdec) {
+        let bcr = self.bcr[ch];
+        let size = bcr & 0xFFFF;
+        let blocks = (bcr >> 16) & 0xFFFF;
+        let words = size.max(1) * blocks.max(1);
+        let step: i64 = if self.chcr[ch] & 0x2 != 0 { -4 } else { 4 };
+        let mut addr = self.madr[ch] & 0x1F_FFFC;
+        for _ in 0..words {
+            let word = read_ram(mem, addr);
+            mdec.write_command_word(word);
+            addr = (addr as i64 + step) as u32 & 0x1F_FFFC;
+        }
+        self.madr[ch] = addr;
+    }
+
+    /// MDEC-out DMA (channel 1): a device→RAM block copy that drains decoded
+    /// output words from the macroblock decoder. Word count is `size * blocks`
+    /// from BCR.
+    fn run_mdec_out(&mut self, ch: usize, mem: &mut Memory, mdec: &mut Mdec) {
+        let bcr = self.bcr[ch];
+        let size = bcr & 0xFFFF;
+        let blocks = (bcr >> 16) & 0xFFFF;
+        let words = size.max(1) * blocks.max(1);
+        let step: i64 = if self.chcr[ch] & 0x2 != 0 { -4 } else { 4 };
+        let mut addr = self.madr[ch] & 0x1F_FFFC;
+        for _ in 0..words {
+            let word = mdec.read_data_word();
+            write_ram(mem, addr, word);
             addr = (addr as i64 + step) as u32 & 0x1F_FFFC;
         }
         self.madr[ch] = addr;
@@ -344,20 +392,21 @@ mod tests {
     use super::*;
     use crate::gpu::rgb_to_bgr555;
 
-    fn setup() -> (Dma, Memory, Gpu, Cdrom, Spu, Irq) {
+    fn setup() -> (Dma, Memory, Gpu, Cdrom, Spu, Mdec, Irq) {
         (
             Dma::new(),
             Memory::new(),
             Gpu::new(),
             Cdrom::new(),
             Spu::new(),
+            Mdec::new(),
             Irq::new(),
         )
     }
 
     #[test]
     fn otc_builds_descending_list() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut mdec, mut irq) = setup();
         // OTC over 4 entries starting at 0x100.
         dma.madr[CH_OTC] = 0x100;
         dma.bcr[CH_OTC] = 4;
@@ -369,6 +418,7 @@ mod tests {
             &mut gpu,
             &mut cdrom,
             &mut spu,
+            &mut mdec,
             &mut irq,
         );
         assert_eq!(read_ram(&mem, 0x100), 0x0FC & 0xFF_FFFF); // → 0x0FC
@@ -381,7 +431,7 @@ mod tests {
 
     #[test]
     fn linked_list_dma_drives_gp0_fill() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut mdec, mut irq) = setup();
         // Build a one-node list at 0x200: header (count=3) + a fill command.
         // Fill red 16x16 at (0,0).
         write_ram(&mut mem, 0x200, (3 << 24) | 0x00FF_FFFF); // count 3, next=end
@@ -398,6 +448,7 @@ mod tests {
             &mut gpu,
             &mut cdrom,
             &mut spu,
+            &mut mdec,
             &mut irq,
         );
         assert_eq!(gpu.vram_at(0, 0), rgb_to_bgr555(0xFF, 0, 0));
@@ -406,7 +457,7 @@ mod tests {
 
     #[test]
     fn block_dma_cpu_to_vram_loads_pixels() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut mdec, mut irq) = setup();
         // Prepare a CPU->VRAM image load header + pixel data in RAM.
         write_ram(&mut mem, 0x300, 0xA000_0000); // CPU->VRAM
         write_ram(&mut mem, 0x304, 0x0000_0000); // dst (0,0)
@@ -423,6 +474,7 @@ mod tests {
             &mut gpu,
             &mut cdrom,
             &mut spu,
+            &mut mdec,
             &mut irq,
         );
         assert_eq!(gpu.vram_at(0, 0), 0xAAAA);
@@ -431,7 +483,7 @@ mod tests {
 
     #[test]
     fn dma_completion_raises_irq_when_enabled() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut mdec, mut irq) = setup();
         // Enable DMA IRQ for the OTC channel + master enable.
         dma.dicr = (1 << 23) | (1 << (16 + CH_OTC));
         dma.madr[CH_OTC] = 0x100;
@@ -443,6 +495,7 @@ mod tests {
             &mut gpu,
             &mut cdrom,
             &mut spu,
+            &mut mdec,
             &mut irq,
         );
         assert!(irq.read_stat() & (1 << IrqLine::Dma.bit()) != 0);
@@ -450,8 +503,72 @@ mod tests {
     }
 
     #[test]
+    fn mdec_in_dma_feeds_decoder() {
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut mdec, mut irq) = setup();
+        // Stage a mono 8-bit decode command + one DC-only data word in RAM, then
+        // DMA both words into the MDEC (RAM → device, channel 0).
+        // Command 1, depth=1 (8-bit), unsigned, one param word.
+        let cmd = (1u32 << 29) | (1 << 27) | 1;
+        // DC-only block: q_scale=1, dc=16, then a run of 63 (EOB). With quant[0]
+        // defaulting to 0 the DC is 0, but the decode still fills the FIFO — we
+        // only assert the words were consumed and output was produced.
+        let n1: u32 = (1 << 10) | 16;
+        let n2: u32 = 63 << 10;
+        let data = n1 | (n2 << 16);
+        write_ram(&mut mem, 0x700, cmd);
+        write_ram(&mut mem, 0x704, data);
+        dma.madr[CH_MDEC_IN] = 0x700;
+        dma.bcr[CH_MDEC_IN] = 2; // 2 words, one block
+        let chcr = (1 << 24) | 0x1 | (1 << 9); // enable, RAM→device, sync mode 1
+        dma.write32(
+            0x1F80_1080 + (CH_MDEC_IN as u32) * 0x10 + 0x8,
+            chcr,
+            &mut mem,
+            &mut gpu,
+            &mut cdrom,
+            &mut spu,
+            &mut mdec,
+            &mut irq,
+        );
+        assert_eq!(dma.chcr[CH_MDEC_IN] & (1 << 24), 0, "busy cleared");
+        // 8-bit mono decodes to 16 output words.
+        assert_eq!(mdec.out_len(), 16, "decoder produced a mono block");
+    }
+
+    #[test]
+    fn mdec_out_dma_copies_to_ram() {
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut mdec, mut irq) = setup();
+        // Decode a flat mono 8-bit block directly, then DMA the output to RAM
+        // (device → RAM, channel 1).
+        mdec.write_command_word((1u32 << 29) | (1 << 27) | 1); // 8-bit mono, 1 word
+        let n1: u32 = (1 << 10) | 16; // q_scale=1, dc=16
+        let n2: u32 = 63 << 10; // EOB
+        mdec.write_command_word(n1 | (n2 << 16));
+        assert_eq!(mdec.out_len(), 16);
+
+        dma.madr[CH_MDEC_OUT] = 0x800;
+        dma.bcr[CH_MDEC_OUT] = 16; // 16 words
+        let chcr = (1 << 24) | (1 << 9); // enable, device→RAM, sync mode 1
+        dma.write32(
+            0x1F80_1080 + (CH_MDEC_OUT as u32) * 0x10 + 0x8,
+            chcr,
+            &mut mem,
+            &mut gpu,
+            &mut cdrom,
+            &mut spu,
+            &mut mdec,
+            &mut irq,
+        );
+        assert_eq!(dma.chcr[CH_MDEC_OUT] & (1 << 24), 0, "busy cleared");
+        assert_eq!(mdec.out_len(), 0, "output FIFO drained");
+        // With quant[0]=0 the DC is 0 -> flat Y=0 -> byte 0x80 -> 0x80808080.
+        assert_eq!(read_ram(&mem, 0x800), 0x8080_8080);
+        assert_eq!(read_ram(&mem, 0x83C), 0x8080_8080); // last of 16 words
+    }
+
+    #[test]
     fn register_read_write_roundtrip() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut mdec, mut irq) = setup();
         dma.write32(
             0x1F80_1080,
             0x1234,
@@ -459,6 +576,7 @@ mod tests {
             &mut gpu,
             &mut cdrom,
             &mut spu,
+            &mut mdec,
             &mut irq,
         ); // ch0 MADR
         assert_eq!(dma.read32(0x1F80_1080), 0x1234);
@@ -469,6 +587,7 @@ mod tests {
             &mut gpu,
             &mut cdrom,
             &mut spu,
+            &mut mdec,
             &mut irq,
         );
         assert_eq!(dma.read32(0x1F80_10F0), 0xDEAD_BEEF);
@@ -476,7 +595,7 @@ mod tests {
 
     #[test]
     fn cdrom_dma_copies_data_fifo_to_ram() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut mdec, mut irq) = setup();
         // Stage 8 bytes in the CD-ROM sector buffer and load the data FIFO.
         cdrom.set_sector_buffer_for_test((0..8).collect());
         cdrom.write8(0x1F80_1803, 0x80); // BFRD: load data FIFO
@@ -491,6 +610,7 @@ mod tests {
             &mut gpu,
             &mut cdrom,
             &mut spu,
+            &mut mdec,
             &mut irq,
         );
         assert_eq!(read_ram(&mem, 0x400), 0x0302_0100);
@@ -500,7 +620,7 @@ mod tests {
 
     #[test]
     fn spu_dma_round_trips_ram_through_spu_ram() {
-        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut irq) = setup();
+        let (mut dma, mut mem, mut gpu, mut cdrom, mut spu, mut mdec, mut irq) = setup();
         // Stage two words in main RAM and DMA them into SPU RAM (RAM→SPU).
         write_ram(&mut mem, 0x500, 0x1122_3344);
         write_ram(&mut mem, 0x504, 0x5566_7788);
@@ -517,6 +637,7 @@ mod tests {
             &mut gpu,
             &mut cdrom,
             &mut spu,
+            &mut mdec,
             &mut irq,
         );
         assert_eq!(dma.chcr[CH_SPU] & (1 << 24), 0);
@@ -533,6 +654,7 @@ mod tests {
             &mut gpu,
             &mut cdrom,
             &mut spu,
+            &mut mdec,
             &mut irq,
         );
         assert_eq!(read_ram(&mem, 0x600), 0x1122_3344);

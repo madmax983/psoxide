@@ -20,6 +20,7 @@ use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::iostubs::{CACHE_CTRL_REG, CacheCtrl, MemCtrl, Sio0};
 use crate::irq::{Irq, IrqLine};
+use crate::mdec::Mdec;
 use crate::spu::Spu;
 use crate::timers::{TIMERS_BASE, TIMERS_END, Timers};
 
@@ -312,6 +313,7 @@ struct CoreBus<'a> {
     sio0: &'a mut Sio0,
     cdrom: &'a mut Cdrom,
     spu: &'a mut Spu,
+    mdec: &'a mut Mdec,
     /// CPU-cycle cost of the data access performed by the current instruction
     /// (0 = none). Set once per load/store at the top-level [`Bus`] entry from
     /// the original access width and address, read back by `step_cpu` to charge
@@ -349,6 +351,7 @@ impl CoreBus<'_> {
             _ if Sio0::contains(phys) => self.sio0.read32(phys),
             _ if Cdrom::contains(phys) => self.cdrom.read32(phys),
             _ if Spu::contains(phys) => self.spu.read32(phys),
+            _ if Mdec::contains(phys) => self.mdec.read32(phys),
             _ => 0,
         }
     }
@@ -361,7 +364,7 @@ impl CoreBus<'_> {
             0x1F80_1074 => self.irq.write_mask(val),
             0x1F80_1080..=0x1F80_10FF => {
                 self.dma.write32(
-                    phys, val, self.mem, self.gpu, self.cdrom, self.spu, self.irq,
+                    phys, val, self.mem, self.gpu, self.cdrom, self.spu, self.mdec, self.irq,
                 );
             }
             TIMERS_BASE..=TIMERS_END => self.timers.write32(phys, val),
@@ -369,6 +372,7 @@ impl CoreBus<'_> {
             _ if Sio0::contains(phys) => self.sio0.write32(phys, val),
             _ if Cdrom::contains(phys) => self.cdrom.write32(phys, val),
             _ if Spu::contains(phys) => self.spu.write32(phys, val),
+            _ if Mdec::contains(phys) => self.mdec.write32(phys, val),
             // Other I/O ports are stubbed (ignored).
             _ => {}
         }
@@ -539,6 +543,9 @@ pub struct CoreSnapshot {
     /// SPU register file stub.
     #[serde(default)]
     pub spu: Spu,
+    /// MDEC (macroblock decoder) state.
+    #[serde(default)]
+    pub mdec: Mdec,
 }
 
 /// Deserializes the RAM buffer, rejecting snapshots whose length is not the
@@ -566,6 +573,7 @@ pub struct PsxCore {
     sio0: Sio0,
     cdrom: Cdrom,
     spu: Spu,
+    mdec: Mdec,
     paused: bool,
     controllers: [u16; 2],
 }
@@ -592,6 +600,7 @@ impl PsxCore {
             sio0: Sio0::new(),
             cdrom: Cdrom::new(),
             spu: Spu::new(),
+            mdec: Mdec::new(),
             paused: false,
             controllers: [0; 2],
         }
@@ -722,6 +731,7 @@ impl PsxCore {
             sio0: &mut self.sio0,
             cdrom: &mut self.cdrom,
             spu: &mut self.spu,
+            mdec: &mut self.mdec,
             access_cost: 0,
         }
     }
@@ -918,6 +928,7 @@ impl PsxCore {
                 sio0: &mut self.sio0,
                 cdrom: &mut self.cdrom,
                 spu: &mut self.spu,
+                mdec: &mut self.mdec,
                 access_cost: 0,
             };
             step(&mut self.cpu, &mut bus);
@@ -1022,6 +1033,7 @@ impl PsxCore {
             sio0: self.sio0.clone(),
             cdrom: self.cdrom.clone(),
             spu: self.spu.clone(),
+            mdec: self.mdec.clone(),
         }
     }
 
@@ -1046,6 +1058,7 @@ impl PsxCore {
         self.sio0 = snap.sio0.clone();
         self.cdrom = snap.cdrom.clone();
         self.spu = snap.spu.clone();
+        self.mdec = snap.mdec.clone();
     }
 }
 
@@ -1193,6 +1206,7 @@ mod tests {
                 sio0: &mut core.sio0,
                 cdrom: &mut core.cdrom,
                 spu: &mut core.spu,
+                mdec: &mut core.mdec,
                 access_cost: 0,
             };
             // Fill red 16x16 at (0,0) through the GP0 port.
@@ -1221,6 +1235,7 @@ mod tests {
                 sio0: &mut core.sio0,
                 cdrom: &mut core.cdrom,
                 spu: &mut core.spu,
+                mdec: &mut core.mdec,
                 access_cost: 0,
             };
             bus.load32(0x1F80_1814)
@@ -1244,6 +1259,7 @@ mod tests {
             sio0: &mut core.sio0,
             cdrom: &mut core.cdrom,
             spu: &mut core.spu,
+            mdec: &mut core.mdec,
             access_cost: 0,
         };
         bus.store32(0x1F80_1074, 0x1); // I_MASK = VBlank
@@ -1269,6 +1285,7 @@ mod tests {
             sio0: &mut core.sio0,
             cdrom: &mut core.cdrom,
             spu: &mut core.spu,
+            mdec: &mut core.mdec,
             access_cost: 0,
         };
         // SPU register file (0x1F80_1C00) is byte-addressable backing store.
