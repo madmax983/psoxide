@@ -17,15 +17,21 @@
 //!   (`PMON`) from the previous voice.
 //! * **Noise** — an LFSR clocked from the `SPUCNT` noise-frequency field,
 //!   selectable per voice through `NON`.
-//! * **Mixing** — per-voice L/R volume, main L/R volume, and a CD-audio input
-//!   hook (present but silent this pass), producing an interleaved 44.1 kHz
-//!   stereo `i16` stream drained by the frontend.
+//! * **Mixing** — per-voice L/R volume, main L/R volume, a queued CD-audio
+//!   input (`SPUCNT` bit 0 dry, bit 2 reverb send), and the reverb DSP,
+//!   producing an interleaved 44.1 kHz stereo `i16` stream drained by the
+//!   frontend.
+//! * **Reverb** — the PSX-SPX "SPU Reverb Formula" (same/different-side IIR
+//!   reflection, four-tap comb early-echo, two all-pass filters) running in the
+//!   512 KB work area, clocked at 22.05 kHz (every other output sample) and fed
+//!   by per-voice `EON` sends plus the optional CD reverb send.
 //!
 //! Deliberately simplified / stubbed this pass (all documented inline):
-//! reverb (registers are stored and read back but no reverb DSP runs),
-//! CD-DA / XA audio mixing (the input hook exists but is fed silence),
-//! volume *sweep* envelopes (fixed-volume mode is exact; sweep mode is
-//! approximated), and cycle-exact transfer/seek timing.
+//! the reverb input is not band-limit downsampled and its output is held (not
+//! interpolated) for the intervening sample; XA/CD-DA *decoding* still lives in
+//! the CD-ROM controller (this module only mixes whatever frames are pushed
+//! into the CD-audio queue); volume *sweep* envelopes are approximated
+//! (fixed-volume mode is exact); and transfer/seek timing is not cycle-exact.
 //!
 //! All persisted state is integer-typed so the containing snapshot can derive
 //! `Eq`; there is no floating-point math anywhere in the datapath.
@@ -61,6 +67,9 @@ pub const SAMPLE_RATE: u32 = 44_100;
 /// Maximum queued interleaved-stereo samples before the oldest are dropped
 /// (~1 second of stereo audio).
 const MAX_QUEUED: usize = 88_200;
+
+/// Maximum queued CD-audio input frames before the oldest are dropped.
+const CD_QUEUE_MAX: usize = 8_192;
 
 /// ADPCM decode filter coefficients (positive tap, divided by 64).
 const FILTER_POS: [i32; 5] = [0, 60, 115, 98, 122];
@@ -382,12 +391,24 @@ pub struct Spu {
     noise_level: i16,
     /// Noise generator timer.
     noise_timer: i32,
-    /// CD-audio left input sample (fed by [`Spu::push_cd_audio`]; silent).
+    /// CD-audio left input sample for the current output sample.
     cd_sample_l: i16,
-    /// CD-audio right input sample (fed by [`Spu::push_cd_audio`]; silent).
+    /// CD-audio right input sample for the current output sample.
     cd_sample_r: i16,
     /// Queued interleaved-stereo output samples (L, R, L, R, ...).
     samples: VecDeque<i16>,
+    /// Running byte offset into the reverb work area (advances 2 bytes per
+    /// reverb DSP tick, wrapping in the work area).
+    reverb_pos: u32,
+    /// Toggles each output sample; the reverb DSP is clocked at 22.05 kHz, i.e.
+    /// every other 44.1 kHz sample (when `true`).
+    reverb_run: bool,
+    /// Held reverb left output between DSP ticks (22.05 kHz → 44.1 kHz).
+    last_reverb_l: i16,
+    /// Held reverb right output between DSP ticks.
+    last_reverb_r: i16,
+    /// CD-audio input frames (44.1 kHz stereo) fed by the CD-ROM controller.
+    cd_queue: VecDeque<(i16, i16)>,
 }
 
 impl Default for Spu {
@@ -415,6 +436,11 @@ impl Spu {
             cd_sample_l: 0,
             cd_sample_r: 0,
             samples: VecDeque::new(),
+            reverb_pos: 0,
+            reverb_run: false,
+            last_reverb_l: 0,
+            last_reverb_r: 0,
+            cd_queue: VecDeque::new(),
         }
     }
 
@@ -424,12 +450,21 @@ impl Spu {
         matches!(phys, SPU_BASE..=SPU_END)
     }
 
-    /// Feeds a CD-audio input sample pair into the mixer. Currently unused by
-    /// the core (CD-DA / XA decoding is not implemented), but the datapath is
-    /// present: the samples are scaled by the CD volume and added to the mix.
+    /// Queues a batch of CD-audio input frames (44.1 kHz stereo) from the
+    /// CD-ROM controller. Each output sample consumes one frame from the front
+    /// of the queue; the queue is capped at 8192 frames (oldest dropped) so a
+    /// producer that outruns the mixer cannot grow it without bound.
+    pub fn push_cd_audio_samples(&mut self, frames: &[(i16, i16)]) {
+        self.cd_queue.extend(frames.iter().copied());
+        while self.cd_queue.len() > CD_QUEUE_MAX {
+            self.cd_queue.pop_front();
+        }
+    }
+
+    /// Feeds a single CD-audio input frame into the mixer queue (compatibility
+    /// wrapper over [`Spu::push_cd_audio_samples`]).
     pub fn push_cd_audio(&mut self, left: i16, right: i16) {
-        self.cd_sample_l = left;
-        self.cd_sample_r = right;
+        self.push_cd_audio_samples(&[(left, right)]);
     }
 
     /// Drains all queued interleaved-stereo output samples.
@@ -750,6 +785,30 @@ impl Spu {
         m & (1u32 << v) != 0
     }
 
+    /// Returns `true` if voice `v`'s reverb-send (EON) bit is set.
+    fn eon_bit(&self, v: usize) -> bool {
+        let m = u32::from(self.reg16(0x1F80_1D98)) | (u32::from(self.reg16(0x1F80_1D9A)) << 16);
+        m & (1u32 << v) != 0
+    }
+
+    /// SPUCNT bit 0 — CD-audio enable (mix CD input into the dry output).
+    #[inline]
+    fn cd_audio_enable(&self) -> bool {
+        self.spucnt & 0x0001 != 0
+    }
+
+    /// SPUCNT bit 2 — CD-audio reverb send (route CD input into the reverb).
+    #[inline]
+    fn cd_reverb_enable(&self) -> bool {
+        self.spucnt & 0x0004 != 0
+    }
+
+    /// SPUCNT bit 7 — reverb master enable.
+    #[inline]
+    fn reverb_master_enable(&self) -> bool {
+        self.spucnt & 0x0080 != 0
+    }
+
     /// Clocks the noise LFSR from the SPUCNT noise-frequency field. The exact
     /// hardware timing is approximated (documented): the step/shift map onto a
     /// down-counter that clocks a Galois-style LFSR.
@@ -766,6 +825,172 @@ impl Spu {
         }
     }
 
+    /// Reads a signed 16-bit sample from the reverb work area.
+    ///
+    /// The effective byte address is
+    /// `mbase + (((reg << 3) + extra + reverb_pos) mod work_size)`, matching the
+    /// PSX-SPX convention that reverb address registers hold values in units of
+    /// 8 bytes and are all relative to `mBASE`, wrapping inside the work area.
+    fn rev_read(&self, mbase: u32, work_size: u32, reg: u16, extra: i32) -> i32 {
+        let off = (((i64::from(reg)) << 3) + i64::from(extra) + i64::from(self.reverb_pos))
+            .rem_euclid(i64::from(work_size)) as u32;
+        let addr = (mbase.wrapping_add(off)) & RAM_MASK;
+        let lo = self.ram[addr as usize];
+        let hi = self.ram[((addr + 1) & RAM_MASK) as usize];
+        i32::from(i16::from_le_bytes([lo, hi]))
+    }
+
+    /// Writes a value (clamped to `i16`, little-endian) into the reverb work
+    /// area at the same effective address computed by [`Spu::rev_read`].
+    fn rev_write(&mut self, mbase: u32, work_size: u32, reg: u16, extra: i32, val: i32) {
+        let off = (((i64::from(reg)) << 3) + i64::from(extra) + i64::from(self.reverb_pos))
+            .rem_euclid(i64::from(work_size)) as u32;
+        let addr = (mbase.wrapping_add(off)) & RAM_MASK;
+        let b = clamp16(val).to_le_bytes();
+        self.ram[addr as usize] = b[0];
+        self.ram[((addr + 1) & RAM_MASK) as usize] = b[1];
+    }
+
+    /// Runs one tick of the reverb DSP, following the PSX-SPX "SPU Reverb
+    /// Formula" (same-side + different-side IIR reflection, a four-tap comb
+    /// early-echo, and two all-pass filters, scaled out by `vLOUT`/`vROUT`).
+    ///
+    /// Notes on this implementation:
+    /// * The DSP is clocked at 22.05 kHz (every other 44.1 kHz output sample);
+    ///   the caller holds the previous output for the intervening sample. The
+    ///   input is *not* band-limited/downsampled and the output is *not*
+    ///   interpolated — both are simplifications versus real hardware.
+    /// * All address registers (`mLSAME`, `dAPF1`, ...) hold values in 8-byte
+    ///   units relative to `mBASE`; reads/writes wrap inside the work area
+    ///   `[mBASE, 0x80000)`.
+    /// * Gated by `SPUCNT` bit 7 at the call site; per-voice `EON` and the
+    ///   `SPUCNT` bit-2 CD send feed the `l_in`/`r_in` accumulators.
+    fn reverb_process(&mut self, l_in: i16, r_in: i16) -> (i16, i16) {
+        let mbase = u32::from(self.reg16(0x1F80_1DA2)) << 3;
+        if mbase >= SPU_RAM_BYTES as u32 {
+            return (0, 0);
+        }
+        let work_size = SPU_RAM_BYTES as u32 - mbase;
+        if work_size == 0 {
+            return (0, 0);
+        }
+
+        // Volumes (signed i16, sign-extended).
+        let sv = |s: &Self, a: u32| i32::from(s.reg16(a) as i16);
+        let vlout = sv(self, 0x1F80_1D84);
+        let vrout = sv(self, 0x1F80_1D86);
+        let viir = sv(self, 0x1F80_1DC4);
+        let vcomb1 = sv(self, 0x1F80_1DC6);
+        let vcomb2 = sv(self, 0x1F80_1DC8);
+        let vcomb3 = sv(self, 0x1F80_1DCA);
+        let vcomb4 = sv(self, 0x1F80_1DCC);
+        let vwall = sv(self, 0x1F80_1DCE);
+        let vapf1 = sv(self, 0x1F80_1DD0);
+        let vapf2 = sv(self, 0x1F80_1DD2);
+        let vlin = sv(self, 0x1F80_1DFC);
+        let vrin = sv(self, 0x1F80_1DFE);
+
+        // Address registers (values in 8-byte units).
+        let dapf1 = self.reg16(0x1F80_1DC0);
+        let dapf2 = self.reg16(0x1F80_1DC2);
+        let mlsame = self.reg16(0x1F80_1DD4);
+        let mrsame = self.reg16(0x1F80_1DD6);
+        let mlcomb1 = self.reg16(0x1F80_1DD8);
+        let mrcomb1 = self.reg16(0x1F80_1DDA);
+        let mlcomb2 = self.reg16(0x1F80_1DDC);
+        let mrcomb2 = self.reg16(0x1F80_1DDE);
+        let dlsame = self.reg16(0x1F80_1DE0);
+        let drsame = self.reg16(0x1F80_1DE2);
+        let mldiff = self.reg16(0x1F80_1DE4);
+        let mrdiff = self.reg16(0x1F80_1DE6);
+        let mlcomb3 = self.reg16(0x1F80_1DE8);
+        let mrcomb3 = self.reg16(0x1F80_1DEA);
+        let mlcomb4 = self.reg16(0x1F80_1DEC);
+        let mrcomb4 = self.reg16(0x1F80_1DEE);
+        let dldiff = self.reg16(0x1F80_1DF0);
+        let drdiff = self.reg16(0x1F80_1DF2);
+        let mlapf1 = self.reg16(0x1F80_1DF4);
+        let mrapf1 = self.reg16(0x1F80_1DF6);
+        let mlapf2 = self.reg16(0x1F80_1DF8);
+        let mrapf2 = self.reg16(0x1F80_1DFA);
+
+        let mul = |a: i32, b: i32| (a * b) >> 15;
+        let mb = mbase;
+        let ws = work_size;
+
+        let lin = mul(i32::from(l_in), vlin);
+        let rin = mul(i32::from(r_in), vrin);
+
+        // Same-side reflection.
+        let l_same_old = self.rev_read(mb, ws, mlsame, -2);
+        let l_same = mul(
+            lin + mul(self.rev_read(mb, ws, dlsame, 0), vwall) - l_same_old,
+            viir,
+        ) + l_same_old;
+        self.rev_write(mb, ws, mlsame, 0, l_same);
+        let r_same_old = self.rev_read(mb, ws, mrsame, -2);
+        let r_same = mul(
+            rin + mul(self.rev_read(mb, ws, drsame, 0), vwall) - r_same_old,
+            viir,
+        ) + r_same_old;
+        self.rev_write(mb, ws, mrsame, 0, r_same);
+
+        // Different-side reflection.
+        let l_diff_old = self.rev_read(mb, ws, mldiff, -2);
+        let l_diff = mul(
+            lin + mul(self.rev_read(mb, ws, drdiff, 0), vwall) - l_diff_old,
+            viir,
+        ) + l_diff_old;
+        self.rev_write(mb, ws, mldiff, 0, l_diff);
+        let r_diff_old = self.rev_read(mb, ws, mrdiff, -2);
+        let r_diff = mul(
+            rin + mul(self.rev_read(mb, ws, dldiff, 0), vwall) - r_diff_old,
+            viir,
+        ) + r_diff_old;
+        self.rev_write(mb, ws, mrdiff, 0, r_diff);
+
+        // Comb filter (early echo).
+        let mut lout = mul(self.rev_read(mb, ws, mlcomb1, 0), vcomb1)
+            + mul(self.rev_read(mb, ws, mlcomb2, 0), vcomb2)
+            + mul(self.rev_read(mb, ws, mlcomb3, 0), vcomb3)
+            + mul(self.rev_read(mb, ws, mlcomb4, 0), vcomb4);
+        let mut rout = mul(self.rev_read(mb, ws, mrcomb1, 0), vcomb1)
+            + mul(self.rev_read(mb, ws, mrcomb2, 0), vcomb2)
+            + mul(self.rev_read(mb, ws, mrcomb3, 0), vcomb3)
+            + mul(self.rev_read(mb, ws, mrcomb4, 0), vcomb4);
+
+        // All-pass filter 1.
+        let dapf1_bytes = i32::from(dapf1) << 3;
+        let l_apf1 = self.rev_read(mb, ws, mlapf1, -dapf1_bytes);
+        lout -= mul(l_apf1, vapf1);
+        self.rev_write(mb, ws, mlapf1, 0, lout);
+        lout = mul(lout, vapf1) + l_apf1;
+        let r_apf1 = self.rev_read(mb, ws, mrapf1, -dapf1_bytes);
+        rout -= mul(r_apf1, vapf1);
+        self.rev_write(mb, ws, mrapf1, 0, rout);
+        rout = mul(rout, vapf1) + r_apf1;
+
+        // All-pass filter 2.
+        let dapf2_bytes = i32::from(dapf2) << 3;
+        let l_apf2 = self.rev_read(mb, ws, mlapf2, -dapf2_bytes);
+        lout -= mul(l_apf2, vapf2);
+        self.rev_write(mb, ws, mlapf2, 0, lout);
+        lout = mul(lout, vapf2) + l_apf2;
+        let r_apf2 = self.rev_read(mb, ws, mrapf2, -dapf2_bytes);
+        rout -= mul(r_apf2, vapf2);
+        self.rev_write(mb, ws, mrapf2, 0, rout);
+        rout = mul(rout, vapf2) + r_apf2;
+
+        // Output scaling.
+        let out_l = mul(i32::from(clamp16(lout)), vlout);
+        let out_r = mul(i32::from(clamp16(rout)), vrout);
+
+        // Advance the running work-area position (2 bytes per tick).
+        self.reverb_pos = (self.reverb_pos + 2) % work_size;
+
+        (clamp16(out_l), clamp16(out_r))
+    }
+
     /// Generates one interleaved stereo output sample and queues it.
     fn generate_sample(&mut self) {
         self.step_noise();
@@ -774,6 +999,9 @@ impl Spu {
         let mut left = 0i32;
         let mut right = 0i32;
         let mut prev_out = 0i16;
+        // Reverb input accumulator (per-voice EON sends + optional CD send).
+        let mut rev_l = 0i32;
+        let mut rev_r = 0i32;
 
         for v in 0..VOICES {
             let base = v * 16;
@@ -801,22 +1029,56 @@ impl Spu {
             let r = (i32::from(out) * vol_r) >> 15;
             left += l;
             right += r;
+            if self.eon_bit(v) {
+                rev_l += l;
+                rev_r += r;
+            }
             self.voices[v].cur_vol_l = l as i16;
             self.voices[v].cur_vol_r = r as i16;
             prev_out = out;
         }
 
+        // Pull this sample's CD-audio input frame (44.1 kHz) from the queue.
+        let (cl, cr) = self.cd_queue.pop_front().unwrap_or((0, 0));
+        self.cd_sample_l = cl;
+        self.cd_sample_r = cr;
+        let cd_l_vol = i32::from(fixed_vol(self.reg16(0x1F80_1DB0)));
+        let cd_r_vol = i32::from(fixed_vol(self.reg16(0x1F80_1DB2)));
+        let cd_dry_l = (i32::from(cl) * cd_l_vol) >> 15;
+        let cd_dry_r = (i32::from(cr) * cd_r_vol) >> 15;
+        // CD-audio reverb send (SPUCNT bit 2).
+        if self.cd_reverb_enable() {
+            rev_l += cd_dry_l;
+            rev_r += cd_dry_r;
+        }
+
+        // The reverb DSP runs at half the output rate (22.05 kHz).
+        self.reverb_run = !self.reverb_run;
+
         let (out_l, out_r) = if enabled {
             let main_l = i32::from(fixed_vol(self.reg16(0x1F80_1D80)));
             let main_r = i32::from(fixed_vol(self.reg16(0x1F80_1D82)));
-            let cd_l = i32::from(fixed_vol(self.reg16(0x1F80_1DB0)));
-            let cd_r = i32::from(fixed_vol(self.reg16(0x1F80_1DB2)));
             let mut l = (left * main_l) >> 15;
             let mut r = (right * main_r) >> 15;
-            // CD-audio input hook (silent this pass).
-            l += (i32::from(self.cd_sample_l) * cd_l) >> 15;
-            r += (i32::from(self.cd_sample_r) * cd_r) >> 15;
-            (l.clamp(-32768, 32767) as i16, r.clamp(-32768, 32767) as i16)
+            // CD-audio dry mix (SPUCNT bit 0).
+            if self.cd_audio_enable() {
+                l += cd_dry_l;
+                r += cd_dry_r;
+            }
+            // Reverb output: recomputed on DSP ticks, held between them.
+            if self.reverb_master_enable() {
+                if self.reverb_run {
+                    let (rl, rr) = self.reverb_process(clamp16(rev_l), clamp16(rev_r));
+                    self.last_reverb_l = rl;
+                    self.last_reverb_r = rr;
+                }
+                l += i32::from(self.last_reverb_l);
+                r += i32::from(self.last_reverb_r);
+            } else {
+                self.last_reverb_l = 0;
+                self.last_reverb_r = 0;
+            }
+            (clamp16(l), clamp16(r))
         } else {
             (0, 0)
         };
@@ -847,6 +1109,12 @@ fn fixed_vol(reg: u16) -> i16 {
     } else {
         ((reg & 0x7FFF) << 1) as i16
     }
+}
+
+/// Saturates a 32-bit accumulator into a signed 16-bit sample.
+#[inline]
+fn clamp16(x: i32) -> i16 {
+    x.clamp(-32768, 32767) as i16
 }
 
 /// Serde helper for boxed fixed-size byte arrays (register file + sample RAM).
@@ -1119,5 +1387,220 @@ mod tests {
         spu.push_sample(3, 4);
         assert_eq!(spu.drain_samples(), vec![1, 2, 3, 4]);
         assert!(spu.drain_samples().is_empty());
+    }
+
+    // ---- reverb + CD-audio ----------------------------------------------
+
+    // Reverb register addresses (absolute).
+    const MBASE: u32 = 0x1F80_1DA2;
+    const V_LOUT: u32 = 0x1F80_1D84;
+    const V_ROUT: u32 = 0x1F80_1D86;
+    const D_APF1: u32 = 0x1F80_1DC0;
+    const D_APF2: u32 = 0x1F80_1DC2;
+    const V_IIR: u32 = 0x1F80_1DC4;
+    const V_COMB1: u32 = 0x1F80_1DC6;
+    const V_COMB2: u32 = 0x1F80_1DC8;
+    const V_COMB3: u32 = 0x1F80_1DCA;
+    const V_COMB4: u32 = 0x1F80_1DCC;
+    const V_WALL: u32 = 0x1F80_1DCE;
+    const V_APF1: u32 = 0x1F80_1DD0;
+    const V_APF2: u32 = 0x1F80_1DD2;
+    const M_LSAME: u32 = 0x1F80_1DD4;
+    const M_RSAME: u32 = 0x1F80_1DD6;
+    const M_LCOMB1: u32 = 0x1F80_1DD8;
+    const M_RCOMB1: u32 = 0x1F80_1DDA;
+    const M_LCOMB2: u32 = 0x1F80_1DDC;
+    const M_RCOMB2: u32 = 0x1F80_1DDE;
+    const D_LSAME: u32 = 0x1F80_1DE0;
+    const D_RSAME: u32 = 0x1F80_1DE2;
+    const M_LDIFF: u32 = 0x1F80_1DE4;
+    const M_RDIFF: u32 = 0x1F80_1DE6;
+    const M_LCOMB3: u32 = 0x1F80_1DE8;
+    const M_RCOMB3: u32 = 0x1F80_1DEA;
+    const M_LCOMB4: u32 = 0x1F80_1DEC;
+    const M_RCOMB4: u32 = 0x1F80_1DEE;
+    const D_LDIFF: u32 = 0x1F80_1DF0;
+    const D_RDIFF: u32 = 0x1F80_1DF2;
+    const M_LAPF1: u32 = 0x1F80_1DF4;
+    const M_RAPF1: u32 = 0x1F80_1DF6;
+    const M_LAPF2: u32 = 0x1F80_1DF8;
+    const M_RAPF2: u32 = 0x1F80_1DFA;
+    const V_LIN: u32 = 0x1F80_1DFC;
+    const V_RIN: u32 = 0x1F80_1DFE;
+    const CD_VOL_L: u32 = 0x1F80_1DB0;
+    const CD_VOL_R: u32 = 0x1F80_1DB2;
+
+    /// Programs a plausible reverb preset (mBASE = 0) with a few-hundred-sample
+    /// delay network, leaving the caller to set SPUCNT / CD volume.
+    fn program_reverb(spu: &mut Spu) {
+        spu.write16(MBASE, 0x0000);
+        // Input / output at full scale.
+        spu.write16(V_LIN, 0x7FFF);
+        spu.write16(V_RIN, 0x7FFF);
+        spu.write16(V_LOUT, 0x7FFF);
+        spu.write16(V_ROUT, 0x7FFF);
+        // Reflection / wall gains chosen for a decaying (loop-gain < 1) tail.
+        spu.write16(V_IIR, 0x6000);
+        spu.write16(V_WALL, 0x7000);
+        spu.write16(V_COMB1, 0x3000);
+        spu.write16(V_COMB2, 0x2800);
+        spu.write16(V_COMB3, 0x2000);
+        spu.write16(V_COMB4, 0x1800);
+        spu.write16(V_APF1, 0x1000);
+        spu.write16(V_APF2, 0x1000);
+        // All-pass tap-back distances (8-byte units).
+        spu.write16(D_APF1, 0x0002);
+        spu.write16(D_APF2, 0x0004);
+        // Delay-line addresses (8-byte units). The reverb *output* only taps the
+        // comb reads, so the comb addresses sit just below the write addresses
+        // (same / diff / all-pass) to give short, positive read-back delays,
+        // while the same-side loop reads dLSAME a little below mLSAME for a
+        // fast-recirculating (dense) tail.
+        spu.write16(M_LCOMB1, 0x0040);
+        spu.write16(M_RCOMB1, 0x0042);
+        spu.write16(M_LCOMB2, 0x0048);
+        spu.write16(M_RCOMB2, 0x004A);
+        spu.write16(M_LCOMB3, 0x0050);
+        spu.write16(M_RCOMB3, 0x0052);
+        spu.write16(M_LCOMB4, 0x0058);
+        spu.write16(M_RCOMB4, 0x005A);
+        spu.write16(D_LSAME, 0x0060);
+        spu.write16(D_RSAME, 0x0062);
+        spu.write16(M_LSAME, 0x0068);
+        spu.write16(M_RSAME, 0x006A);
+        spu.write16(D_LDIFF, 0x0070);
+        spu.write16(D_RDIFF, 0x0072);
+        spu.write16(M_LDIFF, 0x0078);
+        spu.write16(M_RDIFF, 0x007A);
+        spu.write16(M_LAPF1, 0x0080);
+        spu.write16(M_RAPF1, 0x0082);
+        spu.write16(M_LAPF2, 0x0088);
+        spu.write16(M_RAPF2, 0x008A);
+    }
+
+    /// Sum of absolute sample magnitudes over an interleaved-stereo window
+    /// `[from, to)` measured in stereo frames.
+    fn window_energy(out: &[i16], from: usize, to: usize) -> u64 {
+        out[from * 2..to * 2]
+            .iter()
+            .map(|&s| i64::from(s).unsigned_abs())
+            .sum()
+    }
+
+    #[test]
+    fn reverb_produces_decaying_tail() {
+        let mut spu = Spu::new();
+        program_reverb(&mut spu);
+        spu.write16(CD_VOL_L, 0x3FFF);
+        spu.write16(CD_VOL_R, 0x3FFF);
+        spu.write16(MAIN_VOL_L, 0x3FFF);
+        spu.write16(MAIN_VOL_R, 0x3FFF);
+        // SPU enable | reverb master | CD reverb send | CD audio.
+        spu.write16(SPUCNT, 0x8000 | 0x0080 | 0x0004 | 0x0001);
+
+        // Feed a loud CD-audio burst, then let the queue drain to silence.
+        let burst: Vec<(i16, i16)> = (0..400).map(|_| (0x4000, 0x4000)).collect();
+        spu.push_cd_audio_samples(&burst);
+
+        let mut irq = Irq::new();
+        let total = 5_000usize;
+        spu.tick(CYCLES_PER_SAMPLE * total as u32, &mut irq);
+        let out = spu.drain_samples();
+        assert_eq!(out.len(), total * 2);
+
+        // (i) The tail is non-zero well after the input burst ended (frame 400).
+        let tail = window_energy(&out, 800, 1_800);
+        assert!(tail > 10_000, "reverb tail should be audible: {tail}");
+
+        // (ii) The tail decays: a later window carries less energy than an
+        // earlier one (both after the input stopped).
+        let early = window_energy(&out, 800, 1_800);
+        let late = window_energy(&out, 3_800, 4_800);
+        assert!(
+            late < early,
+            "reverb tail should decay: early={early} late={late}"
+        );
+    }
+
+    #[test]
+    fn reverb_master_disable_kills_tail() {
+        let mut spu = Spu::new();
+        program_reverb(&mut spu);
+        spu.write16(CD_VOL_L, 0x3FFF);
+        spu.write16(CD_VOL_R, 0x3FFF);
+        spu.write16(MAIN_VOL_L, 0x3FFF);
+        spu.write16(MAIN_VOL_R, 0x3FFF);
+        // Reverb master (bit 7) CLEAR; CD reverb-send + CD audio still set.
+        spu.write16(SPUCNT, 0x8000 | 0x0004 | 0x0001);
+
+        let burst: Vec<(i16, i16)> = (0..400).map(|_| (0x4000, 0x4000)).collect();
+        spu.push_cd_audio_samples(&burst);
+
+        let mut irq = Irq::new();
+        let total = 5_000usize;
+        spu.tick(CYCLES_PER_SAMPLE * total as u32, &mut irq);
+        let out = spu.drain_samples();
+
+        // With reverb disabled there is no tail once the CD input stops.
+        let tail = window_energy(&out, 800, 4_800);
+        assert_eq!(tail, 0, "no reverb tail when master reverb is disabled");
+    }
+
+    #[test]
+    fn cd_input_gated_by_spucnt_bit0() {
+        // With CD-audio enabled (bit 0) and no voices, the dry mix carries the
+        // CD input.
+        let mut spu = Spu::new();
+        spu.write16(CD_VOL_L, 0x3FFF);
+        spu.write16(CD_VOL_R, 0x3FFF);
+        spu.write16(MAIN_VOL_L, 0x3FFF);
+        spu.write16(MAIN_VOL_R, 0x3FFF);
+        spu.write16(SPUCNT, 0x8000 | 0x0001); // enable + CD audio, no reverb
+        let burst: Vec<(i16, i16)> = (0..200).map(|_| (0x4000, 0x4000)).collect();
+        spu.push_cd_audio_samples(&burst);
+        let mut irq = Irq::new();
+        spu.tick(CYCLES_PER_SAMPLE * 200, &mut irq);
+        let out = spu.drain_samples();
+        assert!(
+            out.iter().any(|&s| s != 0),
+            "CD input should reach the dry mix when SPUCNT bit0 is set"
+        );
+
+        // With CD-audio disabled (bit 0 clear), the same input contributes
+        // nothing (no voices keyed).
+        let mut spu = Spu::new();
+        spu.write16(CD_VOL_L, 0x3FFF);
+        spu.write16(CD_VOL_R, 0x3FFF);
+        spu.write16(MAIN_VOL_L, 0x3FFF);
+        spu.write16(MAIN_VOL_R, 0x3FFF);
+        spu.write16(SPUCNT, 0x8000); // enable only, CD audio off
+        let burst: Vec<(i16, i16)> = (0..200).map(|_| (0x4000, 0x4000)).collect();
+        spu.push_cd_audio_samples(&burst);
+        let mut irq = Irq::new();
+        spu.tick(CYCLES_PER_SAMPLE * 200, &mut irq);
+        let out = spu.drain_samples();
+        assert!(
+            out.iter().all(|&s| s == 0),
+            "CD input must not reach the mix when SPUCNT bit0 is clear"
+        );
+    }
+
+    #[test]
+    fn reverb_register_readback() {
+        let mut spu = Spu::new();
+        spu.write16(V_IIR, 0x6000);
+        assert_eq!(
+            spu.read16(V_IIR),
+            0x6000,
+            "reverb registers still read back"
+        );
+    }
+
+    #[test]
+    fn cd_queue_is_capped() {
+        let mut spu = Spu::new();
+        let big: Vec<(i16, i16)> = (0..CD_QUEUE_MAX + 100).map(|_| (1, 1)).collect();
+        spu.push_cd_audio_samples(&big);
+        assert_eq!(spu.cd_queue.len(), CD_QUEUE_MAX, "CD queue capped");
     }
 }

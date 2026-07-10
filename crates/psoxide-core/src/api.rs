@@ -778,6 +778,12 @@ impl PsxCore {
         // Advance the CD-ROM controller so a queued command response can latch
         // and raise its interrupt this cycle.
         self.cdrom.tick(1, &mut self.irq);
+        // Hand any CD-audio frames the CD-ROM controller decoded this cycle
+        // (XA-ADPCM / CD-DA) to the SPU, which mixes them through its CD input.
+        let cd_frames = self.cdrom.take_cd_audio();
+        if !cd_frames.is_empty() {
+            self.spu.push_cd_audio_samples(&cd_frames);
+        }
         // Advance the SPU by one CPU cycle: it emits an audio sample every 768
         // cycles and raises its interrupt when the SPU IRQ address is matched.
         self.spu.tick(1, &mut self.irq);

@@ -48,9 +48,18 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   bit 9). `Spu::tick` (in the step loop) emits one interleaved-stereo 44.1kHz
   `i16` sample every 768 CPU cycles into a queue drained by
   `PsxCore::drain_audio`; the desktop plays it through rodio. Transfers arrive
-  via the CPU transfer FIFO (0x1DA8) or DMA channel 4. Stubbed/simplified:
-  reverb DSP (registers stored + read back, no processing), CD-DA/XA mixing (a
-  silent input hook), and volume sweeps (fixed-volume mode is exact)
+  via the CPU transfer FIFO (0x1DA8) or DMA channel 4. The **reverb DSP** is a
+  real PSX-SPX delay network (the 22 comb/all-pass taps + IIR/wall/APF
+  coefficients out of the reverb work area, clocked at 22.05kHz — every other
+  44.1kHz sample, output held between ticks — gated by SPUCNT bit7 with the
+  vLOUT/vROUT master applied to the wet return); its input is the per-voice EON
+  sends plus the SPUCNT-bit2 CD reverb send. **CD audio** (CD-DA + XA-ADPCM
+  decoded in `cdrom.rs`) is handed in each cycle via
+  `Spu::push_cd_audio_samples` and mixed through the SPU CD input: the SPU CD
+  input volume (0x1DB0/0x1DB2) scales the dry mix (gated by SPUCNT bit0) and the
+  reverb send (bit2). Stubbed/simplified: the reverb input is not band-limited
+  (every-other-sample clocking + held output rather than a proper anti-alias
+  filter), and volume sweeps are still fixed-mode (bit15-clear volumes exact)
 - CD-ROM (`cdrom.rs`): a real sub-controller at 0x1F80_1800..0x1F80_1803 (not
   the old read-back stub). Index-banked register file with parameter/response/
   data FIFOs; a command state machine (Getstat, Setloc, Play, ReadN/ReadS,
@@ -68,9 +77,15 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   set) is delivered to the CPU through the data FIFO (BFRD request) and to RAM
   through DMA channel 3. MSF↔LBA use a 150-sector pregap; per-sector reads emit
   INT1, and GetID reports the SCEA data-disc response (INT2) or the no-disc
-  error (INT5). The `disc` module (psoxide-config) parses `.cue` sheets + their
-  `.bin` tracks into a core `Disc`; the desktop `--disc` flag mounts one at
-  startup and the CD-ROM integration test uses it as a dev-dependency
+  error (INT5). **CD audio** is decoded: CD-DA audio-track sectors (2352 raw
+  bytes → 588 stereo 44.1kHz PCM frames, played at 1x for correct pitch) and
+  XA-ADPCM sectors (decoded + resampled to 44.1kHz through a bounded queue) are
+  passed through the CD volume matrix (index-2/3 ports, unity at power-on) and
+  Mute/Demute, then drained by `Cdrom::take_cd_audio` and pushed into the SPU CD
+  input each cycle by the `step_cpu` bridge. The `disc` module (psoxide-config)
+  parses `.cue` sheets + their `.bin` tracks into a core `Disc`; the desktop
+  `--disc` flag mounts one at startup and the CD-ROM integration test uses it as
+  a dev-dependency
 - Interrupt controller (`irq.rs`): I_STAT/I_MASK; VBlank raised once per
   `StepFrame`
 - Hardware timers (`timers.rs`): the three root counters at
@@ -93,17 +108,22 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 ## Not Yet Implemented
 
 - GTE (cop2) — decoded but ignored
-- SPU reverb DSP (the `spu.rs` voice engine is real — see "Hardware Emulated";
-  what stays stubbed is the reverb processor: the 32 reverb registers are stored
-  and read back but drive no DSP), CD-DA/XA audio mixing into the SPU (a silent
-  input hook is present), and volume-sweep envelopes (fixed-volume mode is
-  exact; sweep mode is approximated to a near-full-scale constant)
-- CD-ROM audio + fine timing (the controller in `cdrom.rs` is real — see
-  "Hardware Emulated"): what stays stubbed is XA-ADPCM / CD-DA audio playback
-  (Play/Setfilter/Mute are accepted but decode no samples and drive no SPU),
-  subchannel Q beyond the GetlocL/GetlocP position bytes, and cycle-accurate
-  seek/read timing (the read/response latencies are approximate constants, not
-  measured mechanics). Narrow (8/16-bit) reads of the CD ports compose from the
+- SPU volume-sweep envelopes (the `spu.rs` voice engine, reverb DSP, and CD
+  mixing are all real — see "Hardware Emulated"): fixed-volume mode (register
+  bit15 clear) is exact; sweep mode (bit15 set) is approximated to a
+  near-full-scale constant. The reverb DSP runs the real PSX-SPX delay network
+  but its input is not band-limited (the 22.05kHz clock is modelled by running
+  the DSP every other 44.1kHz sample and holding the output, not by an
+  anti-alias filter)
+- CD-ROM fine timing (the controller in `cdrom.rs` and its CD-DA/XA-ADPCM audio
+  are real — see "Hardware Emulated"): what stays approximate is subchannel Q
+  beyond the GetlocL/GetlocP position bytes, cycle-accurate seek/read timing
+  (the read/response latencies are approximate constants, not measured
+  mechanics), and the CD-DA report / autopause cadence (once per sector rather
+  than the hardware's finer subq granularity). XA playback is rate-regulated by
+  a bounded queue rather than exact sector mechanics; Setfilter file/channel
+  selection is honoured but the XA SPU-boost and gapless streaming details are
+  not. Narrow (8/16-bit) reads of the CD ports compose from the
   four consecutive ports rather than mirroring the addressed 8-bit register, and
   BUSYSTS is held for the whole command-latency window — both visible in the
   ps1-tests `io-access-bitwidth` `CDROM_STAT` rows. The upstream JaCzekanski
@@ -112,7 +132,8 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   cycle counts, `terminal`/`volume-regs`/`disc-swap` need interactive serial /
   gamepad / lid-open input, `getloc` needs INT-ack HLE the CPU-test loop lacks);
   CD-ROM is covered instead by `cdrom.rs` unit tests + the synthetic-fixture
-  integration test `crates/psoxide-test-harness/tests/cdrom.rs`
+  integration tests `crates/psoxide-test-harness/tests/cdrom.rs` (data path) and
+  `.../tests/cd_audio.rs` (CD-DA → SPU audio path)
 - Coprocessor-unusable exception (ExcCode 0x0B): implemented for every
   coprocessor op. The decoder gives COP1 (0x11), COP3 (0x13), the LWCx/SWCx
   coprocessor load/stores (0x30-0x33 / 0x38-0x3B), and unassigned COP0 commands
@@ -236,8 +257,8 @@ pwsh scripts/verus-check.ps1
    controller (`cdrom.rs`) now mounts BIN/CUE MODE2/2352 discs via
    `Command::LoadDisc`, executes the BIOS/runtime command set, and delivers
    sectors through the data FIFO and DMA channel 3 (see the CD-ROM entry under
-   "Hardware Emulated"), and the SPU (`spu.rs`) synthesises audio. Still needed
-   for an actual game boot: the BIOS kernel / CD-ROM boot path (and SPU reverb /
-   CD-audio remain stubbed)
+   "Hardware Emulated"), and the SPU (`spu.rs`) synthesises audio — including
+   the reverb DSP and CD-DA/XA-ADPCM audio now mixed through the SPU CD input.
+   Still needed for an actual game boot: the BIOS kernel / CD-ROM boot path
 
 Test resources: Amidog PSX CPU/GTE tests, JaCzekanski `ps1-tests`, PeterLemon PSX demos.
