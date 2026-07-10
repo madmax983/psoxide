@@ -784,6 +784,23 @@ impl Spu {
         }
     }
 
+    /// Number of CPU cycles from the current state until the SPU next performs
+    /// an autonomous `I_STAT`-setting action, for the lazy device scheduler.
+    ///
+    /// The SPU is never idle: it emits a sample (and may raise its address-match
+    /// IRQ inside `generate_sample`) every [`CYCLES_PER_SAMPLE`] cycles, so the
+    /// next sample boundary is `CYCLES_PER_SAMPLE - sample_timer` cycles away.
+    /// When a transfer has already armed a pending IRQ raise (`note_transfer_irq`
+    /// / `note_decode_irq` from a CPU-side write) the very next `tick` will raise
+    /// it, so the deadline collapses to 1 cycle.
+    #[must_use]
+    pub fn cycles_to_next_event(&self) -> Option<u64> {
+        if self.irq_pending_raise {
+            return Some(1);
+        }
+        Some(u64::from(CYCLES_PER_SAMPLE - self.sample_timer))
+    }
+
     /// Returns `true` if voice `v`'s pitch-modulation (PMON) bit is set.
     fn pmon_bit(&self, v: usize) -> bool {
         if v == 0 {
@@ -1294,6 +1311,53 @@ mod tests {
         assert_eq!(spu.ram[SPU_RAM_BYTES - 1], 0x11);
         assert_eq!(spu.ram[0], 0x44);
         assert_eq!(spu.ram[1], 0x33);
+    }
+
+    #[test]
+    fn cycles_to_next_event_hits_sample_boundary() {
+        for start in [0u32, 1, 100, 767] {
+            let mut spu = Spu::new();
+            spu.sample_timer = start;
+            let n = spu.cycles_to_next_event().unwrap();
+            assert_eq!(n, u64::from(CYCLES_PER_SAMPLE - start));
+
+            let mut irq = Irq::new();
+            let _ = spu.drain_samples();
+            for _ in 0..(n - 1) {
+                spu.tick(1, &mut irq);
+            }
+            assert!(
+                spu.drain_samples().is_empty(),
+                "no sample emitted before the predicted boundary (start={start})"
+            );
+            spu.tick(1, &mut irq);
+            assert_eq!(
+                spu.drain_samples().len(),
+                2,
+                "one interleaved stereo pair emitted at the predicted boundary (start={start})"
+            );
+        }
+    }
+
+    #[test]
+    fn cycles_to_next_event_armed_transfer_irq_is_one() {
+        let mut spu = Spu::new();
+        let mut irq = Irq::new();
+        spu.write16(SPUCNT, 1 << 6); // enable SPU IRQ
+        spu.write16(IRQ_ADDR, 0x100);
+        spu.write16(TRANSFER_ADDR, 0x100);
+        spu.write16(TRANSFER_FIFO, 0x1234); // arms irq_pending_raise
+        assert_eq!(
+            spu.cycles_to_next_event(),
+            Some(1),
+            "an armed transfer IRQ collapses the deadline to the next cycle"
+        );
+        spu.tick(1, &mut irq);
+        assert_ne!(
+            irq.read_stat() & (1 << IrqLine::Spu.bit()),
+            0,
+            "the armed SPU IRQ is raised on the next tick"
+        );
     }
 
     #[test]

@@ -495,6 +495,18 @@ struct CoreBus<'a> {
     /// the original access width and address, read back by `step_cpu` to charge
     /// wait states to the hardware timers.
     access_cost: u32,
+    /// Observation cycle for the lazy scheduler: the absolute CPU cycle the
+    /// devices must be caught up to before any device register is read/written
+    /// during this instruction (`= cpu.cycles + 1`, matching the naive path's
+    /// post-top-tick device clock). Ignored when `device_clock` is `None`.
+    obs: u64,
+    /// Absolute cycle the four per-cycle devices have been advanced to. `None`
+    /// for one-off (non-instruction) bus accesses, which are pre-synchronized by
+    /// the caller and never need in-bus catch-up.
+    device_clock: Option<&'a mut u64>,
+    /// Set `true` when this access touched a device register window (so the
+    /// scheduler recomputes the next-event deadline after the instruction).
+    io_touched: bool,
 }
 
 impl CoreBus<'_> {
@@ -502,6 +514,33 @@ impl CoreBus<'_> {
     #[inline]
     fn is_io(phys: u32) -> bool {
         matches!(map_region(phys), BusRegion::IoPorts)
+    }
+
+    /// Called before dispatching a device-register access. Marks the access as
+    /// I/O (so the scheduler recomputes the next-event deadline afterwards) and,
+    /// in scheduled mode, catches the per-cycle devices up to the observation
+    /// cycle so the register read/write sees the same device state the naive
+    /// path (which top-ticks the devices before executing) would present.
+    ///
+    /// In the non-deadline branch `obs < next_deadline`, so this catch-up
+    /// crosses no device event and cannot set a spurious `I_STAT` bit; in the
+    /// deadline branch the devices are already at `obs`, so it is a no-op.
+    #[inline]
+    fn touch_io(&mut self) {
+        self.io_touched = true;
+        let obs = self.obs;
+        let Some(dc) = self.device_clock.as_deref_mut() else {
+            return;
+        };
+        catch_up_devices(
+            dc,
+            obs,
+            self.timers,
+            self.cdrom,
+            self.spu,
+            self.sio0,
+            self.irq,
+        );
     }
 
     /// Records the wait-state cost of a data access of `width_bytes` at physical
@@ -615,6 +654,7 @@ impl Bus for CoreBus<'_> {
         let phys = mask_region(addr);
         self.charge(phys, 1);
         if Self::is_io(phys) {
+            self.touch_io();
             return self.io_read8(phys);
         }
         self.mem.read8(addr)
@@ -623,6 +663,7 @@ impl Bus for CoreBus<'_> {
         let phys = mask_region(addr);
         self.charge(phys, 2);
         if Self::is_io(phys) {
+            self.touch_io();
             return self.io_read16(phys);
         }
         self.mem.read16(addr)
@@ -631,6 +672,7 @@ impl Bus for CoreBus<'_> {
         let phys = mask_region(addr);
         self.charge(phys, 4);
         if Self::is_io(phys) {
+            self.touch_io();
             return self.io_read32(phys);
         }
         if phys == CACHE_CTRL_REG {
@@ -642,6 +684,7 @@ impl Bus for CoreBus<'_> {
         let phys = mask_region(addr);
         self.charge(phys, 1);
         if Self::is_io(phys) {
+            self.touch_io();
             self.io_write8(phys, value);
             return;
         }
@@ -651,6 +694,7 @@ impl Bus for CoreBus<'_> {
         let phys = mask_region(addr);
         self.charge(phys, 2);
         if Self::is_io(phys) {
+            self.touch_io();
             self.io_write16(phys, value);
             return;
         }
@@ -660,6 +704,7 @@ impl Bus for CoreBus<'_> {
         let phys = mask_region(addr);
         self.charge(phys, 4);
         if Self::is_io(phys) {
+            self.touch_io();
             self.io_write32(phys, value);
             return;
         }
@@ -674,6 +719,66 @@ impl Bus for CoreBus<'_> {
     fn set_access_cost(&mut self, cycles: u32) {
         self.access_cost = cycles;
     }
+}
+
+/// Advances the four per-cycle devices (timers, CD-ROM, SPU, SIO0) from
+/// `*device_clock` up to `target`, delivering interrupts through `irq`.
+///
+/// The device order mirrors the naive per-instruction loop exactly — timers,
+/// then CD-ROM (with the decoded-CD-audio → SPU bridge), then SPU, then SIO0 —
+/// so the observable result is identical to ticking each device one cycle at a
+/// time. Timers, SPU and SIO0 tick in a single batched call because their
+/// batched tick is proven equivalent to per-cycle stepping. The CD-ROM + SPU
+/// pair is batched too **except** while the CD-ROM is producing audio, when it
+/// is stepped one cycle at a time so decoded CD frames reach the SPU in the
+/// same order (and at the same sample boundaries) the naive loop delivered them.
+fn catch_up_devices(
+    device_clock: &mut u64,
+    target: u64,
+    timers: &mut Timers,
+    cdrom: &mut Cdrom,
+    spu: &mut Spu,
+    sio0: &mut Sio0,
+    irq: &mut Irq,
+) {
+    let cur = *device_clock;
+    if target <= cur {
+        return;
+    }
+    // The gap is bounded well under u32 in practice (the SPU deadline caps it
+    // near CYCLES_PER_SAMPLE); chunk in u32 steps to stay total-correct anyway.
+    let mut remaining = target - cur;
+    while remaining > 0 {
+        let step = u32::try_from(remaining.min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
+        if cdrom.is_cd_audio_active() {
+            // Timers and SIO0 are independent of the CD→SPU bridge, so they can
+            // still batch; the CD-ROM/SPU pair steps per cycle to keep decoded
+            // frame delivery ordered with SPU sample consumption.
+            timers.tick(step, irq);
+            for _ in 0..step {
+                cdrom.tick(1, irq);
+                if cdrom.has_cd_audio() {
+                    let frames = cdrom.take_cd_audio();
+                    spu.push_cd_audio_samples(&frames);
+                }
+                spu.tick(1, irq);
+            }
+            sio0.tick(step, irq);
+        } else {
+            // No CD audio is produced in this window, so batching the CD-ROM and
+            // SPU ticks (with the bridge between them) is exactly equivalent.
+            timers.tick(step, irq);
+            cdrom.tick(step, irq);
+            if cdrom.has_cd_audio() {
+                let frames = cdrom.take_cd_audio();
+                spu.push_cd_audio_samples(&frames);
+            }
+            spu.tick(step, irq);
+            sio0.tick(step, irq);
+        }
+        remaining -= u64::from(step);
+    }
+    *device_clock = target;
 }
 
 /// A complete serializable machine snapshot for save states.
@@ -749,6 +854,25 @@ pub struct PsxCore {
     mdec: Mdec,
     paused: bool,
     controllers: [u16; 2],
+    /// When `true` (the default), [`Self::step_cpu`] uses the lazy device
+    /// scheduler ([`Self::step_cpu_scheduled`]); when `false` it uses the
+    /// original per-instruction fan-out ([`Self::step_cpu_naive`]). The two
+    /// paths are behaviourally identical (bit-for-bit); the flag exists so
+    /// differential tests can A/B them, and so a frontend can opt out.
+    ///
+    /// Not part of [`CoreSnapshot`]: it is an execution-strategy toggle, not
+    /// machine state.
+    scheduler_enabled: bool,
+    /// Absolute CPU cycle the four per-cycle devices (timers, CD-ROM, SPU,
+    /// SIO0) have been advanced to. In naive mode this tracks `cpu.cycles`; in
+    /// scheduled mode the devices lag `cpu.cycles` and are reconciled lazily.
+    /// Not serialized (reconstructed on load).
+    device_clock: u64,
+    /// Cached minimum absolute CPU cycle at which any device would next set an
+    /// `I_STAT` bit (`u64::MAX` = no device event pending). The scheduler runs
+    /// instructions freely while `cpu.cycles + 1 < next_deadline`. Not
+    /// serialized (recomputed on load).
+    next_deadline: u64,
 }
 
 impl Default for PsxCore {
@@ -776,7 +900,41 @@ impl PsxCore {
             mdec: Mdec::new(),
             paused: false,
             controllers: [0; 2],
+            scheduler_enabled: true,
+            device_clock: 0,
+            next_deadline: 0,
         }
+    }
+
+    /// Selects the CPU-stepping strategy: the lazy device scheduler (`true`,
+    /// the default) or the original per-instruction device fan-out (`false`).
+    /// Both are bit-for-bit equivalent; this exists for differential testing
+    /// and for a frontend that wants to force the reference path. Switching
+    /// resynchronizes the device clock to `cpu.cycles`.
+    pub fn set_scheduler_enabled(&mut self, enabled: bool) {
+        // Bring the devices fully up to date before changing strategy so the
+        // two paths start from an identical, rest-consistent state.
+        self.catch_up_all(self.cpu.cycles);
+        self.scheduler_enabled = enabled;
+        self.device_clock = self.cpu.cycles;
+        self.next_deadline = 0;
+    }
+
+    /// Returns whether the lazy device scheduler is active.
+    #[must_use]
+    pub fn is_scheduler_enabled(&self) -> bool {
+        self.scheduler_enabled
+    }
+
+    /// Flushes the lazily-scheduled devices up to `cpu.cycles`, so every device
+    /// reflects the full elapsed time (a no-op in naive mode, where the devices
+    /// already track `cpu.cycles`). Exposed for differential tests that need the
+    /// scheduled and reference strategies in a directly-comparable, rest-
+    /// consistent state; it eagerly performs the device catch-up the next
+    /// scheduled step would do anyway, so it does not change observable
+    /// behaviour.
+    pub fn sync_devices(&mut self) {
+        self.catch_up_all(self.cpu.cycles);
     }
 
     /// Returns a shared reference to the GPU.
@@ -892,6 +1050,12 @@ impl PsxCore {
 
     /// Builds a transient [`CoreBus`] borrowing every peripheral, for one-off
     /// bus accesses that are not part of a CPU instruction step.
+    ///
+    /// `device_clock` is `None`: these accesses do not tick the per-cycle
+    /// devices themselves. The public [`Self::store8`]/[`Self::load8`] wrappers
+    /// synchronize the devices to `cpu.cycles` around the access instead, so a
+    /// frontend/test poke of a device register observes the same state the
+    /// scheduled step loop would have at this rest point.
     fn core_bus(&mut self) -> CoreBus<'_> {
         CoreBus {
             mem: &mut self.mem,
@@ -906,6 +1070,24 @@ impl PsxCore {
             spu: &mut self.spu,
             mdec: &mut self.mdec,
             access_cost: 0,
+            obs: self.cpu.cycles,
+            device_clock: None,
+            io_touched: false,
+        }
+    }
+
+    /// Synchronizes the per-cycle devices to `cpu.cycles` before a one-off
+    /// (non-instruction) bus access, then rebuilds the deadline afterwards, so
+    /// frontend/test register pokes are consistent with the scheduled loop. A
+    /// no-op in naive mode (the devices already track `cpu.cycles`).
+    fn sync_for_one_off(&mut self) {
+        if self.scheduler_enabled {
+            self.catch_up_all(self.cpu.cycles);
+        }
+    }
+    fn resync_after_one_off(&mut self) {
+        if self.scheduler_enabled {
+            self.recompute_deadline();
         }
     }
 
@@ -916,39 +1098,54 @@ impl PsxCore {
     /// peripherals (e.g. the CD-ROM controller at `0x1F80_1800..=0x1F80_1803`)
     /// without hand-assembling guest code.
     pub fn store8(&mut self, addr: u32, value: u8) {
+        self.sync_for_one_off();
         self.core_bus().store8(addr, value);
+        self.resync_after_one_off();
     }
 
     /// Performs a 16-bit store through the full system bus (device routing
     /// included), exactly as a CPU `sh` would. Used to program the 16-bit SPU
     /// register file from a frontend/test.
     pub fn store16(&mut self, addr: u32, value: u16) {
+        self.sync_for_one_off();
         self.core_bus().store16(addr, value);
+        self.resync_after_one_off();
     }
 
     /// Performs a 32-bit store through the full system bus (device routing
     /// included), exactly as a CPU `sw` would. Used to program the DMA and
     /// interrupt-controller register files from a frontend/test.
     pub fn store32(&mut self, addr: u32, value: u32) {
+        self.sync_for_one_off();
         self.core_bus().store32(addr, value);
+        self.resync_after_one_off();
     }
 
     /// Performs an 8-bit load through the full system bus, popping device FIFOs
     /// exactly as a CPU `lb` would.
     pub fn load8(&mut self, addr: u32) -> u8 {
-        self.core_bus().load8(addr)
+        self.sync_for_one_off();
+        let v = self.core_bus().load8(addr);
+        self.resync_after_one_off();
+        v
     }
 
     /// Performs a 16-bit load through the full system bus (device routing
     /// included), exactly as a CPU `lh` would.
     pub fn load16(&mut self, addr: u32) -> u16 {
-        self.core_bus().load16(addr)
+        self.sync_for_one_off();
+        let v = self.core_bus().load16(addr);
+        self.resync_after_one_off();
+        v
     }
 
     /// Performs a 32-bit load through the full system bus (device routing
     /// included), exactly as a CPU `lw` would.
     pub fn load32(&mut self, addr: u32) -> u32 {
-        self.core_bus().load32(addr)
+        self.sync_for_one_off();
+        let v = self.core_bus().load32(addr);
+        self.resync_after_one_off();
+        v
     }
 
     /// Executes a single command.
@@ -1066,7 +1263,23 @@ impl PsxCore {
         }
     }
 
+    /// Executes one CPU instruction (plus its device/interrupt bookkeeping),
+    /// dispatching to the lazy scheduler or the reference per-instruction loop.
     fn step_cpu(&mut self) {
+        if self.scheduler_enabled {
+            self.step_cpu_scheduled();
+        } else {
+            self.step_cpu_naive();
+        }
+    }
+
+    /// Reference implementation: tick every per-cycle device by one cycle,
+    /// poll for an interrupt, execute one instruction, then charge the extra
+    /// wait-state cycles to the CPU counter and every device. This is the
+    /// behaviour the lazy scheduler ([`Self::step_cpu_scheduled`]) reproduces
+    /// bit-for-bit; it is kept compiled for differential testing and as the
+    /// fallback path.
+    fn step_cpu_naive(&mut self) {
         // Advance the hardware timers by one CPU cycle first, so a timer that
         // reaches its target/overflow this cycle can deliver its interrupt at
         // this same instruction boundary.
@@ -1087,12 +1300,16 @@ impl PsxCore {
         // Advance the SIO0 controller ACK timer by the same cycle, so a
         // scheduled controller /ACK can raise IRQ7 at this instruction boundary.
         self.sio0.tick(1, &mut self.irq);
+        // Keep the shared device clock in step with `cpu.cycles` so save-state
+        // flushing (and a later switch to the scheduler) stays consistent.
+        self.device_clock = self.cpu.cycles.wrapping_add(1);
 
         // Deliver a pending, unmasked hardware interrupt at the instruction
         // boundary before fetching the next instruction. With reset state
         // (interrupts disabled) this is a no-op.
         if poll_interrupt(&mut self.cpu, self.irq.pending()) {
             self.cpu.cycles = self.cpu.cycles.wrapping_add(1);
+            self.device_clock = self.cpu.cycles;
             return;
         }
 
@@ -1124,6 +1341,9 @@ impl PsxCore {
                 spu: &mut self.spu,
                 mdec: &mut self.mdec,
                 access_cost: 0,
+                obs: self.cpu.cycles,
+                device_clock: None,
+                io_touched: false,
             };
             step(&mut self.cpu, &mut bus);
             bus.access_cost
@@ -1141,6 +1361,108 @@ impl PsxCore {
             self.sio0.tick(extra, &mut self.irq);
             self.cpu.cycles = self.cpu.cycles.wrapping_add(u64::from(extra));
         }
+        self.device_clock = self.cpu.cycles;
+    }
+
+    /// Lazy device-scheduler step. Behaviourally identical to
+    /// [`Self::step_cpu_naive`], but instead of ticking all four per-cycle
+    /// devices every instruction it lets them lag and reconciles them only when
+    /// an instruction reaches a cached next-event deadline (or touches a device
+    /// register). See the module notes / PR for the equivalence argument.
+    fn step_cpu_scheduled(&mut self) {
+        let c = self.cpu.cycles;
+        // Observation cycle: the naive path top-ticks the devices to `c + 1`
+        // before polling and before the instruction executes.
+        let obs = c.wrapping_add(1);
+
+        // If a device could set an `I_STAT` bit at or before this observation
+        // cycle, catch every device up to `obs` (and recompute the deadline)
+        // before we poll, so the bit is delivered at exactly the same boundary
+        // the naive loop would deliver it.
+        if obs >= self.next_deadline {
+            self.catch_up_all(obs);
+        }
+
+        // Deliver a pending, unmasked hardware interrupt at the instruction
+        // boundary. Below the deadline the device bits of `I_STAT` are frozen
+        // but correct, while software-set bits (DMA / VBlank) are live, so this
+        // poll matches the naive poll's result.
+        if poll_interrupt(&mut self.cpu, self.irq.pending()) {
+            self.cpu.cycles = c.wrapping_add(1);
+            return;
+        }
+
+        // Same cost model as the naive path; fetch cost is read from the PC of
+        // the instruction being fetched, before it executes.
+        let fetch_wait = crate::timing::fetch_cycles(self.cpu.pc, &self.memctrl.timing()) - 1;
+
+        let (data_cost, io_touched) = {
+            let mut bus = CoreBus {
+                mem: &mut self.mem,
+                gpu: &mut self.gpu,
+                dma: &mut self.dma,
+                irq: &mut self.irq,
+                timers: &mut self.timers,
+                memctrl: &mut self.memctrl,
+                cache_ctrl: &mut self.cache_ctrl,
+                sio0: &mut self.sio0,
+                cdrom: &mut self.cdrom,
+                spu: &mut self.spu,
+                mdec: &mut self.mdec,
+                access_cost: 0,
+                obs,
+                device_clock: Some(&mut self.device_clock),
+                io_touched: false,
+            };
+            step(&mut self.cpu, &mut bus);
+            (bus.access_cost, bus.io_touched)
+        };
+        let data_wait = data_cost.saturating_sub(1);
+
+        // Only the CPU cycle counter advances by the wait states; the devices
+        // stay lagged and are reconciled at the next deadline crossing.
+        let extra = fetch_wait + data_wait;
+        self.cpu.cycles = self.cpu.cycles.wrapping_add(u64::from(extra));
+
+        // A device register access may have changed a device's next event
+        // (started a read, set a timer target, queued a transmit, keyed a
+        // voice on, acked an interrupt), so rebuild the deadline.
+        if io_touched {
+            self.recompute_deadline();
+        }
+    }
+
+    /// Advances every per-cycle device from `device_clock` up to `target`
+    /// (delivering interrupts) and rebuilds the next-event deadline. `target`
+    /// must be `>= device_clock`.
+    fn catch_up_all(&mut self, target: u64) {
+        catch_up_devices(
+            &mut self.device_clock,
+            target,
+            &mut self.timers,
+            &mut self.cdrom,
+            &mut self.spu,
+            &mut self.sio0,
+            &mut self.irq,
+        );
+        self.recompute_deadline();
+    }
+
+    /// Recomputes [`Self::next_deadline`] as the earliest absolute CPU cycle at
+    /// which any device would next set an `I_STAT` bit (`u64::MAX` if none).
+    fn recompute_deadline(&mut self) {
+        let base = self.device_clock;
+        let mut best = u64::MAX;
+        let mut consider = |offset: Option<u64>| {
+            if let Some(o) = offset {
+                best = best.min(base.saturating_add(o));
+            }
+        };
+        consider(self.timers.cycles_to_next_event());
+        consider(self.cdrom.cycles_to_next_event());
+        consider(self.spu.cycles_to_next_event());
+        consider(self.sio0.cycles_to_next_event());
+        self.next_deadline = best;
     }
 
     /// Renders the current display area from VRAM to a 320×240 RGBA buffer.
@@ -1209,8 +1531,18 @@ impl PsxCore {
     }
 
     /// Captures a full save-state snapshot.
-    #[must_use]
-    pub fn save_state(&self) -> CoreSnapshot {
+    ///
+    /// Takes `&mut self` because it first flushes the lazily-scheduled devices
+    /// up to `cpu.cycles` so their serialized state is canonical — byte-for-byte
+    /// what the reference per-instruction loop would serialize at this rest
+    /// point. At a rest point the flush crosses no un-fired device event (the
+    /// next deadline is always beyond `cpu.cycles`), so it sets no `I_STAT` bit
+    /// and produces no audio the naive path would not also have. The scheduler
+    /// bookkeeping (`device_clock`, `next_deadline`) is deliberately **not**
+    /// part of [`CoreSnapshot`], keeping the snapshot format backward
+    /// compatible; it is reconstructed on load.
+    pub fn save_state(&mut self) -> CoreSnapshot {
+        self.catch_up_all(self.cpu.cycles);
         CoreSnapshot {
             paused: self.paused,
             controllers: self.controllers,
@@ -1253,6 +1585,12 @@ impl PsxCore {
         self.cdrom = snap.cdrom.clone();
         self.spu = snap.spu.clone();
         self.mdec = snap.mdec.clone();
+        // Reconstruct the (non-serialized) scheduler bookkeeping: the restored
+        // devices are consistent as of `cpu.cycles`, and the deadline is forced
+        // to recompute on the next scheduled step (the first `obs >= 0` catch-up
+        // ticks the devices by one cycle, matching the naive top-tick).
+        self.device_clock = self.cpu.cycles;
+        self.next_deadline = 0;
     }
 }
 
@@ -1402,6 +1740,9 @@ mod tests {
                 spu: &mut core.spu,
                 mdec: &mut core.mdec,
                 access_cost: 0,
+                obs: 0,
+                device_clock: None,
+                io_touched: false,
             };
             // Fill red 16x16 at (0,0) through the GP0 port.
             bus.store32(0x1F80_1810, 0x0200_00FF);
@@ -1431,6 +1772,9 @@ mod tests {
                 spu: &mut core.spu,
                 mdec: &mut core.mdec,
                 access_cost: 0,
+                obs: 0,
+                device_clock: None,
+                io_touched: false,
             };
             bus.load32(0x1F80_1814)
         };
@@ -1455,6 +1799,9 @@ mod tests {
             spu: &mut core.spu,
             mdec: &mut core.mdec,
             access_cost: 0,
+            obs: 0,
+            device_clock: None,
+            io_touched: false,
         };
         bus.store32(0x1F80_1074, 0x1); // I_MASK = VBlank
         assert_eq!(bus.load32(0x1F80_1074), 0x1);
@@ -1481,6 +1828,9 @@ mod tests {
             spu: &mut core.spu,
             mdec: &mut core.mdec,
             access_cost: 0,
+            obs: 0,
+            device_clock: None,
+            io_touched: false,
         };
         // SPU register file (0x1F80_1C00) is byte-addressable backing store.
         bus.store16(0x1F80_1C00, 0xABCD);

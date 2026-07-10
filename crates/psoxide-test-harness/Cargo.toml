@@ -17,6 +17,9 @@ psoxide-config = { path = "../psoxide-config" }
 # under `cargo bench`). default-features off + only `cargo_bench_support` avoids
 # pulling optional plotting/html deps that can break on newer toolchains.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Differential equivalence tests (scheduler vs. naive device fan-out) use
+# proptest to fuzz device configurations and command streams.
+proptest = "1"
 
 [[bench]]
 name = "hot_loop"

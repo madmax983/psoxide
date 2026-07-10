@@ -219,6 +219,54 @@ impl Counter {
         self.value = next;
     }
 
+    /// Number of CPU cycles from the current state until this counter would
+    /// next raise its interrupt, or `None` if the current configuration raises
+    /// no further interrupt (IRQ disabled, or a spent one-shot).
+    ///
+    /// This is the counter's contribution to the lazy device scheduler's
+    /// next-event deadline. It is **conservative**: it may return a value less
+    /// than or equal to the true next-event cycle, never larger. In particular
+    /// the overflow calculation ignores `reset_on_target` (which can only delay
+    /// or cancel an overflow), so the returned offset is a safe lower bound.
+    fn cycles_to_next_event(&self, index: usize) -> Option<u64> {
+        let want_target = self.irq_on_target();
+        let want_overflow = self.irq_on_overflow();
+        if !want_target && !want_overflow {
+            return None;
+        }
+        // A spent one-shot (bit 6 clear, already fired) raises no further IRQ
+        // until the mode register is rewritten (which re-arms via `write_mode`).
+        if !self.irq_repeat() && self.irq_fired {
+            return None;
+        }
+
+        let v = u32::from(self.value);
+        let mut steps: Option<u64> = None;
+        if want_target {
+            // `step_one` sets `next = value + 1` and hits when `next == target`.
+            // After `s` increments the value is `v + s`, so the first hit is at
+            // `s = (target - v) mod 2^16`, or a full `2^16` when they are equal.
+            let d = (u32::from(self.target).wrapping_sub(v)) & 0xFFFF;
+            let s = if d == 0 { 0x1_0000 } else { u64::from(d) };
+            steps = Some(steps.map_or(s, |b: u64| b.min(s)));
+        }
+        if want_overflow {
+            // Overflow occurs when the value increments from 0xFFFF to 0, i.e.
+            // when the pre-increment value is 0xFFFF: `s = 0x10000 - v`.
+            let s = 0x1_0000u64 - u64::from(v);
+            steps = Some(steps.map_or(s, |b: u64| b.min(s)));
+        }
+        let steps = steps?;
+
+        // The n-th timer tick occurs at CPU-cycle offset `n * div - accumulator`
+        // (the accumulator holds `< div` residual cycles on entry). Clamp to a
+        // minimum of 1 so the scheduler always makes forward progress.
+        let div = u64::from(self.clock_source(index));
+        let acc = u64::from(self.accumulator);
+        let cycles = steps.saturating_mul(div).saturating_sub(acc);
+        Some(cycles.max(1))
+    }
+
     /// Asserts the timer interrupt, honoring the one-shot (bit 6 clear) latch.
     fn raise(&mut self, irq: &mut Irq, line: IrqLine) {
         if !self.irq_repeat() {
@@ -329,6 +377,21 @@ impl Timers {
             let line = Self::line(index);
             self.counters[index].tick(index, cycles, irq, line);
         }
+    }
+
+    /// Number of CPU cycles until the earliest of the three counters would next
+    /// raise its interrupt, or `None` if no counter has an armed interrupt.
+    /// Conservative (never larger than the true next event); see
+    /// [`Counter::cycles_to_next_event`].
+    #[must_use]
+    pub fn cycles_to_next_event(&self) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        for index in 0..3 {
+            if let Some(c) = self.counters[index].cycles_to_next_event(index) {
+                best = Some(best.map_or(c, |b: u64| b.min(c)));
+            }
+        }
+        best
     }
 }
 
@@ -584,5 +647,124 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The scheduler deadline `cycles_to_next_event` must be a safe lower bound
+    /// on the cycle a per-cycle tick loop actually raises the interrupt, and
+    /// exact except in the documented `reset_on_target + overflow` conservative
+    /// case. Drives each config per-cycle and checks the first firing cycle.
+    #[test]
+    fn cycles_to_next_event_predicts_first_irq() {
+        fn fresh(mode: u16, target: u16, start: u16) -> Counter {
+            Counter {
+                value: start,
+                mode,
+                target,
+                accumulator: 0,
+                irq_fired: false,
+            }
+        }
+
+        let modes = [
+            0u16,
+            1 << 3,
+            1 << 4,
+            (1 << 4) | (1 << 3),
+            (1 << 4) | (1 << 3) | (1 << 6),
+            1 << 5,
+            (1 << 5) | (1 << 6),
+            (1 << 5) | (1 << 3),
+            (1 << 4) | (1 << 5),
+            (1 << 4) | (1 << 5) | (1 << 6),
+            (1 << 4) | (1 << 5) | (1 << 3),
+        ];
+        let targets = [0u16, 1, 2, 0x00FF, 0xFFFF];
+        let starts = [0u16, 1, 0x00FE, 0xFFFF];
+        // Divisors 1 (sysclk), 6 (dotclock), 8 (sysclk/8).
+        let sources = [(0usize, 0u16), (0usize, 1 << 8), (2usize, 2 << 8)];
+
+        for &(index, sel) in &sources {
+            let line = Timers::line(index);
+            for &base in &modes {
+                let mode = base | sel;
+                for &target in &targets {
+                    for &start in &starts {
+                        let c = fresh(mode, target, start);
+                        let div = c.clock_source(index);
+                        let predicted = c.cycles_to_next_event(index);
+
+                        // A config is exact unless the conservative overflow
+                        // path (overflow IRQ + reset-on-target) is engaged.
+                        let conservative = (mode & (1 << 5) != 0) && (mode & (1 << 3) != 0);
+
+                        match predicted {
+                            None => {
+                                // IRQ disabled or spent one-shot: no fire within
+                                // a generous window (a full 16-bit wrap).
+                                let mut cc = fresh(mode, target, start);
+                                let mut irq = Irq::new();
+                                let bound = 0x1_0000u64 * u64::from(div) + 8;
+                                for _ in 0..bound {
+                                    cc.tick(index, 1, &mut irq, line);
+                                    assert_eq!(
+                                        irq.read_stat(),
+                                        0,
+                                        "None but fired: idx={index} mode={mode:#06x} target={target} start={start}"
+                                    );
+                                }
+                            }
+                            Some(n) => {
+                                // No fire strictly before the predicted cycle.
+                                let mut cc = fresh(mode, target, start);
+                                let mut irq = Irq::new();
+                                for _ in 0..(n - 1) {
+                                    cc.tick(index, 1, &mut irq, line);
+                                }
+                                assert_eq!(
+                                    irq.read_stat(),
+                                    0,
+                                    "fired before predicted n={n}: idx={index} mode={mode:#06x} target={target} start={start}"
+                                );
+                                // Exactly at the predicted cycle it fires (unless
+                                // conservative, where it fires at or after).
+                                cc.tick(index, 1, &mut irq, line);
+                                if !conservative {
+                                    assert_ne!(
+                                        irq.read_stat(),
+                                        0,
+                                        "did not fire at predicted n={n}: idx={index} mode={mode:#06x} target={target} start={start}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A spent one-shot (bit 6 clear) reports no further deadline until re-armed.
+    #[test]
+    fn cycles_to_next_event_spent_one_shot_is_none() {
+        // One-shot IRQ-on-target at target 4.
+        let mut c = Counter {
+            value: 0,
+            mode: 1 << 4,
+            target: 4,
+            accumulator: 0,
+            irq_fired: false,
+        };
+        assert_eq!(c.cycles_to_next_event(2), Some(4));
+        let mut irq = Irq::new();
+        for _ in 0..4 {
+            c.tick(2, 1, &mut irq, Timers::line(2));
+        }
+        assert_ne!(irq.read_stat(), 0, "one-shot fired");
+        assert!(c.irq_fired, "one-shot latched");
+        assert_eq!(
+            c.cycles_to_next_event(2),
+            None,
+            "spent one-shot: no deadline"
+        );
     }
 }
