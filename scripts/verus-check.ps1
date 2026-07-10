@@ -12,7 +12,9 @@ try {
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $proofFiles = @(
     (Join-Path $repoRoot "crates/psoxide-proof/src/bus_map.rs"),
-    (Join-Path $repoRoot "crates/psoxide-proof/src/decode.rs")
+    (Join-Path $repoRoot "crates/psoxide-proof/src/decode.rs"),
+    (Join-Path $repoRoot "crates/psoxide-proof/src/map_region.rs"),
+    (Join-Path $repoRoot "crates/psoxide-proof/src/timing.rs")
 )
 
 foreach ($file in $proofFiles) {

@@ -234,8 +234,52 @@ cargo test -p psoxide-test-harness
 Verus proofs are checked out-of-band (Verus is not a Cargo dependency):
 
 ```
-pwsh scripts/verus-check.ps1
+make verify                 # Linux/macOS (skips cleanly if verus is absent)
+./scripts/verus-check.sh    # same, direct
+pwsh scripts/verus-check.ps1   # Windows / CI parity
 ```
+
+## Formal Verification
+
+The `psoxide-proof` crate holds hand-written Verus specs that machine-check the
+pure logic of the emulator's bus map, instruction decoder, and timing tables.
+Verus is installed **out-of-band** (it is not a Cargo dependency): a prebuilt
+Verus release `0.2026.07.05` running on rust toolchain `1.96.0`. Get it from
+<https://github.com/verus-lang/verus/releases>.
+
+Run the proofs with `make verify` (or `./scripts/verus-check.sh`, or
+`pwsh scripts/verus-check.ps1` on Windows). All entry points discover the
+`verus` binary via the `VERUS` / `VERUS_BIN` env var or `verus` on PATH, and
+skip cleanly (exit 0) with a message when it is not found, so they never break a
+checkout without Verus. The proof `.rs` files are **not** declared as cargo
+modules (only `lib.rs` is), so they do not affect `cargo build`/`clippy`/`test`.
+
+### Machine-VERIFIED (33 verified, 0 errors)
+
+- **bus_map.rs — 6 verified.** `mask_region`: segment bounds, mask
+  boundedness, and per-segment mask correctness (the KUSEG/KSEG0/KSEG1/KSEG2
+  region masks).
+- **decode.rs — 4 verified.** Opcode 6-bit bound, and that coprocessor opcodes
+  never decode to `Illegal`.
+- **map_region.rs — 3 verified.** `BusRegion` decode totality, disjointness,
+  and 19 boundary addresses.
+- **timing.rs — 20 verified.** `delay_1st_seq` field bounds & overflow-safety;
+  `bus_cycles >= 1` so there is no underflow; fixed-class exact cycle values;
+  width-monotonicity; and golden exact-value lemmas for BIOS/EXP1 (7/13/25),
+  EXP3, SPU, CDROM, and EXP2.
+
+### ASSERTED-BY-TEST, not proven
+
+- The decoder spec models opcode dispatch at **CLASS granularity** — it does
+  not descend into the COP0/COP2 sub-decode.
+- The timing monotonicity/overflow lemmas are stated over the real caller
+  **width domain `{1, 2, 4}`**, with a documented `width_bytes >= 1`
+  precondition.
+- The proof files **DUPLICATE** the pure logic of `bus.rs` / `timing.rs` /
+  the CPU decoder (`decode.rs`) — they are hand-mirrored specs, not references
+  to the shared implementation code, and are **kept in sync manually**. A spec
+  can therefore drift from the impl if the impl changes without the spec being
+  updated.
 
 ## Test Tiers
 
