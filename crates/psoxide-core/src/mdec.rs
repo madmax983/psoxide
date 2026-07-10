@@ -344,10 +344,7 @@ impl Mdec {
             // Colour: repeated 6-block macroblocks (Cr, Cb, Y1..Y4).
             let iq_y = self.iq_y.clone();
             let iq_uv = self.iq_uv.clone();
-            loop {
-                let Some(mut cr) = decode_rle_block(&hw, &mut pos, &iq_uv) else {
-                    break;
-                };
+            while let Some(mut cr) = decode_rle_block(&hw, &mut pos, &iq_uv) {
                 let Some(mut cb) = decode_rle_block(&hw, &mut pos, &iq_uv) else {
                     break;
                 };
