@@ -103,6 +103,25 @@ pub enum Command {
     LoadDisc(Disc),
     /// Eject the currently inserted disc, if any.
     EjectDisc,
+    /// Insert a memory card into a controller-port slot. `data` is padded or
+    /// truncated to the 128 KB card size.
+    InsertMemoryCard {
+        /// Slot index (0 or 1).
+        slot: u8,
+        /// Card image bytes (128 KB expected; padded/truncated otherwise).
+        data: Vec<u8>,
+    },
+    /// Eject the memory card in a slot, if any.
+    EjectMemoryCard {
+        /// Slot index (0 or 1).
+        slot: u8,
+    },
+    /// Clear the dirty flag on a memory card after the frontend has flushed its
+    /// image to persistent storage. (Query is `&self` and cannot clear it.)
+    ClearMemoryCardDirty {
+        /// Slot index (0 or 1).
+        slot: u8,
+    },
     /// Reset the CPU to the BIOS entry vector.
     Reset,
     /// Execute one CPU instruction.
@@ -138,6 +157,11 @@ pub enum CoreQuery {
     Pc,
     /// Return lightweight machine status.
     EmulatorState,
+    /// Return the memory-card image + dirty flag for a slot.
+    MemoryCard {
+        /// Slot index (0 or 1).
+        slot: u8,
+    },
 }
 
 /// Lightweight machine status.
@@ -164,6 +188,16 @@ pub enum QueryResult {
     Pc(u32),
     /// [`CoreQuery::EmulatorState`] response.
     EmulatorState(EmulatorState),
+    /// [`CoreQuery::MemoryCard`] response. `present` is `false` (with an empty
+    /// `data` and `dirty == false`) when no card is inserted in the slot.
+    MemoryCard {
+        /// Whether a card is inserted in the queried slot.
+        present: bool,
+        /// The 128 KB card image (empty when `present` is `false`).
+        data: Vec<u8>,
+        /// Whether the card has unsaved modifications.
+        dirty: bool,
+    },
 }
 
 /// Errors returned by [`PsxCore::execute`].
@@ -757,6 +791,13 @@ impl PsxCore {
             }
             Command::LoadDisc(disc) => self.cdrom.insert_disc(disc),
             Command::EjectDisc => self.cdrom.eject(),
+            Command::InsertMemoryCard { slot, data } => {
+                self.sio0.insert_card(slot as usize, data);
+            }
+            Command::EjectMemoryCard { slot } => self.sio0.eject_card(slot as usize),
+            Command::ClearMemoryCardDirty { slot } => {
+                self.sio0.clear_card_dirty(slot as usize);
+            }
             Command::Reset => self.cpu.reset(),
             Command::StepCpu => self.step_cpu(),
             Command::StepFrame => {
@@ -806,6 +847,18 @@ impl PsxCore {
                 controllers: self.controllers,
                 cycles: self.cpu.cycles,
             }),
+            CoreQuery::MemoryCard { slot } => match self.sio0.card_image(slot as usize) {
+                Some((data, dirty)) => QueryResult::MemoryCard {
+                    present: true,
+                    data,
+                    dirty,
+                },
+                None => QueryResult::MemoryCard {
+                    present: false,
+                    data: Vec::new(),
+                    dirty: false,
+                },
+            },
         }
     }
 

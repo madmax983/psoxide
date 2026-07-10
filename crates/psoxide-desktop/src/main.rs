@@ -23,7 +23,7 @@ use clap::{Parser, Subcommand};
 use gilrs::{Button as PadButton, EventType, Gilrs};
 use pixels::{Pixels, SurfaceTexture};
 use psoxide_config::PsxConfig;
-use psoxide_core::{Button, Command, FRAME_HEIGHT, FRAME_WIDTH, PsxCore};
+use psoxide_core::{Button, Command, CoreQuery, FRAME_HEIGHT, FRAME_WIDTH, PsxCore, QueryResult};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -53,6 +53,10 @@ enum CliCommand {
         /// tracks) or a raw MODE2/2352 `.bin` (single data track).
         #[arg(long)]
         disc: Option<PathBuf>,
+        /// Optional memory-card image file for slot 0 (128 KB). Created fresh
+        /// (all-zero) if the path does not exist; flushed back on write + exit.
+        #[arg(long)]
+        memcard: Option<PathBuf>,
         /// Window scale factor.
         #[arg(long, default_value = "2")]
         scale: u32,
@@ -74,9 +78,17 @@ fn main() -> Result<()> {
             bios,
             exe,
             disc,
+            memcard,
             scale,
             config,
-        } => cmd_run(&bios, exe.as_deref(), disc.as_deref(), scale, &config),
+        } => cmd_run(
+            &bios,
+            exe.as_deref(),
+            disc.as_deref(),
+            memcard,
+            scale,
+            &config,
+        ),
         CliCommand::Info { bios } => cmd_info(&bios),
     }
 }
@@ -94,10 +106,14 @@ fn cmd_info(bios_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Memory-card image size in bytes (128 KB).
+const MEMCARD_BYTES: usize = 128 * 1024;
+
 fn cmd_run(
     bios_name: &str,
     exe: Option<&Path>,
     disc: Option<&Path>,
+    memcard: Option<PathBuf>,
     scale: u32,
     config_path: &Path,
 ) -> Result<()> {
@@ -124,6 +140,32 @@ fn cmd_run(
             .map_err(|e| anyhow::anyhow!("failed to mount disc: {e}"))?;
     }
 
+    // Memory card in slot 0 (when `--memcard PATH` is given). If the file
+    // exists, load it (padding/truncating to the 128 KB card size, warning if
+    // the size is off); otherwise start from a fresh all-zero card that the
+    // BIOS will format. Slot 1 (index 1) is left empty and always reports
+    // "no card". The `PathBuf` is stashed in `App` so writes can be flushed
+    // back (see the save-on-dirty policy in `RedrawRequested`/`CloseRequested`).
+    if let Some(ref path) = memcard {
+        let data = if path.exists() {
+            let mut bytes = fs::read(path)
+                .with_context(|| format!("failed to read memory card: {}", path.display()))?;
+            if bytes.len() != MEMCARD_BYTES {
+                eprintln!(
+                    "Warning: memory card {} is {} bytes, expected {MEMCARD_BYTES}; padding/truncating",
+                    path.display(),
+                    bytes.len()
+                );
+                bytes.resize(MEMCARD_BYTES, 0);
+            }
+            bytes
+        } else {
+            vec![0u8; MEMCARD_BYTES]
+        };
+        core.execute(Command::InsertMemoryCard { slot: 0, data })
+            .map_err(|e| anyhow::anyhow!("failed to insert memory card: {e}"))?;
+    }
+
     // Gamepad input via gilrs (optional — keyboard still works without one).
     let gilrs = match Gilrs::new() {
         Ok(g) => Some(g),
@@ -144,6 +186,7 @@ fn cmd_run(
         pixels: None,
         audio: AudioOutput::try_new(),
         gilrs,
+        memcard_path: memcard,
     };
     event_loop.run_app(&mut app).context("event loop error")?;
     Ok(())
@@ -158,6 +201,43 @@ struct App {
     pixels: Option<Pixels<'static>>,
     /// Gamepad input context (`None` when unavailable).
     gilrs: Option<Gilrs>,
+    /// Slot-0 memory-card file to persist to (`None` when `--memcard` was not
+    /// passed, in which case no card is inserted and none is written).
+    memcard_path: Option<PathBuf>,
+}
+
+impl App {
+    /// Flushes the slot-0 memory card to its configured file if it is dirty.
+    ///
+    /// Persistence policy: flush on dirty each frame + on exit. Querying the
+    /// card is cheap and only writes the file when the core reports unsaved
+    /// changes, so an idle game does not thrash the disk. Only slot 0 is
+    /// persisted; slot 1 is never populated by the desktop frontend.
+    fn flush_memcard(&mut self) {
+        let Some(path) = self.memcard_path.clone() else {
+            return;
+        };
+        let QueryResult::MemoryCard {
+            present,
+            data,
+            dirty,
+        } = self.core.query(CoreQuery::MemoryCard { slot: 0 })
+        else {
+            return;
+        };
+        if !present || !dirty {
+            return;
+        }
+        match fs::write(&path, &data) {
+            Ok(()) => {
+                let _ = self.core.execute(Command::ClearMemoryCardDirty { slot: 0 });
+            }
+            Err(e) => eprintln!(
+                "Warning: failed to write memory card {}: {e}",
+                path.display()
+            ),
+        }
+    }
 }
 
 fn key_to_button(key: KeyCode) -> Option<Button> {
@@ -242,7 +322,11 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Flush the memory card one last time before exiting.
+                self.flush_memcard();
+                event_loop.exit();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
                     event_loop.exit();
@@ -276,6 +360,9 @@ impl ApplicationHandler for App {
                 if let Some(audio) = self.audio.as_ref() {
                     audio.queue(samples);
                 }
+                // Persistence policy: flush on dirty each frame + on exit. This
+                // only touches the disk when the card was actually written.
+                self.flush_memcard();
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
                 }
