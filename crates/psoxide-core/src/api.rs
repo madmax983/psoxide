@@ -18,8 +18,9 @@ use crate::cpu::execute::Bus;
 use crate::cpu::{Cpu, CpuSnapshot, poll_interrupt, step};
 use crate::dma::Dma;
 use crate::gpu::Gpu;
-use crate::iostubs::{CACHE_CTRL_REG, CacheCtrl, MemCtrl, Sio0, Spu};
+use crate::iostubs::{CACHE_CTRL_REG, CacheCtrl, MemCtrl, Sio0};
 use crate::irq::{Irq, IrqLine};
+use crate::spu::Spu;
 use crate::timers::{TIMERS_BASE, TIMERS_END, Timers};
 
 /// Placeholder framebuffer width in pixels.
@@ -304,8 +305,9 @@ impl CoreBus<'_> {
             0x1F80_1070 => self.irq.write_stat(val),
             0x1F80_1074 => self.irq.write_mask(val),
             0x1F80_1080..=0x1F80_10FF => {
-                self.dma
-                    .write32(phys, val, self.mem, self.gpu, self.cdrom, self.irq);
+                self.dma.write32(
+                    phys, val, self.mem, self.gpu, self.cdrom, self.spu, self.irq,
+                );
             }
             TIMERS_BASE..=TIMERS_END => self.timers.write32(phys, val),
             _ if MemCtrl::contains(phys) => self.memctrl.write32(phys, val),
@@ -629,6 +631,17 @@ impl PsxCore {
         self.irq.set(IrqLine::VBlank);
     }
 
+    /// Drains all queued interleaved-stereo audio samples (L, R, L, R, ...) the
+    /// SPU has produced since the last drain. The desktop frontend calls this
+    /// once per frame and feeds the result to the host audio device.
+    ///
+    /// The SPU emits 44.1 kHz stereo, so a `StepFrame` yields ~735 sample pairs
+    /// (1470 `i16` values). The internal queue is capped at ~1 second of audio,
+    /// so a headless or paused run cannot grow it unbounded.
+    pub fn drain_audio(&mut self) -> Vec<i16> {
+        self.spu.drain_samples()
+    }
+
     /// Builds a transient [`CoreBus`] borrowing every peripheral, for one-off
     /// bus accesses that are not part of a CPU instruction step.
     fn core_bus(&mut self) -> CoreBus<'_> {
@@ -656,6 +669,13 @@ impl PsxCore {
         self.core_bus().store8(addr, value);
     }
 
+    /// Performs a 16-bit store through the full system bus (device routing
+    /// included), exactly as a CPU `sh` would. Used to program the 16-bit SPU
+    /// register file from a frontend/test.
+    pub fn store16(&mut self, addr: u32, value: u16) {
+        self.core_bus().store16(addr, value);
+    }
+
     /// Performs a 32-bit store through the full system bus (device routing
     /// included), exactly as a CPU `sw` would. Used to program the DMA and
     /// interrupt-controller register files from a frontend/test.
@@ -667,6 +687,12 @@ impl PsxCore {
     /// exactly as a CPU `lb` would.
     pub fn load8(&mut self, addr: u32) -> u8 {
         self.core_bus().load8(addr)
+    }
+
+    /// Performs a 16-bit load through the full system bus (device routing
+    /// included), exactly as a CPU `lh` would.
+    pub fn load16(&mut self, addr: u32) -> u16 {
+        self.core_bus().load16(addr)
     }
 
     /// Performs a 32-bit load through the full system bus (device routing
@@ -752,6 +778,9 @@ impl PsxCore {
         // Advance the CD-ROM controller so a queued command response can latch
         // and raise its interrupt this cycle.
         self.cdrom.tick(1, &mut self.irq);
+        // Advance the SPU by one CPU cycle: it emits an audio sample every 768
+        // cycles and raises its interrupt when the SPU IRQ address is matched.
+        self.spu.tick(1, &mut self.irq);
 
         // Advance the SIO0 controller ACK timer by the same cycle, so a
         // scheduled controller /ACK can raise IRQ7 at this instruction boundary.

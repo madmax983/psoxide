@@ -7,10 +7,13 @@
 //! psoxide info scph1001.bin
 //! ```
 //!
-//! The GPU is rendered via `framebuffer_rgba()` into a Pixels surface.
-//! Input is driven by the keyboard and, when present, a gamepad (via gilrs);
-//! both feed digital-pad state to controller port 0. Audio is a silent no-op
-//! stub.
+//! The GPU is rendered via `framebuffer_rgba()` into a Pixels surface. Input is
+//! driven by the keyboard and, when present, a gamepad (via gilrs); both feed
+//! digital-pad state to controller port 0. Audio is produced by the core's SPU
+//! and played back through the host device via `rodio` (see the [`audio`]
+//! module); if no audio device is available the emulator continues silently.
+
+mod audio;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +30,8 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+use crate::audio::AudioOutput;
 
 #[derive(Parser)]
 #[command(name = "psoxide", about = "Sony PlayStation emulator")]
@@ -137,6 +142,7 @@ fn cmd_run(
         buttons: 0,
         window: None,
         pixels: None,
+        audio: AudioOutput::try_new(),
         gilrs,
     };
     event_loop.run_app(&mut app).context("event loop error")?;
@@ -147,6 +153,7 @@ struct App {
     core: PsxCore,
     scale: u32,
     buttons: u16,
+    audio: Option<AudioOutput>,
     window: Option<Window>,
     pixels: Option<Pixels<'static>>,
     /// Gamepad input context (`None` when unavailable).
@@ -261,6 +268,13 @@ impl ApplicationHandler for App {
                     let frame = self.core.framebuffer_rgba();
                     pixels.frame_mut().copy_from_slice(&frame);
                     let _ = pixels.render();
+                }
+                // Feed this frame's SPU output to the host audio device. Always
+                // drain the core queue so it cannot grow unbounded even when
+                // there is no audio device.
+                let samples = self.core.drain_audio();
+                if let Some(audio) = self.audio.as_ref() {
+                    audio.queue(samples);
                 }
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();

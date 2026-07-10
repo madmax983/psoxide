@@ -701,11 +701,10 @@ pub fn poll_interrupt(cpu: &mut Cpu, pending: bool) -> bool {
 /// Main RAM and the BIOS ROM are the normal instruction sources. On real
 /// hardware most of the I/O region bus-errors on a code fetch — but not all of
 /// it: the ps1-tests `code-in-io` suite shows the DMA register block and the
-/// SPU register block *do* respond and execute. psoxide backs the DMA register
-/// file (`dma.rs`) with real read/write-back semantics, so a code fetch there
-/// returns the written words and executes; it is therefore treated as a legal
-/// fetch source. The SPU register file is not yet backed (its stores are
-/// dropped), so it is left faulting until that device backing lands.
+/// SPU register block *do* respond and execute. psoxide backs both the DMA
+/// register file (`dma.rs`) and the SPU register file (`spu.rs`) with real
+/// read/write-back semantics, so a code fetch in either returns the written
+/// words and executes; both are therefore treated as legal fetch sources.
 ///
 /// A bus error, unlike an address error, records no `BadVaddr`.
 #[inline]
@@ -719,9 +718,9 @@ fn fetch_ok(virt: u32) -> bool {
         BusRegion::IoPorts if (0x1F80_1080..=0x1F80_10FF).contains(&phys) => true,
         // SPU register block (0x1F80_1C00..=0x1F80_1FFF): real hardware also
         // responds to a code fetch here, and psoxide now backs the SPU register
-        // file (`iostubs::Spu`) with write-then-read-back semantics, so a copied
+        // file (`spu::Spu`) with write-then-read-back semantics, so a copied
         // instruction word reads back and executes (ps1-tests `code-in-io`
-        // testCodeInSPU). See `crate::iostubs::{SPU_BASE, SPU_END}`.
+        // testCodeInSPU). See `crate::spu::{SPU_BASE, SPU_END}`.
         BusRegion::IoPorts if (0x1F80_1C00..=0x1F80_1FFF).contains(&phys) => true,
         _ => false,
     }
