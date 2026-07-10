@@ -20,6 +20,7 @@ pub mod iostubs;
 pub mod irq;
 pub mod spu;
 pub mod timers;
+pub mod timing;
 
 pub use api::{
     BIOS_IMAGE_SIZE, Button, Command, CoreError, CoreQuery, CoreSnapshot, EmulatorState,
@@ -36,3 +37,6 @@ pub use gte::Gte;
 pub use irq::{Irq, IrqLine};
 pub use spu::Spu;
 pub use timers::Timers;
+pub use timing::{
+    AccessClass, MemTiming, access_class, access_cycles, delay_1st_seq, fetch_cycles,
+};

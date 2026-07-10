@@ -212,16 +212,149 @@ fn io_access_bitwidth_runs_to_completion() {
     );
 }
 
+/// Parses the `access-time` result table into `label -> [w8, w16, w32]`, where
+/// each entry is the **whole** part of the printed average cycles-per-access.
+///
+/// The test prints each cell with the format `%2d.%2-d` (whole `.` fraction).
+/// The harness's `printf` HLE renders the leading `%2d` but not the trailing
+/// `%2-d`, so only the whole part is machine-readable — enough to gate the model
+/// to ~1-cycle resolution, which is all the golden's own noise (5.21 vs 5.30 …)
+/// supports. Address tokens carry no `.` and are skipped.
+fn parse_access_table(tty: &str) -> std::collections::HashMap<String, [i64; 3]> {
+    let mut out = std::collections::HashMap::new();
+    for line in tty.lines() {
+        let mut toks = line.split_whitespace();
+        let Some(label) = toks.next() else { continue };
+        // A data row's label is all-caps letters/digits/underscore, e.g. "RAM",
+        // "CDROM_STAT". Skip the header ("SEGMENT") and prose lines.
+        if label == "SEGMENT"
+            || !label
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            continue;
+        }
+        let wholes: Vec<i64> = toks
+            .filter(|t| t.contains('.'))
+            .filter_map(|t| t.split('.').next().unwrap().parse::<i64>().ok())
+            .collect();
+        if wholes.len() >= 3 {
+            out.insert(label.to_string(), [wholes[0], wholes[1], wholes[2]]);
+        }
+    }
+    out
+}
+
 #[test]
-fn access_time_runs_to_completion() {
-    // access-time is a pure cycle-timing measurement with no pass/fail
-    // assertions of its own; psoxide's one-cycle-per-instruction model cannot
-    // reproduce the reference numbers. The gate only proves the binary loads and
-    // runs its whole measurement loop to completion via the timer/HLE path.
+fn access_time_reproduces_region_timing() {
+    // `access-time` times a single volatile load to each region and prints the
+    // average CPU cycles per access (Timer2, sysclk source). With the wait-state
+    // cost model the produced whole-cycle numbers track the vendored `psx.log`
+    // golden for the well-modelled regions and preserve the region-aware spread.
+    // The reference values are noisy fractions; we gate on the whole part.
     let tty = run_exe("cpu/access-time/access-time.exe", 2_000_000);
+
+    // (a) The measurement ran start to finish.
     assert!(tty.contains("cpu/access-time"), "header missing:\n{tty}");
     assert!(
         tty.contains("Done."),
         "access-time did not run to completion:\n{tty}"
     );
+
+    let table = parse_access_table(&tty);
+    let get = |label: &str| -> [i64; 3] {
+        *table
+            .get(label)
+            .unwrap_or_else(|| panic!("row {label:?} missing from table:\n{tty}"))
+    };
+
+    // (b) Well-modelled regions land within ±1.5 cycles of the golden at every
+    // width. Golden values (8/16/32):
+    //   RAM 5.21/5.30/5.14  BIOS 7.60/12.94/24.94  EXPANSION1 6.94/13.70/25.70
+    //   EXPANSION3 6.70/6.10/9.95  CACHECTRL 0.95/1.90/1.90  and the internal
+    //   I/O register rows, all ~3.0-3.8. SCRATCHPAD (1.50/1.10/0.94) is at the
+    //   edge: its marginal cost rounds just under one cycle, so the whole part
+    //   reads 0 — |0 - 1.50| = 1.50, exactly at tolerance.
+    let within = |label: &str, golden: [f64; 3]| {
+        let p = get(label);
+        for w in 0..3 {
+            let delta = (p[w] as f64 - golden[w]).abs();
+            assert!(
+                delta <= 1.5 + 1e-9,
+                "{label} width{w}: produced {} vs golden {} (Δ{delta:.2} > 1.5)\n{tty}",
+                p[w],
+                golden[w],
+            );
+        }
+    };
+    within("RAM", [5.21, 5.30, 5.14]);
+    within("BIOS", [7.60, 12.94, 24.94]);
+    within("EXPANSION1", [6.94, 13.70, 25.70]);
+    within("EXPANSION3", [6.70, 6.10, 9.95]);
+    within("SCRATCHPAD", [1.50, 1.10, 0.94]);
+    within("CACHECTRL", [0.95, 1.90, 1.90]);
+    for io in [
+        "DMAC_CTRL",
+        "JOY_STAT",
+        "SIO_STAT",
+        "RAM_SIZE",
+        "I_STAT",
+        "TIMER0_VAL",
+        "GPUSTAT",
+        "MDECSTAT",
+    ] {
+        within(io, [3.0, 3.0, 3.0]);
+    }
+
+    // (c) The delay-driven external devices are present and non-degenerate: they
+    // carry real programmable wait states far above the flat 3-cycle internal
+    // I/O baseline, proving region-awareness. The single PSX-SPX formula diverges
+    // from the golden here by a documented margin (do NOT special-case it):
+    //   CDROM  produced 7/13/25  vs golden 8.0/14.0/25.93   (~ -1)
+    //   SPU    produced 21/21/…  vs golden 17.99/17.99/…     (~ +3)
+    //   EXP2   produced 15/29/57 vs golden 10.99/25.99/55.98 (~ +1..+4)
+    // (SPUCNT's 32-bit cell is a misaligned-word access — an address-error trap
+    // whose cost is HLE exception overhead, not a bus access, so it is excluded.)
+    let cdrom = get("CDROM_STAT");
+    let spu = get("SPUCNT");
+    let exp2 = get("EXPANSION2");
+    assert!(cdrom[0] >= 6, "CDROM_STAT degenerate: {cdrom:?}\n{tty}");
+    assert!(
+        spu[0] >= 15 && spu[1] >= 15,
+        "SPUCNT degenerate: {spu:?}\n{tty}"
+    );
+    assert!(exp2[0] >= 10, "EXPANSION2 degenerate: {exp2:?}\n{tty}");
+
+    // (d) The region-aware spread the whole model exists to produce:
+    //   BIOS-32 (25) > RAM-32 (5) > SCRATCHPAD-32 (0), and Expansion 2 carries
+    //   the largest 32-bit cost of every *aligned* row (57), dwarfing internal
+    //   RAM/BIOS/scratchpad — a flat one-cycle model could never show this.
+    let ram = get("RAM");
+    let bios = get("BIOS");
+    let scratch = get("SCRATCHPAD");
+    assert!(
+        bios[2] > ram[2] && ram[2] > scratch[2],
+        "expected BIOS32 {} > RAM32 {} > SCRATCH32 {}\n{tty}",
+        bios[2],
+        ram[2],
+        scratch[2],
+    );
+    // EXPANSION2 has the largest 32-bit access cost of any aligned region.
+    for label in [
+        "RAM",
+        "BIOS",
+        "EXPANSION1",
+        "EXPANSION3",
+        "SCRATCHPAD",
+        "CDROM_STAT",
+        "CACHECTRL",
+        "DMAC_CTRL",
+    ] {
+        assert!(
+            exp2[2] >= get(label)[2],
+            "EXPANSION2-32 ({}) should be >= {label}-32 ({})\n{tty}",
+            exp2[2],
+            get(label)[2],
+        );
+    }
 }

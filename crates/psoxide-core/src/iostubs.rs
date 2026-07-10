@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 use crate::irq::{Irq, IrqLine};
+use crate::timing::MemTiming;
 
 /// Physical base of the memory-control register block.
 pub const MEMCTRL_BASE: u32 = 0x1F80_1000;
@@ -55,14 +56,27 @@ impl Default for MemCtrl {
 }
 
 impl MemCtrl {
-    /// Post-reset defaults per Nocash PSX-SPX (Expansion 1 base = 0x1F00_0000,
-    /// Expansion 2 base = 0x1F80_2000; the delay/size words are left zero
-    /// because real BIOSes always reprogram them).
+    /// Post-boot defaults per Nocash PSX-SPX. The Expansion 1/2 base words are
+    /// the hardware reset values; the Delay/Size and COM_DELAY words are seeded
+    /// with the standard values the retail BIOS programs during early boot.
+    ///
+    /// Seeding the wait-state words (rather than leaving them zero) means the
+    /// access-timing model produces realistic region latencies even when a test
+    /// harness side-loads a program without booting a real BIOS — the `ps1-tests`
+    /// `cpu/access-time` measurement relies on these already being configured.
+    /// A running BIOS simply rewrites the same values.
     #[must_use]
     pub fn new() -> Self {
         let mut regs = [0u32; 9];
-        regs[0] = 0x1F00_0000; // Expansion 1 base
-        regs[1] = 0x1F80_2000; // Expansion 2 base
+        regs[0] = 0x1F00_0000; // 0x1000 Expansion 1 base
+        regs[1] = 0x1F80_2000; // 0x1004 Expansion 2 base
+        regs[2] = 0x0013_243F; // 0x1008 Expansion 1 delay/size
+        regs[3] = 0x0000_3022; // 0x100C Expansion 3 delay/size
+        regs[4] = 0x0013_243F; // 0x1010 BIOS ROM delay/size
+        regs[5] = 0x2009_31E1; // 0x1014 SPU delay/size
+        regs[6] = 0x0002_0843; // 0x1018 CD-ROM delay/size
+        regs[7] = 0x0007_0777; // 0x101C Expansion 2 delay/size
+        regs[8] = 0x0003_1125; // 0x1020 COM_DELAY (COM0=5,COM1=2,COM2=1,COM3=1)
         Self {
             regs,
             ram_size: 0x0000_0B88, // 2MB, per SPX default
@@ -83,6 +97,23 @@ impl MemCtrl {
         }
         let idx = ((phys - MEMCTRL_BASE) / 4) as usize;
         self.regs.get(idx).copied().unwrap_or(0)
+    }
+
+    /// Snapshots the wait-state configuration into a [`MemTiming`] for the
+    /// access-cost model. The Delay/Size words live at register indices 2/3/4/
+    /// 5/6/7 (Exp1 / Exp3 / BIOS / SPU / CD-ROM / Exp2) and COM_DELAY at index 8
+    /// — the layout the BIOS and the `access-time` test program.
+    #[must_use]
+    pub fn timing(&self) -> MemTiming {
+        MemTiming {
+            com_delay: self.regs[8],
+            bios: self.regs[4],
+            exp1: self.regs[2],
+            exp2: self.regs[7],
+            exp3: self.regs[3],
+            spu: self.regs[5],
+            cdrom: self.regs[6],
+        }
     }
 
     /// Writes a 32-bit value at `phys`.

@@ -36,6 +36,11 @@ pub const CPU_CLOCK_HZ: u64 = 33_868_800;
 pub const FRAMES_PER_SECOND: u64 = 60;
 /// Instructions stepped per [`Command::StepFrame`] (rough placeholder pacing).
 pub const STEPS_PER_FRAME: u64 = CPU_CLOCK_HZ / FRAMES_PER_SECOND;
+/// CPU cycles elapsed per [`Command::StepFrame`]. With the cycle-accurate access
+/// timing model an instruction no longer costs a fixed one cycle, so `StepFrame`
+/// paces by a cycle budget (not an instruction count) to hold ~60fps regardless
+/// of how many wait states the running code incurs.
+pub const CYCLES_PER_FRAME: u64 = CPU_CLOCK_HZ / FRAMES_PER_SECOND;
 
 /// A standard digital controller button (SCPH-1080 layout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, core::hash::Hash)]
@@ -273,6 +278,11 @@ struct CoreBus<'a> {
     sio0: &'a mut Sio0,
     cdrom: &'a mut Cdrom,
     spu: &'a mut Spu,
+    /// CPU-cycle cost of the data access performed by the current instruction
+    /// (0 = none). Set once per load/store at the top-level [`Bus`] entry from
+    /// the original access width and address, read back by `step_cpu` to charge
+    /// wait states to the hardware timers.
+    access_cost: u32,
 }
 
 impl CoreBus<'_> {
@@ -280,6 +290,17 @@ impl CoreBus<'_> {
     #[inline]
     fn is_io(phys: u32) -> bool {
         matches!(map_region(phys), BusRegion::IoPorts)
+    }
+
+    /// Records the wait-state cost of a data access of `width_bytes` at physical
+    /// address `phys`, from the current memory-control timing configuration.
+    #[inline]
+    fn charge(&mut self, phys: u32, width_bytes: u32) {
+        self.access_cost = crate::timing::access_cycles(
+            crate::timing::access_class(phys),
+            width_bytes,
+            &self.memctrl.timing(),
+        );
     }
 
     fn io_read32(&mut self, phys: u32) -> u32 {
@@ -370,6 +391,7 @@ impl CoreBus<'_> {
 impl Bus for CoreBus<'_> {
     fn load8(&mut self, addr: u32) -> u8 {
         let phys = mask_region(addr);
+        self.charge(phys, 1);
         if Self::is_io(phys) {
             return self.io_read8(phys);
         }
@@ -377,6 +399,7 @@ impl Bus for CoreBus<'_> {
     }
     fn load16(&mut self, addr: u32) -> u16 {
         let phys = mask_region(addr);
+        self.charge(phys, 2);
         if Self::is_io(phys) {
             return self.io_read16(phys);
         }
@@ -384,6 +407,7 @@ impl Bus for CoreBus<'_> {
     }
     fn load32(&mut self, addr: u32) -> u32 {
         let phys = mask_region(addr);
+        self.charge(phys, 4);
         if Self::is_io(phys) {
             return self.io_read32(phys);
         }
@@ -399,6 +423,7 @@ impl Bus for CoreBus<'_> {
     }
     fn store8(&mut self, addr: u32, value: u8) {
         let phys = mask_region(addr);
+        self.charge(phys, 1);
         if Self::is_io(phys) {
             self.io_write8(phys, value);
             return;
@@ -407,6 +432,7 @@ impl Bus for CoreBus<'_> {
     }
     fn store16(&mut self, addr: u32, value: u16) {
         let phys = mask_region(addr);
+        self.charge(phys, 2);
         if Self::is_io(phys) {
             self.io_write16(phys, value);
             return;
@@ -417,6 +443,7 @@ impl Bus for CoreBus<'_> {
     }
     fn store32(&mut self, addr: u32, value: u32) {
         let phys = mask_region(addr);
+        self.charge(phys, 4);
         if Self::is_io(phys) {
             self.io_write32(phys, value);
             return;
@@ -430,6 +457,11 @@ impl Bus for CoreBus<'_> {
         self.mem.write8(addr.wrapping_add(1), b[1]);
         self.mem.write8(addr.wrapping_add(2), b[2]);
         self.mem.write8(addr.wrapping_add(3), b[3]);
+    }
+
+    #[inline]
+    fn set_access_cost(&mut self, cycles: u32) {
+        self.access_cost = cycles;
     }
 }
 
@@ -656,6 +688,7 @@ impl PsxCore {
             sio0: &mut self.sio0,
             cdrom: &mut self.cdrom,
             spu: &mut self.spu,
+            access_cost: 0,
         }
     }
 
@@ -727,7 +760,13 @@ impl PsxCore {
             Command::Reset => self.cpu.reset(),
             Command::StepCpu => self.step_cpu(),
             Command::StepFrame => {
-                for _ in 0..STEPS_PER_FRAME {
+                // Pace by a CPU-cycle budget rather than a fixed instruction
+                // count: with wait-state timing an instruction costs a variable
+                // number of cycles, so a cycle budget keeps the frame duration
+                // stable. `step_cpu` always advances `cpu.cycles` by at least 1,
+                // so this loop always terminates.
+                let target = self.cpu.cycles.wrapping_add(CYCLES_PER_FRAME);
+                while self.cpu.cycles < target {
                     self.step_cpu();
                 }
                 // Once per frame: advance the interlace field and raise VBlank.
@@ -793,19 +832,51 @@ impl PsxCore {
             self.cpu.cycles = self.cpu.cycles.wrapping_add(1);
             return;
         }
-        let mut bus = CoreBus {
-            mem: &mut self.mem,
-            gpu: &mut self.gpu,
-            dma: &mut self.dma,
-            irq: &mut self.irq,
-            timers: &mut self.timers,
-            memctrl: &mut self.memctrl,
-            cache_ctrl: &mut self.cache_ctrl,
-            sio0: &mut self.sio0,
-            cdrom: &mut self.cdrom,
-            spu: &mut self.spu,
+
+        // Cost model: an instruction costs `1 + fetch_wait + data_wait` CPU
+        // cycles. `execute::step` already accounts the base 1 (and the four
+        // devices were ticked by 1 above); here we compute the *extra* wait
+        // states and charge them once, keeping `cpu.cycles` and the device tick
+        // totals in lockstep. `fetch_cycles`/`access_cycles` return the whole
+        // access cost, so each `wait = cost - 1`.
+        //
+        // The instruction fetch cost is computed before building the bus (it
+        // borrows `memctrl`); a cached (KUSEG/KSEG0) fetch is 1 cycle (i-cache
+        // hit model) so `fetch_wait` is 0 in the common case, and a load run
+        // from cached code reports its pure data-access cost — exactly the
+        // `access-time` golden.
+        let fetch_wait = crate::timing::fetch_cycles(self.cpu.pc, &self.memctrl.timing()) - 1;
+
+        let data_cost = {
+            let mut bus = CoreBus {
+                mem: &mut self.mem,
+                gpu: &mut self.gpu,
+                dma: &mut self.dma,
+                irq: &mut self.irq,
+                timers: &mut self.timers,
+                memctrl: &mut self.memctrl,
+                cache_ctrl: &mut self.cache_ctrl,
+                sio0: &mut self.sio0,
+                cdrom: &mut self.cdrom,
+                spu: &mut self.spu,
+                access_cost: 0,
+            };
+            step(&mut self.cpu, &mut bus);
+            bus.access_cost
         };
-        step(&mut self.cpu, &mut bus);
+        let data_wait = data_cost.saturating_sub(1);
+
+        let extra = fetch_wait + data_wait;
+        if extra != 0 {
+            // Charge the wait states to every per-cycle device and to the CPU
+            // cycle counter so a guest timing loop (Timer2, sysclk source) sees
+            // region-aware access latency.
+            self.timers.tick(extra, &mut self.irq);
+            self.cdrom.tick(extra, &mut self.irq);
+            self.spu.tick(extra, &mut self.irq);
+            self.sio0.tick(extra, &mut self.irq);
+            self.cpu.cycles = self.cpu.cycles.wrapping_add(u64::from(extra));
+        }
     }
 
     /// Renders the current display area from VRAM to a 320×240 RGBA buffer.
@@ -1063,6 +1134,7 @@ mod tests {
                 sio0: &mut core.sio0,
                 cdrom: &mut core.cdrom,
                 spu: &mut core.spu,
+                access_cost: 0,
             };
             // Fill red 16x16 at (0,0) through the GP0 port.
             bus.store32(0x1F80_1810, 0x0200_00FF);
@@ -1090,6 +1162,7 @@ mod tests {
                 sio0: &mut core.sio0,
                 cdrom: &mut core.cdrom,
                 spu: &mut core.spu,
+                access_cost: 0,
             };
             bus.load32(0x1F80_1814)
         };
@@ -1112,6 +1185,7 @@ mod tests {
             sio0: &mut core.sio0,
             cdrom: &mut core.cdrom,
             spu: &mut core.spu,
+            access_cost: 0,
         };
         bus.store32(0x1F80_1074, 0x1); // I_MASK = VBlank
         assert_eq!(bus.load32(0x1F80_1074), 0x1);
@@ -1136,6 +1210,7 @@ mod tests {
             sio0: &mut core.sio0,
             cdrom: &mut core.cdrom,
             spu: &mut core.spu,
+            access_cost: 0,
         };
         // SPU register file (0x1F80_1C00) is byte-addressable backing store.
         bus.store16(0x1F80_1C00, 0xABCD);

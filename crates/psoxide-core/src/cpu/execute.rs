@@ -23,6 +23,13 @@ pub trait Bus {
     fn store16(&mut self, addr: u32, value: u16);
     /// Stores a little-endian word.
     fn store32(&mut self, addr: u32, value: u32);
+
+    /// Records the CPU-cycle cost of the most recent *data* access. The default
+    /// is a no-op; the system bus overrides it so the step loop can charge
+    /// region-dependent wait states. Called with 0 by [`step`] right after the
+    /// instruction fetch so a fetch's cost is not mistaken for a data access.
+    #[inline]
+    fn set_access_cost(&mut self, _cycles: u32) {}
 }
 
 // ── Exception codes (CAUSE ExcCode field) ───────────────────────────────
@@ -131,6 +138,11 @@ pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
     }
 
     let raw = bus.load32(cpu.pc);
+    // The fetch above went through the same `load32` a data load would, so it
+    // set the bus access-cost hook. Clear it now: instruction-fetch timing is
+    // charged separately (see `fetch_cycles`), and a data load/store later in
+    // this instruction will set the cost again if one occurs.
+    bus.set_access_cost(0);
 
     // Advance the program counter pair; the delay-slot flag tracks whether the
     // instruction we are about to run sits after a taken branch.
