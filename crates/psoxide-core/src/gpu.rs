@@ -1180,7 +1180,10 @@ impl Gpu {
         stat |= u32::from(self.draw_to_display) << 10;
         stat |= u32::from(self.mask_set) << 11;
         stat |= u32::from(self.mask_check) << 12;
-        stat |= u32::from(self.field) << 13;
+        // bit 13: interlace field. In non-interlaced (240p) mode real hardware
+        // reads this as 1 (matching the 0x1480_2000 GPUSTAT power-on value); in
+        // interlaced mode it follows the per-frame field toggle.
+        stat |= u32::from(if self.interlace { self.field } else { true }) << 13;
         // bit 14 reverse = 0
         stat |= u32::from(self.tex_disable) << 15;
         stat |= u32::from(self.hres2) << 16;

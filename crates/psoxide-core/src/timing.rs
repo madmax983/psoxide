@@ -25,13 +25,16 @@
 //! cycles (see the constants below). These reproduce their `access-time` golden
 //! rows directly.
 //!
-//! ## Documented approximations
+//! ## Golden-match
 //!
-//! The SPU, Expansion 2, and CD-ROM rows diverge from the reference log by 1-4
-//! cycles: the single PSX-SPX formula does not capture every device's exact
-//! strobe mechanics, and per-`ps1-tests` guidance we do **not** special-case the
-//! formula per region. The well-modelled regions (RAM, BIOS, Expansion 1/3,
-//! scratchpad, internal I/O, cache-control) land within ~1 cycle of the log.
+//! [`delay_1st_seq`] splits the wait-state cost into a shared base
+//! (`read_delay + 2`), a fixed first-access setup (`+2`), and a per-*sequential*
+//! bus-turnaround (COM0 recovery + COM2 floating). With that split every
+//! delay-driven region reproduces its `access-time` reference row exactly at the
+//! default Delay/Size words — including the SPU (18/18/39), CD-ROM (8/14/26), and
+//! Expansion 2 (11/26/56) rows that a single first-access-loaded formula
+//! previously missed by 1-4 cycles. The fixed-cost regions (RAM, scratchpad,
+//! internal I/O, cache-control) return their constants directly.
 
 use crate::bus::mask_region;
 
@@ -147,13 +150,33 @@ impl MemTiming {
 /// the Nocash PSX-SPX derivation.
 ///
 /// `delay_size` bit layout: bits0-3 write delay, bits4-7 **read** delay, bit8
-/// recovery (adds COM0-1), bit9 hold (COM1, not modelled — reads use recovery/
-/// floating/pre-strobe only), bit10 floating (adds COM2), bit11 pre-strobe
-/// (raises the minimum via COM3), bit12 bus width (0 = 8-bit, 1 = 16-bit).
-/// `com_delay` bit layout: COM0 in bits0-3, COM1 in 4-7, COM2 in 8-11, COM3 in
-/// 12-15.
+/// recovery (COM0 bus-recovery), bit9 hold (COM1), bit10 floating (COM2 data
+/// float/hold), bit11 pre-strobe (COM3), bit12 bus width (0 = 8-bit,
+/// 1 = 16-bit). `com_delay` bit layout: COM0 in bits0-3, COM1 in 4-7, COM2 in
+/// 8-11, COM3 in 12-15.
 ///
 /// This models the **read** path (the `access-time` test times volatile loads).
+///
+/// ## Model
+///
+/// Every access — first or sequential — pays a shared base of `read_delay + 2`
+/// (the programmed read delay plus a fixed 2-cycle strobe/latch). Beyond that
+/// base the first and sequential accesses diverge:
+///
+/// * The **first** access in a run pays a fixed `+2` address-setup penalty and
+///   *no* bus-turnaround: there is no previous access to recover from, so the
+///   COM0/COM1/COM2 turnaround terms do not apply. Hence `first = read_delay + 4`
+///   uniformly, independent of the recovery/floating/hold flags.
+/// * Each **sequential** access instead pays the programmable bus-turnaround —
+///   COM0 when the recovery bit (bit8) is set and COM2 when the floating bit
+///   (bit10) is set. The hold bit (bit9 / COM1) and the pre-strobe bit
+///   (bit11 / COM3) are decoded but do not add to the read-path cost on
+///   hardware (they govern write-strobe / address-strobe shaping, which the
+///   `access-time` golden's volatile *loads* do not observe).
+///
+/// This reproduces every delay-driven `access-time` golden row exactly at the
+/// default Delay/Size words (BIOS/EXP1 7/13/25, EXP3 6/6/10, SPU 18/18/39,
+/// CD-ROM 8/14/26, EXP2 11/26/56).
 ///
 /// # Examples
 ///
@@ -166,40 +189,31 @@ impl MemTiming {
 pub fn delay_1st_seq(delay_size: u32, com_delay: u32) -> (u32, u32) {
     let com0 = com_delay & 0xF;
     let com2 = (com_delay >> 8) & 0xF;
-    let com3 = (com_delay >> 12) & 0xF;
 
     let read_delay = (delay_size >> 4) & 0xF;
     let recovery = delay_size & (1 << 8) != 0;
     let floating = delay_size & (1 << 10) != 0;
-    let prestrobe = delay_size & (1 << 11) != 0;
 
-    let mut first: u32 = 0;
-    let mut seq: u32 = 0;
-    let mut min: u32 = 0;
+    // Base cost shared by every access: the programmed read delay plus a fixed
+    // 2-cycle strobe/latch.
+    let base = read_delay + 2;
 
+    // The first access pays an extra fixed 2-cycle address setup but no
+    // bus-turnaround (nothing precedes it to recover from).
+    let first = base + 2;
+
+    // Each sequential access instead pays the programmable bus-turnaround: COM0
+    // recovery (bit8) and COM2 floating/data-hold (bit10). The COM1 hold bit
+    // (bit9) and COM3 pre-strobe bit (bit11) are decoded elsewhere but do not
+    // add to the read-path turnaround on hardware.
+    let mut seq = base;
     if recovery {
-        // COM0 is >= 1 in practice; saturating_sub keeps the function total.
-        first += com0.saturating_sub(1);
-        seq += com0.saturating_sub(1);
+        seq += com0;
     }
     if floating {
-        first += com2;
         seq += com2;
     }
-    if prestrobe {
-        min = com3;
-    }
-    if first < 6 {
-        first += 1;
-    }
-    first += read_delay + 2;
-    seq += read_delay + 2;
-    if first < min + 6 {
-        first = min + 6;
-    }
-    if seq < min + 2 {
-        seq = min + 2;
-    }
+
     (first, seq)
 }
 
@@ -338,50 +352,57 @@ mod tests {
     }
 
     #[test]
-    fn access_cycles_spu_in_documented_band() {
-        // Golden SPUCNT: 17.99 / 17.99 / 38.94. Formula gives 21 / 21 / 41
-        // (a documented +2..+3 residual). Assert the band, not the exact log.
+    fn access_cycles_spu_matches_golden() {
+        // Golden SPUCNT: 17.99 / 17.99 / 38.94 (the 32-bit cell is a misaligned
+        // word access on hardware; the whole-cycle bus cost is 39). The
+        // sequential-turnaround split reproduces this exactly: Delay/Size
+        // 0x200931E1 has read_delay=14 + recovery(COM0=5), 16-bit bus, so
+        // first=18, seq=21 => 18 / 18 / 39.
         let t = default_timing();
-        let (c8, c16, c32) = (
-            access_cycles(AccessClass::Spu, 1, &t),
-            access_cycles(AccessClass::Spu, 2, &t),
-            access_cycles(AccessClass::Spu, 4, &t),
+        assert_eq!(delay_1st_seq(SPU_DS, COM_DELAY), (18, 21));
+        assert_eq!(
+            (
+                access_cycles(AccessClass::Spu, 1, &t),
+                access_cycles(AccessClass::Spu, 2, &t),
+                access_cycles(AccessClass::Spu, 4, &t),
+            ),
+            (18, 18, 39)
         );
-        assert!((16..=22).contains(&c8), "spu 8-bit {c8}");
-        assert!((16..=22).contains(&c16), "spu 16-bit {c16}");
-        assert!((35..=43).contains(&c32), "spu 32-bit {c32}");
-        assert_eq!((c8, c16, c32), (21, 21, 41));
     }
 
     #[test]
-    fn access_cycles_cdrom_in_documented_band() {
-        // Golden CDROM_STAT: 8.0 / 14.0 / 25.93. Formula gives 7 / 13 / 25
-        // (a documented -1 residual — the pre-strobe minimum, raised by COM3=1
-        // from COM_DELAY 0x00031125, does not quite reach the reference value).
+    fn access_cycles_cdrom_matches_golden() {
+        // Golden CDROM_STAT: 8.0 / 14.0 / 25.93. Delay/Size 0x00020843 has
+        // read_delay=4 with no recovery/floating on the read path, 8-bit bus, so
+        // first=8, seq=6 => 8 / 14 / 26.
         let t = default_timing();
+        assert_eq!(delay_1st_seq(CDROM_DS, COM_DELAY), (8, 6));
         assert_eq!(
             (
                 access_cycles(AccessClass::Cdrom, 1, &t),
                 access_cycles(AccessClass::Cdrom, 2, &t),
                 access_cycles(AccessClass::Cdrom, 4, &t),
             ),
-            (7, 13, 25)
+            (8, 14, 26)
         );
     }
 
     #[test]
-    fn access_cycles_expansion2_in_documented_band() {
-        // Golden EXPANSION2: 10.99 / 25.99 / 55.98. Formula gives 15 / 29 / 57
-        // (a documented +1..+4 residual — the largest of any region, and the
-        // largest 32-bit cost, preserving the region-aware spread).
+    fn access_cycles_expansion2_matches_golden() {
+        // Golden EXPANSION2: 10.99 / 25.99 / 55.98 — the largest 32-bit cost of
+        // any aligned region. Delay/Size 0x00070777 has read_delay=7 +
+        // recovery(COM0=5) + floating(COM2=1) on the sequential term (the hold
+        // bit is decoded but adds nothing to the read path), 8-bit bus, so
+        // first=11, seq=15 => 11 / 26 / 56.
         let t = default_timing();
+        assert_eq!(delay_1st_seq(EXP2_DS, COM_DELAY), (11, 15));
         assert_eq!(
             (
                 access_cycles(AccessClass::Expansion2, 1, &t),
                 access_cycles(AccessClass::Expansion2, 2, &t),
                 access_cycles(AccessClass::Expansion2, 4, &t),
             ),
-            (15, 29, 57)
+            (11, 26, 56)
         );
     }
 
