@@ -125,6 +125,17 @@ impl Harness {
         let _ = self.core.execute(Command::EjectDisc);
     }
 
+    /// Inserts a memory card into `slot` (`Command::InsertMemoryCard`). `data`
+    /// is padded/truncated to the 128 KB card size by the core.
+    pub fn insert_memory_card(&mut self, slot: u8, data: Vec<u8>) {
+        let _ = self.core.execute(Command::InsertMemoryCard { slot, data });
+    }
+
+    /// Ejects the memory card in `slot`, if any (`Command::EjectMemoryCard`).
+    pub fn eject_memory_card(&mut self, slot: u8) {
+        let _ = self.core.execute(Command::EjectMemoryCard { slot });
+    }
+
     /// Runs `n` CPU instructions.
     pub fn run(&mut self, n: usize) {
         for _ in 0..n {

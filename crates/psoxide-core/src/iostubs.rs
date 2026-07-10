@@ -190,6 +190,266 @@ impl DigitalPad {
     }
 }
 
+/// Size of a PSX memory card in bytes: 1024 sectors × 128 bytes = 128 KB.
+pub const MEMCARD_SIZE: usize = 1024 * 128;
+/// Bytes per memory-card sector (frame).
+pub const MEMCARD_SECTOR_SIZE: usize = 128;
+/// Number of addressable sectors on a memory card.
+pub const MEMCARD_SECTOR_COUNT: u16 = 1024;
+
+/// The command byte a memory-card transfer is currently servicing, latched from
+/// the second byte of the exchange (phase 1). Reset at the start of every
+/// transfer (phase 0) so consecutive commands do not bleed into each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+enum McCommand {
+    /// No command selected yet / unknown command.
+    #[default]
+    None,
+    /// Read sector (0x52).
+    Read,
+    /// Write sector (0x57).
+    Write,
+    /// Get card ID (0x53).
+    GetId,
+}
+
+/// A Sony PSX memory card (SCPH-1020): a 128 KB block device (1024 × 128-byte
+/// sectors) driven over SIO0 with a big-endian 16-bit sector address.
+///
+/// The card implements the Nocash PSX-SPX serial protocol byte-for-byte through
+/// [`MemoryCard::exchange`], which is called once per transfer byte with the
+/// transfer `phase` (byte index within the current command, tracked by the
+/// [`Sio0`] state machine) and the CPU's outgoing `tx` byte. It returns the
+/// response byte the card shifts back and whether it asserts `/ACK` (requesting
+/// the next byte); the final byte of each command clears ACK to end the
+/// transfer.
+///
+/// `flag` starts at `0x08` (the "fresh/unwritten card" bit) and is cleared to
+/// `0x00` after the first successful write. `dirty` tracks whether the image has
+/// been modified since the frontend last flushed it to disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCard {
+    /// The 128 KB card image (1024 × 128-byte sectors).
+    data: Vec<u8>,
+    /// FLAG byte: bit3 (0x08) set = card has not been written since insertion.
+    flag: u8,
+    /// Set when `data` has been modified since the last frontend flush.
+    dirty: bool,
+    /// Command currently being serviced (transient; reset each transfer).
+    #[serde(skip)]
+    cmd: McCommand,
+    /// Sector address accumulated from the MSB/LSB address bytes (transient).
+    #[serde(skip)]
+    addr: u16,
+    /// Per-write staging buffer for the 128 incoming data bytes (transient).
+    #[serde(skip, default = "zero_sector")]
+    write_buf: [u8; MEMCARD_SECTOR_SIZE],
+    /// Checksum byte received during a write command (transient).
+    #[serde(skip)]
+    recv_checksum: u8,
+}
+
+/// A zeroed 128-byte sector buffer (`[u8; 128]` has no `Default` impl, so serde
+/// needs an explicit default for the skipped `write_buf` field).
+fn zero_sector() -> [u8; MEMCARD_SECTOR_SIZE] {
+    [0u8; MEMCARD_SECTOR_SIZE]
+}
+
+impl Default for MemoryCard {
+    fn default() -> Self {
+        Self::blank()
+    }
+}
+
+impl MemoryCard {
+    /// FLAG bit indicating the card has not been written since insertion.
+    const FLAG_FRESH: u8 = 0x08;
+
+    /// Creates a blank (all-zero) 128 KB card with the fresh-card flag set.
+    #[must_use]
+    pub fn blank() -> Self {
+        Self::from_data(vec![0u8; MEMCARD_SIZE])
+    }
+
+    /// Creates a card from an existing image, padding or truncating to the
+    /// 128 KB card size. The fresh-card flag is set and the card starts clean.
+    #[must_use]
+    pub fn from_data(mut data: Vec<u8>) -> Self {
+        data.resize(MEMCARD_SIZE, 0);
+        Self {
+            data,
+            flag: Self::FLAG_FRESH,
+            dirty: false,
+            cmd: McCommand::None,
+            addr: 0,
+            write_buf: [0u8; MEMCARD_SECTOR_SIZE],
+            recv_checksum: 0,
+        }
+    }
+
+    /// Returns a clone of the card image plus its dirty flag.
+    #[must_use]
+    pub fn image(&self) -> (Vec<u8>, bool) {
+        (self.data.clone(), self.dirty)
+    }
+
+    /// Clears the dirty flag (call after flushing the image to disk).
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Reads a sector's 128 bytes, or all zeros if `addr` is out of range.
+    fn sector(&self, addr: u16) -> [u8; MEMCARD_SECTOR_SIZE] {
+        let mut out = [0u8; MEMCARD_SECTOR_SIZE];
+        if addr < MEMCARD_SECTOR_COUNT {
+            let base = addr as usize * MEMCARD_SECTOR_SIZE;
+            out.copy_from_slice(&self.data[base..base + MEMCARD_SECTOR_SIZE]);
+        }
+        out
+    }
+
+    /// Computes the protocol checksum of a sector: MSB xor LSB xor all 128 data
+    /// bytes.
+    fn checksum(addr: u16, sector: &[u8; MEMCARD_SECTOR_SIZE]) -> u8 {
+        let mut chk = (addr >> 8) as u8 ^ (addr & 0xFF) as u8;
+        for &b in sector.iter() {
+            chk ^= b;
+        }
+        chk
+    }
+
+    /// Performs one full-duplex byte exchange, indexed by the transfer `phase`
+    /// (byte index within the command) with the CPU's outgoing `tx` byte.
+    /// Returns `(response, ack)`; `ack == false` ends the transfer.
+    fn exchange(&mut self, phase: u8, tx: u8) -> (u8, bool) {
+        // Phase 0 is the address byte (0x81) that selected this card; reset the
+        // per-command scratch so consecutive commands start clean.
+        if phase == 0 {
+            self.cmd = McCommand::None;
+            self.addr = 0;
+            self.recv_checksum = 0;
+            return (0xFF, true);
+        }
+        // Phase 1 latches the command byte.
+        if phase == 1 {
+            self.cmd = match tx {
+                0x52 => McCommand::Read,
+                0x57 => McCommand::Write,
+                0x53 => McCommand::GetId,
+                // Unknown command: no ACK, transfer ends.
+                _ => return (0xFF, false),
+            };
+            return (self.flag, true);
+        }
+        match self.cmd {
+            McCommand::Read => self.exchange_read(phase, tx),
+            McCommand::Write => self.exchange_write(phase, tx),
+            McCommand::GetId => self.exchange_get_id(phase),
+            // Not reachable (phase >= 2 always has a latched command).
+            McCommand::None => (0xFF, false),
+        }
+    }
+
+    /// Read command (0x52) byte exchange for phases >= 2.
+    fn exchange_read(&mut self, phase: u8, tx: u8) -> (u8, bool) {
+        match phase {
+            2 => (0x5A, true), // ID1
+            3 => (0x5D, true), // ID2
+            4 => {
+                self.addr = u16::from(tx) << 8; // address MSB
+                (0x00, true)
+            }
+            5 => {
+                self.addr |= u16::from(tx); // address LSB
+                (0x00, true)
+            }
+            6 => (0x5C, true),                     // ack 1
+            7 => (0x5D, true),                     // ack 2
+            8 => ((self.addr >> 8) as u8, true),   // confirmed address MSB
+            9 => ((self.addr & 0xFF) as u8, true), // confirmed address LSB
+            10..=137 => {
+                // 128 data bytes (zeros when the sector is out of range).
+                let idx = (phase - 10) as usize;
+                (self.sector(self.addr)[idx], true)
+            }
+            138 => (Self::checksum(self.addr, &self.sector(self.addr)), true),
+            139 => {
+                // End byte: 'G' (0x47) for a good sector, 0xFF for bad address.
+                let end = if self.addr < MEMCARD_SECTOR_COUNT {
+                    0x47
+                } else {
+                    0xFF
+                };
+                (end, false)
+            }
+            _ => (0xFF, false),
+        }
+    }
+
+    /// Write command (0x57) byte exchange for phases >= 2.
+    fn exchange_write(&mut self, phase: u8, tx: u8) -> (u8, bool) {
+        match phase {
+            2 => (0x5A, true),
+            3 => (0x5D, true),
+            4 => {
+                self.addr = u16::from(tx) << 8;
+                (0x00, true)
+            }
+            5 => {
+                self.addr |= u16::from(tx);
+                (0x00, true)
+            }
+            6..=133 => {
+                // Receive 128 data bytes into the staging buffer.
+                self.write_buf[(phase - 6) as usize] = tx;
+                (0x00, true)
+            }
+            134 => {
+                self.recv_checksum = tx; // received checksum
+                (0x00, true)
+            }
+            135 => (0x5C, true), // ack 1
+            136 => (0x5D, true), // ack 2
+            137 => (self.commit_write(), false),
+            _ => (0xFF, false),
+        }
+    }
+
+    /// Commits a staged write, returning the end status byte:
+    /// - 0xFF (bad sector) if the address is out of range,
+    /// - 0x4E ('N', bad checksum) if the received checksum mismatches,
+    /// - 0x47 ('G', good) otherwise (writes the sector, sets dirty, clears FLAG).
+    fn commit_write(&mut self) -> u8 {
+        if self.addr >= MEMCARD_SECTOR_COUNT {
+            return 0xFF;
+        }
+        let expected = Self::checksum(self.addr, &self.write_buf);
+        if expected != self.recv_checksum {
+            return 0x4E;
+        }
+        let base = self.addr as usize * MEMCARD_SECTOR_SIZE;
+        self.data[base..base + MEMCARD_SECTOR_SIZE].copy_from_slice(&self.write_buf);
+        self.dirty = true;
+        self.flag &= !Self::FLAG_FRESH;
+        0x47
+    }
+
+    /// Get-ID command (0x53) byte exchange for phases >= 2.
+    fn exchange_get_id(&mut self, phase: u8) -> (u8, bool) {
+        match phase {
+            2 => (0x5A, true),
+            3 => (0x5D, true),
+            4 => (0x5C, true),
+            5 => (0x5D, true),
+            6 => (0x04, true),
+            7 => (0x00, true),
+            8 => (0x00, true),
+            9 => (0x80, false),
+            _ => (0xFF, false),
+        }
+    }
+}
+
 /// A device that can be attached to a controller/memory-card slot. Enum
 /// dispatch (family pattern, no trait objects) so analog / DualShock variants
 /// can be added later without changing the SIO0 transfer plumbing.
@@ -271,6 +531,16 @@ pub struct Sio0 {
     active: TransferTarget,
     /// The two slot devices (slot 0 / slot 1), selected by JOY_CTRL bit 13.
     pads: [PadDevice; 2],
+    /// The memory card in each slot (0 / 1), or `None` when the slot is empty.
+    #[serde(default = "no_cards")]
+    cards: [Option<MemoryCard>; 2],
+}
+
+/// serde default for [`Sio0::cards`]: both slots empty. (`[None, None]` cannot
+/// be spelled as a `#[serde(default)]` on the field because `Option<MemoryCard>`
+/// arrays do not implement `Default` for the array itself.)
+fn no_cards() -> [Option<MemoryCard>; 2] {
+    [None, None]
 }
 
 impl Default for Sio0 {
@@ -314,6 +584,40 @@ impl Sio0 {
             phase: 0,
             active: TransferTarget::None,
             pads: [PadDevice::default(), PadDevice::default()],
+            cards: [None, None],
+        }
+    }
+
+    /// Inserts a memory card built from `data` (padded/truncated to 128 KB) into
+    /// `slot` (0 or 1). Out-of-range slots are ignored.
+    pub fn insert_card(&mut self, slot: usize, data: Vec<u8>) {
+        if let Some(c) = self.cards.get_mut(slot) {
+            *c = Some(MemoryCard::from_data(data));
+        }
+    }
+
+    /// Ejects the memory card in `slot`, if any. Out-of-range slots are ignored.
+    pub fn eject_card(&mut self, slot: usize) {
+        if let Some(c) = self.cards.get_mut(slot) {
+            *c = None;
+        }
+    }
+
+    /// Returns the memory-card image and its dirty flag for `slot`, or `None`
+    /// when no card is inserted (or the slot is out of range).
+    #[must_use]
+    pub fn card_image(&self, slot: usize) -> Option<(Vec<u8>, bool)> {
+        self.cards
+            .get(slot)
+            .and_then(|c| c.as_ref())
+            .map(MemoryCard::image)
+    }
+
+    /// Clears the dirty flag on the memory card in `slot` (after a frontend
+    /// flush). A no-op when no card is inserted.
+    pub fn clear_card_dirty(&mut self, slot: usize) {
+        if let Some(Some(card)) = self.cards.get_mut(slot) {
+            card.clear_dirty();
         }
     }
 
@@ -403,9 +707,14 @@ impl Sio0 {
         let slot = ((self.ctrl >> 13) & 1) as usize;
         let (resp, ack) = match self.active {
             TransferTarget::Pad => self.pads[slot].exchange(self.phase),
-            // No memory card is present: answer open-bus and never ACK, so a
-            // BIOS/game probe (address 0x81) sees "no card" and moves on.
-            TransferTarget::MemoryCard | TransferTarget::None => (0xFF, false),
+            TransferTarget::MemoryCard => match self.cards[slot].as_mut() {
+                // A card is present: run the serial protocol byte exchange.
+                Some(card) => card.exchange(self.phase, tx),
+                // No card in this slot: answer open-bus and never ACK, so a
+                // BIOS/game probe (address 0x81) sees "no card" and moves on.
+                None => (0xFF, false),
+            },
+            TransferTarget::None => (0xFF, false),
         };
         self.push_rx(resp);
         self.ack_level = false;
@@ -678,5 +987,235 @@ mod tests {
     fn sio0_stat_idle_is_five() {
         let mut sio = Sio0::new();
         assert_eq!(sio.read32(0x1F80_1044), 0x5);
+    }
+
+    // ── Memory-card tests ───────────────────────────────────────────────────
+
+    /// Drives one full SIO0 memory-card command through the register file,
+    /// returning the device's per-byte responses. Reuses the same write-TX /
+    /// tick-ACK / read-RX sequence a game's card driver performs.
+    fn card_command(sio: &mut Sio0, irq: &mut Irq, tx: &[u8]) -> Vec<u8> {
+        let mut resp = Vec::with_capacity(tx.len());
+        for &b in tx {
+            resp.push(pad_exchange(sio, irq, b));
+        }
+        resp
+    }
+
+    /// A blank card in slot 0 with JOY_CTRL set to TXEN | /DTR | ack-IEN.
+    fn sio_with_card() -> (Sio0, Irq) {
+        let mut sio = Sio0::new();
+        let irq = Irq::new();
+        sio.insert_card(0, vec![0u8; MEMCARD_SIZE]);
+        sio.write16(0x1F80_104A, 0x1003);
+        (sio, irq)
+    }
+
+    #[test]
+    fn memory_card_get_id_sequence() {
+        let (mut sio, mut irq) = sio_with_card();
+        // 0x81 select, 0x53 Get-ID, then eight trailing bytes.
+        let tx = [0x81u8, 0x53, 0, 0, 0, 0, 0, 0, 0, 0];
+        let resp = card_command(&mut sio, &mut irq, &tx);
+        // phase0=FF, phase1=FLAG(0x08), then 5A 5D 5C 5D 04 00 00 80.
+        assert_eq!(
+            resp,
+            vec![0xFF, 0x08, 0x5A, 0x5D, 0x5C, 0x5D, 0x04, 0x00, 0x00, 0x80]
+        );
+    }
+
+    #[test]
+    fn memory_card_flag_is_fresh_before_write() {
+        let (mut sio, mut irq) = sio_with_card();
+        // The FLAG byte comes back at phase 1 of any command; use a full Get-ID.
+        let resp = card_command(&mut sio, &mut irq, &get_id_tx());
+        assert_eq!(resp[1], 0x08, "fresh card FLAG has bit3 set");
+    }
+
+    /// Builds the 138-byte write-command TX stream for `sector` at `addr` with
+    /// the given trailing `checksum` byte.
+    fn write_tx(addr: u16, sector: &[u8; 128], checksum: u8) -> Vec<u8> {
+        let mut tx = vec![
+            0x81u8,
+            0x57,
+            0x00,
+            0x00,
+            (addr >> 8) as u8,
+            (addr & 0xFF) as u8,
+        ];
+        tx.extend_from_slice(sector);
+        tx.push(checksum); // received checksum
+        tx.extend_from_slice(&[0x00, 0x00, 0x00]); // ack1, ack2, end
+        tx
+    }
+
+    /// Builds the 140-byte read-command TX stream for `addr` (phases 0..=139).
+    fn read_tx(addr: u16) -> Vec<u8> {
+        let mut tx = vec![
+            0x81u8,
+            0x52,
+            0x00,
+            0x00,
+            (addr >> 8) as u8,
+            (addr & 0xFF) as u8,
+        ];
+        // ack1, ack2, confirm-hi, confirm-lo, 128 data, checksum, end = 134 more.
+        tx.extend(std::iter::repeat_n(0x00u8, 134));
+        tx
+    }
+
+    /// The complete 10-byte Get-ID TX stream (phases 0..=9); returns the FLAG
+    /// byte (response index 1) as its side-observable state without leaving the
+    /// card mid-command.
+    fn get_id_tx() -> [u8; 10] {
+        [0x81, 0x53, 0, 0, 0, 0, 0, 0, 0, 0]
+    }
+
+    fn checksum(addr: u16, sector: &[u8; 128]) -> u8 {
+        let mut c = (addr >> 8) as u8 ^ (addr & 0xFF) as u8;
+        for &b in sector.iter() {
+            c ^= b;
+        }
+        c
+    }
+
+    #[test]
+    fn memory_card_write_then_read_round_trip() {
+        let (mut sio, mut irq) = sio_with_card();
+        let addr = 0x0003u16;
+        let mut sector = [0u8; 128];
+        for (i, b) in sector.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0xA5;
+        }
+        let chk = checksum(addr, &sector);
+
+        // Write.
+        let wresp = card_command(&mut sio, &mut irq, &write_tx(addr, &sector, chk));
+        assert_eq!(*wresp.last().unwrap(), 0x47, "good write ends with 'G'");
+
+        // FLAG is cleared after a successful write: probe it via a full Get-ID.
+        let idresp = card_command(&mut sio, &mut irq, &get_id_tx());
+        assert_eq!(idresp[1], 0x00, "FLAG fresh bit cleared after write");
+
+        // Read back and check the data + checksum + end byte.
+        let rresp = card_command(&mut sio, &mut irq, &read_tx(addr));
+        // Layout: [0]=FF [1]=FLAG [2]=5A [3]=5D [4]=00 [5]=00 [6]=5C [7]=5D
+        //         [8]=confirm-hi [9]=confirm-lo [10..138]=data [138]=checksum
+        //         [139]=end.
+        assert_eq!(rresp[8], (addr >> 8) as u8, "confirmed addr MSB");
+        assert_eq!(rresp[9], (addr & 0xFF) as u8, "confirmed addr LSB");
+        assert_eq!(&rresp[10..138], &sector[..], "read data matches written");
+        assert_eq!(rresp[138], chk, "checksum matches");
+        assert_eq!(rresp[139], 0x47, "good read ends with 'G'");
+    }
+
+    #[test]
+    fn memory_card_bad_checksum_rejects_write() {
+        let (mut sio, mut irq) = sio_with_card();
+        let addr = 0x0005u16;
+        let sector = [0x11u8; 128];
+        let good = checksum(addr, &sector);
+        // Send a deliberately wrong checksum.
+        let wresp = card_command(&mut sio, &mut irq, &write_tx(addr, &sector, good ^ 0xFF));
+        assert_eq!(*wresp.last().unwrap(), 0x4E, "bad checksum ends with 'N'");
+
+        // Sector must be unchanged (still zeros): read it back.
+        let rresp = card_command(&mut sio, &mut irq, &read_tx(addr));
+        assert!(rresp[10..138].iter().all(|&b| b == 0), "sector untouched");
+        // FLAG must still be fresh (no successful write happened).
+        let idresp = card_command(&mut sio, &mut irq, &get_id_tx());
+        assert_eq!(idresp[1], 0x08, "FLAG still fresh after rejected write");
+    }
+
+    #[test]
+    fn memory_card_out_of_range_write_and_read() {
+        let (mut sio, mut irq) = sio_with_card();
+        let addr = 0x0400u16; // first out-of-range sector (== 1024).
+        let sector = [0x22u8; 128];
+        let chk = checksum(addr, &sector);
+        let wresp = card_command(&mut sio, &mut irq, &write_tx(addr, &sector, chk));
+        assert_eq!(*wresp.last().unwrap(), 0xFF, "out-of-range write ends 0xFF");
+
+        // Read of an out-of-range sector: zeros + 0xFF end byte.
+        let rresp = card_command(&mut sio, &mut irq, &read_tx(addr));
+        assert!(rresp[10..138].iter().all(|&b| b == 0), "OOR read is zeros");
+        assert_eq!(rresp[139], 0xFF, "out-of-range read ends 0xFF");
+    }
+
+    #[test]
+    fn memory_card_dirty_tracking_and_clear() {
+        let mut sio = Sio0::new();
+        let mut irq = Irq::new();
+        sio.insert_card(0, vec![0u8; MEMCARD_SIZE]);
+        sio.write16(0x1F80_104A, 0x1003);
+        // Freshly inserted: not dirty.
+        assert_eq!(sio.card_image(0).map(|(_, d)| d), Some(false));
+
+        let addr = 0x0001u16;
+        let sector = [0x7Fu8; 128];
+        let chk = checksum(addr, &sector);
+        card_command(&mut sio, &mut irq, &write_tx(addr, &sector, chk));
+        assert_eq!(sio.card_image(0).map(|(_, d)| d), Some(true), "dirty set");
+
+        // The image should reflect the written sector.
+        let (image, _) = sio.card_image(0).unwrap();
+        assert_eq!(&image[128..256], &sector[..], "image reflects write");
+
+        sio.clear_card_dirty(0);
+        assert_eq!(
+            sio.card_image(0).map(|(_, d)| d),
+            Some(false),
+            "dirty cleared"
+        );
+    }
+
+    #[test]
+    fn memory_card_unknown_command_no_ack() {
+        let (mut sio, mut irq) = sio_with_card();
+        // Address select (ACKs) then an unknown command byte (no ACK).
+        let r0 = pad_exchange(&mut sio, &mut irq, 0x81);
+        assert_eq!(r0, 0xFF);
+        // No IRQ pending yet is fine; drive the unknown command.
+        let r1 = pad_exchange(&mut sio, &mut irq, 0x99);
+        assert_eq!(r1, 0xFF, "unknown command returns open-bus");
+        // The transfer ended (no ACK): the next byte restarts at phase 0.
+    }
+
+    #[test]
+    fn memory_card_insert_eject() {
+        let mut sio = Sio0::new();
+        assert!(sio.card_image(0).is_none(), "no card at power-on");
+        sio.insert_card(0, vec![0u8; MEMCARD_SIZE]);
+        assert!(sio.card_image(0).is_some(), "card present after insert");
+        sio.eject_card(0);
+        assert!(sio.card_image(0).is_none(), "card gone after eject");
+        // Slot 1 stays empty throughout.
+        assert!(sio.card_image(1).is_none());
+    }
+
+    #[test]
+    fn memory_card_probe_absent_slot_no_ack() {
+        // A card in slot 0 must not answer for a probe of empty slot 1.
+        let mut sio = Sio0::new();
+        let mut irq = Irq::new();
+        sio.insert_card(0, vec![0u8; MEMCARD_SIZE]);
+        // Slot select bit 13 -> slot 1, plus TXEN | /DTR | ack-IEN.
+        sio.write16(0x1F80_104A, 0x1003 | (1 << 13));
+        sio.write8(0x1F80_1040, 0x81);
+        sio.tick(1000, &mut irq);
+        assert!(!irq.pending(), "empty slot 1 does not ACK");
+        assert_eq!(sio.read8(0x1F80_1040), 0xFF);
+    }
+
+    #[test]
+    fn memory_card_from_data_pads_and_truncates() {
+        let short = MemoryCard::from_data(vec![0xAB; 10]);
+        let (img, _) = short.image();
+        assert_eq!(img.len(), MEMCARD_SIZE, "short image padded to 128 KB");
+        assert_eq!(&img[0..10], &[0xAB; 10]);
+        assert!(img[10..].iter().all(|&b| b == 0), "padding is zero");
+
+        let long = MemoryCard::from_data(vec![0xCD; MEMCARD_SIZE + 100]);
+        assert_eq!(long.image().0.len(), MEMCARD_SIZE, "long image truncated");
     }
 }
