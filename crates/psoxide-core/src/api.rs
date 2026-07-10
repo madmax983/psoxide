@@ -973,8 +973,8 @@ impl PsxCore {
         self.cdrom.tick(1, &mut self.irq);
         // Hand any CD-audio frames the CD-ROM controller decoded this cycle
         // (XA-ADPCM / CD-DA) to the SPU, which mixes them through its CD input.
-        let cd_frames = self.cdrom.take_cd_audio();
-        if !cd_frames.is_empty() {
+        if self.cdrom.has_cd_audio() {
+            let cd_frames = self.cdrom.take_cd_audio();
             self.spu.push_cd_audio_samples(&cd_frames);
         }
         // Advance the SPU by one CPU cycle: it emits an audio sample every 768

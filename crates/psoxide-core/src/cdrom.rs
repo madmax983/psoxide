@@ -269,6 +269,15 @@ impl Cdrom {
         self.cd_audio.drain(..).collect()
     }
 
+    /// Returns `true` if any decoded CD-audio frames are queued. Callers use
+    /// this to avoid the per-instruction `take_cd_audio` Vec allocation when the
+    /// drive has produced nothing (the common idle case).
+    #[inline]
+    #[must_use]
+    pub fn has_cd_audio(&self) -> bool {
+        !self.cd_audio.is_empty()
+    }
+
     /// Returns `true` if `phys` falls in the CD-ROM register window.
     #[must_use]
     pub fn contains(phys: u32) -> bool {
