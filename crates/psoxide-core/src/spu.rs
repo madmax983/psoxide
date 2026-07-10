@@ -757,16 +757,30 @@ impl Spu {
     /// sample every [`CYCLES_PER_SAMPLE`] cycles and raising [`IrqLine::Spu`]
     /// when an enabled IRQ latches.
     pub fn tick(&mut self, cycles: u32, irq: &mut Irq) {
-        for _ in 0..cycles {
-            self.sample_timer += 1;
-            if self.sample_timer >= CYCLES_PER_SAMPLE {
-                self.sample_timer -= CYCLES_PER_SAMPLE;
-                self.generate_sample();
-            }
-            if self.irq_pending_raise {
-                irq.set(IrqLine::Spu);
-                self.irq_pending_raise = false;
-            }
+        if cycles == 0 {
+            return;
+        }
+        // Closed-form advance of the per-cycle loop. `sample_timer` accumulates
+        // `cycles` and emits one sample per `CYCLES_PER_SAMPLE`, so both the
+        // number of `generate_sample` calls and the residual `sample_timer` are
+        // identical to the original loop. `sample_timer` stays < CYCLES_PER_SAMPLE
+        // between calls, so `sample_timer + cycles` cannot overflow u32 for any
+        // realistic `cycles` (single-digit wait states, or a few 100k in tests).
+        self.sample_timer += cycles;
+        while self.sample_timer >= CYCLES_PER_SAMPLE {
+            self.sample_timer -= CYCLES_PER_SAMPLE;
+            self.generate_sample();
+        }
+        // `irq_pending_raise` is only ever set true (by note_decode_irq, reached
+        // through generate_sample or a CPU-side write) and never read by
+        // generate_sample, so ordering of the raise within the call is
+        // unobservable — I_STAT is only sampled at instruction boundaries. The
+        // original loop clears the flag on every iteration, ending false with the
+        // Spu line set iff the flag was ever true; raising once here at the end
+        // reproduces that end-state exactly.
+        if self.irq_pending_raise {
+            irq.set(IrqLine::Spu);
+            self.irq_pending_raise = false;
         }
     }
 
