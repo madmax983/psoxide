@@ -306,24 +306,28 @@ fn access_time_reproduces_region_timing() {
         within(io, [3.0, 3.0, 3.0]);
     }
 
-    // (c) The delay-driven external devices are present and non-degenerate: they
-    // carry real programmable wait states far above the flat 3-cycle internal
-    // I/O baseline, proving region-awareness. The single PSX-SPX formula diverges
-    // from the golden here by a documented margin (do NOT special-case it):
-    //   CDROM  produced 7/13/25  vs golden 8.0/14.0/25.93   (~ -1)
-    //   SPU    produced 21/21/…  vs golden 17.99/17.99/…     (~ +3)
-    //   EXP2   produced 15/29/57 vs golden 10.99/25.99/55.98 (~ +1..+4)
-    // (SPUCNT's 32-bit cell is a misaligned-word access — an address-error trap
-    // whose cost is HLE exception overhead, not a bus access, so it is excluded.)
-    let cdrom = get("CDROM_STAT");
+    // (c) The delay-driven external devices reproduce their golden rows exactly.
+    // The sequential-turnaround split in `delay_1st_seq` closes the former 1-4
+    // cycle residuals, so these now hold to the same ±1.5 whole-cycle tolerance
+    // as the well-modelled regions:
+    //   CDROM produced 8/14/26  vs golden 8.0/14.0/25.93
+    //   SPU   produced 18/18/…  vs golden 17.99/17.99/…
+    //   EXP2  produced 11/26/56 vs golden 10.99/25.99/55.98
+    within("CDROM_STAT", [8.0, 14.0, 25.93]);
+    within("EXPANSION2", [10.99, 25.99, 55.98]);
+    // SPUCNT's 32-bit cell is a misaligned-word access — an address-error trap
+    // whose cost is HLE exception overhead, not a bus access — so only the 8- and
+    // 16-bit read cells are checked against the golden.
     let spu = get("SPUCNT");
+    for (w, golden) in [(0usize, 17.99f64), (1, 17.99)] {
+        let delta = (spu[w] as f64 - golden).abs();
+        assert!(
+            delta <= 1.5 + 1e-9,
+            "SPUCNT width{w}: produced {} vs golden {golden} (Δ{delta:.2} > 1.5)\n{tty}",
+            spu[w],
+        );
+    }
     let exp2 = get("EXPANSION2");
-    assert!(cdrom[0] >= 6, "CDROM_STAT degenerate: {cdrom:?}\n{tty}");
-    assert!(
-        spu[0] >= 15 && spu[1] >= 15,
-        "SPUCNT degenerate: {spu:?}\n{tty}"
-    );
-    assert!(exp2[0] >= 10, "EXPANSION2 degenerate: {exp2:?}\n{tty}");
 
     // (d) The region-aware spread the whole model exists to produce:
     //   BIOS-32 (25) > RAM-32 (5) > SCRATCHPAD-32 (0), and Expansion 2 carries
