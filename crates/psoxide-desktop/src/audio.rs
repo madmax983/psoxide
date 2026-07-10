@@ -31,6 +31,13 @@ pub struct AudioOutput {
     sink: Sink,
     _stream: OutputStream,
     _handle: OutputStreamHandle,
+    /// Count of per-frame chunks dropped by backpressure (sink already full).
+    /// The desktop HUD surfaces this as the audio "underruns" figure: a rising
+    /// count means the host is falling behind / the buffer is saturating.
+    dropped: u64,
+    /// Count of frames where the sink ran dry (nothing queued) — a starved
+    /// buffer, the other side of the same latency budget.
+    starved: u64,
 }
 
 impl AudioOutput {
@@ -58,19 +65,42 @@ impl AudioOutput {
             sink,
             _stream: stream,
             _handle: handle,
+            dropped: 0,
+            starved: 0,
         })
     }
 
     /// Queues a chunk of interleaved-stereo samples for playback.
     ///
     /// Applies backpressure: if the sink already holds [`MAX_QUEUED_BUFFERS`]
-    /// chunks the samples are dropped to bound latency. An empty chunk is
-    /// ignored.
-    pub fn queue(&self, samples: Vec<i16>) {
-        if samples.is_empty() || self.sink.len() >= MAX_QUEUED_BUFFERS {
+    /// chunks the samples are dropped to bound latency (and the drop is
+    /// counted). An empty chunk is ignored.
+    pub fn queue(&mut self, samples: Vec<i16>) {
+        // A dry sink at the top of a frame means the buffer starved since last
+        // frame — the underrun side of the latency budget.
+        if self.sink.empty() {
+            self.starved = self.starved.saturating_add(1);
+        }
+        if samples.is_empty() {
+            return;
+        }
+        if self.sink.len() >= MAX_QUEUED_BUFFERS {
+            self.dropped = self.dropped.saturating_add(1);
             return;
         }
         self.sink
             .append(SamplesBuffer::new(CHANNELS, SAMPLE_RATE, samples));
+    }
+
+    /// Number of underrun-ish events for the HUD: dropped (overrun) plus
+    /// starved (underrun) chunks. Both indicate the audio pacing is off.
+    #[must_use]
+    pub fn underruns(&self) -> u64 {
+        self.dropped.saturating_add(self.starved)
+    }
+
+    /// Stops playback and drops any queued audio, for a clean shutdown.
+    pub fn shutdown(&self) {
+        self.sink.stop();
     }
 }
