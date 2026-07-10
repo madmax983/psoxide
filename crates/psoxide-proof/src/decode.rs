@@ -145,3 +145,5 @@ proof fn decode_class_is_total(op: u32)
 }
 
 } // verus!
+
+fn main() {}
