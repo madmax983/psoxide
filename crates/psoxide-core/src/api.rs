@@ -341,6 +341,9 @@ impl CoreBus<'_> {
 
     fn io_read32(&mut self, phys: u32) -> u32 {
         match phys {
+            // Expansion region 2 (debug board) is unpopulated: reads float the
+            // bus high (all-ones open bus).
+            0x1F80_2000..=0x1F80_2FFF => 0xFFFF_FFFF,
             0x1F80_1810 => self.gpu.gpuread(),
             0x1F80_1814 => self.gpu.gpustat(),
             0x1F80_1070 => self.irq.read_stat(),
@@ -380,6 +383,9 @@ impl CoreBus<'_> {
 
     fn io_read16(&mut self, phys: u32) -> u16 {
         match phys {
+            // Expansion region 2 open bus (see `io_read32`).
+            0x1F80_2000..=0x1F80_2FFF => 0xFFFF,
+            0x1F80_1814 => self.gpu.gpustat() as u16,
             0x1F80_1070 => self.irq.read_stat() as u16,
             0x1F80_1074 => self.irq.read_mask() as u16,
             TIMERS_BASE..=TIMERS_END => self.timers.read16(phys),
@@ -409,6 +415,8 @@ impl CoreBus<'_> {
 
     fn io_read8(&mut self, phys: u32) -> u8 {
         match phys {
+            // Expansion region 2 open bus (see `io_read32`).
+            0x1F80_2000..=0x1F80_2FFF => 0xFF,
             _ if Sio0::contains(phys) => self.sio0.read8(phys),
             _ if Cdrom::contains(phys) => self.cdrom.read8(phys),
             _ if Spu::contains(phys) => self.spu.read8(phys),
