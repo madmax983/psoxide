@@ -8,6 +8,26 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   - Frontends drive via `Command` enum, poll via `CoreQuery`
   - Extract framebuffer: `core.framebuffer_rgba()` (renders the GPU display area from VRAM, 320x240 RGBA)
   - All state serializable for snapshots (`save_state`/`load_state`)
+  - **Paused semantics**: `Command::StepFrame` is a **no-op while paused**
+    (no cycle advance, no VBlank), so a frontend can call it every host frame
+    without a pause guard of its own. `Command::FrameStep` advances exactly one
+    frame **even while paused** (the single-step control) and leaves the pause
+    state itself unchanged.
+  - **Snapshot identity + compat**: `CoreSnapshot` carries identity metadata —
+    `core_version` (`CARGO_PKG_VERSION`), `bios_hash`, `disc_hash` (cheap stable
+    `DefaultHasher` digests of the loaded BIOS / mounted disc image, `None` when
+    absent). `load_state_checked` validates these against the running core and
+    returns a typed `Result<LoadStateOk, LoadStateError>`
+    (`BiosMismatch`/`DiscMismatch`/`VersionMismatch`; the machine is left
+    untouched on `Err`). Backward compatible: all three metadata fields (and the
+    new SPU sample counters) are `#[serde(default)]`, so a legacy `.ss` file with
+    no metadata still loads and is reported as `LoadStateOk::LoadedLegacy`.
+    `load_state` remains the unvalidated force-apply path (tests / override).
+  - **Audio-pacing counters**: `CoreQuery::AudioStatus` → `AudioStatus`
+    (`queued_sample_pairs` SPU output-buffer fill, monotonic `samples_produced`
+    / `samples_dropped`, and the monotonic `emulated_cycles` clock). Counters
+    only — the core does no host-side frame pacing; a HUD derives fps / speed /
+    audio health from deltas over wall time.
 - **psoxide-config**: TOML config, `PsxConfig::load_or_default()`
 - **psoxide-desktop**: CLI frontend. Winit + Pixels + rodio (SPU audio
   playback; falls back to silent if no audio device). Keyboard and gilrs gamepad
@@ -15,8 +35,12 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   run loop also provides desktop-polish controls: save states (`save_state`/
   `load_state` serde snapshots written beside the content as `<stem>.ss<slot>`,
   slots 1-9), pause/frame-step/fast-forward/reset, fullscreen + window rescale,
-  a title-bar HUD (fps / emulation-speed% / audio-underruns), a ~60fps frontend
-  frame pacer, and memory-card + config flush on every exit path. Runtime
+  a title-bar HUD (fps / emulation-speed% / audio buffer + drops, all read from
+  core counters via `CoreQuery::AudioStatus` — speed is the emulated-cycle delta
+  vs the real CPU clock), a ~60fps frontend frame pacer, and memory-card +
+  config flush on every exit path. Pause is handled by the core (`StepFrame`
+  no-ops while paused; frame-step issues `Command::FrameStep`) and load-state
+  presents the core's typed `LoadStateError`. Runtime
   keybindings and last-used paths persist through `psoxide-config`
   (`PsxConfig::save`); CLI flags override the config.
 

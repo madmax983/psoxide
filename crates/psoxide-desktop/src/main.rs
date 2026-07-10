@@ -28,9 +28,10 @@ use clap::{Parser, Subcommand};
 use gilrs::{Axis, Button as PadButton, EventType, Gilrs};
 use pixels::{Pixels, SurfaceTexture};
 use psoxide_config::PsxConfig;
-use psoxide_core::api::FRAMES_PER_SECOND;
+use psoxide_core::api::{CPU_CLOCK_HZ, FRAMES_PER_SECOND};
 use psoxide_core::{
-    Button, Command, ControllerKind, CoreQuery, FRAME_HEIGHT, FRAME_WIDTH, PsxCore, QueryResult,
+    Button, Command, ControllerKind, CoreQuery, FRAME_HEIGHT, FRAME_WIDTH, LoadStateError,
+    LoadStateOk, PsxCore, QueryResult,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -270,6 +271,7 @@ fn cmd_run(
         fps_window_start: Instant::now(),
         fps_window_frames: 0,
         hud_fps: 0.0,
+        last_hud_cycles: 0,
     };
     event_loop.run_app(&mut app).context("event loop error")?;
     Ok(())
@@ -328,8 +330,9 @@ struct App {
     config_path: PathBuf,
     /// Base path for save-state slot files (disc, else EXE, else BIOS).
     save_base: PathBuf,
-    /// Whether emulation stepping is paused (frontend-driven; the core's
-    /// `StepFrame` does not itself honour a paused flag).
+    /// UI mirror of the core's pause state (drives the HUD marker and the
+    /// frame-step gate). The core itself gates `StepFrame`, so this is just
+    /// intent state, not a stepping workaround.
     paused: bool,
     /// Whether fast-forward is held (uncaps the frame pacer).
     fast_forward: bool,
@@ -347,6 +350,9 @@ struct App {
     fps_window_frames: u32,
     /// Most recently measured frames-per-second (for the title-bar HUD).
     hud_fps: f64,
+    /// Core emulated-cycle count at the start of the current HUD window, for the
+    /// emulated-vs-real speed calculation (read from `CoreQuery::AudioStatus`).
+    last_hud_cycles: u64,
 }
 
 /// Runtime-control keybindings resolved to concrete winit key codes.
@@ -504,15 +510,37 @@ impl App {
         }
     }
 
-    /// Loads the active slot into the machine. A missing or invalid slot is
-    /// reported and otherwise ignored (the running game is left untouched).
+    /// Loads the active slot into the machine, validating its identity metadata.
+    ///
+    /// A missing/invalid file, or a BIOS/disc identity mismatch, is reported and
+    /// otherwise ignored (the running game is left untouched). A legacy save
+    /// with no metadata is loaded with a note; a core-version mismatch is warned
+    /// about and then force-loaded (the serialized format is compatible).
     fn load_state_slot(&mut self) {
-        match savestate::read_slot(&self.save_base, self.active_slot) {
-            Ok(snap) => {
-                self.core.load_state(&snap);
-                eprintln!("Loaded state from slot {}", self.active_slot);
+        let snap = match savestate::read_slot(&self.save_base, self.active_slot) {
+            Ok(snap) => snap,
+            Err(e) => {
+                eprintln!("Warning: {e}");
+                return;
             }
-            Err(e) => eprintln!("Warning: {e}"),
+        };
+        let slot = self.active_slot;
+        match self.core.load_state_checked(&snap) {
+            Ok(LoadStateOk::Loaded) => eprintln!("Loaded state from slot {slot}"),
+            Ok(LoadStateOk::LoadedLegacy) => eprintln!(
+                "Loaded state from slot {slot} (legacy save with no identity metadata; not validated)"
+            ),
+            Err(
+                e @ (LoadStateError::BiosMismatch { .. } | LoadStateError::DiscMismatch { .. }),
+            ) => {
+                eprintln!("Warning: {e}; slot {slot} not loaded");
+            }
+            Err(e @ LoadStateError::VersionMismatch { .. }) => {
+                // Compatible serialized format — warn, then force the load.
+                eprintln!("Warning: {e}; loading slot {slot} anyway");
+                self.core.load_state(&snap);
+                eprintln!("Loaded state from slot {slot}");
+            }
         }
     }
 
@@ -544,20 +572,37 @@ impl App {
         }
     }
 
-    /// Updates the title-bar HUD (fps, emulation speed, audio underruns) once
-    /// per ~1s measurement window.
+    /// Updates the title-bar HUD (fps, emulation speed, audio buffer/drops) once
+    /// per ~0.5s measurement window.
+    ///
+    /// Emulation speed and the audio figures come from core counters
+    /// (`CoreQuery::AudioStatus`), not frontend heuristics: speed is the
+    /// emulated-cycle delta over wall time vs the real CPU clock, and the audio
+    /// figures are the SPU output-queue fill + monotonic dropped-sample count.
     fn update_hud(&mut self) {
         self.fps_window_frames += 1;
         let elapsed = self.fps_window_start.elapsed();
         if elapsed < Duration::from_millis(500) {
             return;
         }
-        self.hud_fps = self.fps_window_frames as f64 / elapsed.as_secs_f64();
+        let secs = elapsed.as_secs_f64();
+        self.hud_fps = self.fps_window_frames as f64 / secs;
         self.fps_window_frames = 0;
         self.fps_window_start = Instant::now();
 
-        let speed = self.hud_fps / FRAMES_PER_SECOND as f64 * 100.0;
-        let underruns = self.audio.as_ref().map_or(0, AudioOutput::underruns);
+        let (queued, dropped, cycles) = match self.core.query(CoreQuery::AudioStatus) {
+            QueryResult::AudioStatus(s) => {
+                (s.queued_sample_pairs, s.samples_dropped, s.emulated_cycles)
+            }
+            _ => (0, 0, 0),
+        };
+        // Emulated-vs-real speed from the emulated-cycle delta over the wall
+        // window (0% while paused, since the core stops advancing cycles).
+        let emulated_secs =
+            cycles.saturating_sub(self.last_hud_cycles) as f64 / CPU_CLOCK_HZ as f64;
+        self.last_hud_cycles = cycles;
+        let speed = emulated_secs / secs * 100.0;
+
         let status = if self.paused {
             " [paused]"
         } else if self.fast_forward {
@@ -567,8 +612,8 @@ impl App {
         };
         if let Some(window) = self.window.as_ref() {
             window.set_title(&format!(
-                "psoxide — {:.0} fps  {:.0}%  slot {}  underruns {}{}",
-                self.hud_fps, speed, self.active_slot, underruns, status
+                "psoxide — {:.0} fps  {:.0}%  slot {}  audio {} drop {}{}",
+                self.hud_fps, speed, self.active_slot, queued, dropped, status
             ));
         }
     }
@@ -594,9 +639,9 @@ impl App {
             true
         } else if key == self.keys.frame_step {
             if self.paused {
-                // The core's StepFrame ignores the paused flag, so a single call
-                // advances exactly one frame while we stay logically paused.
-                let _ = self.core.execute(Command::StepFrame);
+                // FrameStep advances exactly one frame regardless of the paused
+                // flag (and leaves the machine paused).
+                let _ = self.core.execute(Command::FrameStep);
             }
             true
         } else if key == self.keys.reset {
@@ -818,11 +863,10 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                // Advance the machine unless paused. When paused we still
-                // re-render the last frame and drain audio so nothing backs up.
-                if !self.paused {
-                    let _ = self.core.execute(Command::StepFrame);
-                }
+                // Advance one frame. The core's StepFrame is a no-op while
+                // paused, so a paused session simply re-renders the last frame
+                // (and still drains audio below so nothing backs up).
+                let _ = self.core.execute(Command::StepFrame);
                 if let Some(pixels) = self.pixels.as_mut() {
                     let frame = self.core.framebuffer_rgba();
                     pixels.frame_mut().copy_from_slice(&frame);

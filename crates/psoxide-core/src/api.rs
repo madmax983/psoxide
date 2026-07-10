@@ -151,7 +151,16 @@ pub enum Command {
     /// Execute one CPU instruction.
     StepCpu,
     /// Execute a frame's worth of instructions ([`STEPS_PER_FRAME`]).
+    ///
+    /// Honours the paused flag: while paused this is a **no-op** (the machine
+    /// does not advance, no VBlank is raised), so a frontend can call it
+    /// unconditionally every host frame and get correct pause behaviour for
+    /// free. Use [`Command::FrameStep`] to advance a single frame while paused.
     StepFrame,
+    /// Advance exactly one frame, **even while paused** (the single-step /
+    /// frame-advance control). Unlike [`Command::StepFrame`] it ignores the
+    /// paused flag; the pause state itself is left unchanged.
+    FrameStep,
     /// Replace a controller port's button bitfield.
     SetControllerState {
         /// Controller port index (0 or 1).
@@ -215,6 +224,32 @@ pub enum CoreQuery {
         /// Controller port index (0 or 1).
         port: u8,
     },
+    /// Return audio-pacing counters (SPU output-queue fill + monotonic produced/
+    /// dropped sample counts) and the monotonic emulated-cycle count, for a
+    /// frontend HUD. Counters only: the core does not pace frames.
+    AudioStatus,
+}
+
+/// Audio-pacing / emulation-speed bookkeeping for a frontend HUD
+/// ([`CoreQuery::AudioStatus`]). All fields are counters the core already
+/// maintains; the frontend derives rates/speed from deltas over wall time — the
+/// core does no host-side pacing itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioStatus {
+    /// Interleaved-stereo sample-pairs currently queued in the SPU (the output
+    /// buffer's fill level, drained by [`PsxCore::drain_audio`]).
+    pub queued_sample_pairs: usize,
+    /// Monotonic count of stereo sample-pairs the SPU has generated since
+    /// power-on.
+    pub samples_produced: u64,
+    /// Monotonic count of stereo sample-pairs dropped because the output queue
+    /// saturated (the frontend fell behind draining) — the core-side audio
+    /// under/over-run signal.
+    pub samples_dropped: u64,
+    /// Monotonic emulated CPU-cycle count (the clock `StepFrame`/`FrameStep`
+    /// advance). A HUD divides its delta by [`CPU_CLOCK_HZ`] and wall time to
+    /// get emulated-vs-real speed.
+    pub emulated_cycles: u64,
 }
 
 /// Lightweight machine status.
@@ -261,6 +296,8 @@ pub enum QueryResult {
         /// Large-motor actuation last latched from a poll.
         large: u8,
     },
+    /// [`CoreQuery::AudioStatus`] response.
+    AudioStatus(AudioStatus),
 }
 
 /// Errors returned by [`PsxCore::execute`].
@@ -824,7 +861,88 @@ pub struct CoreSnapshot {
     /// MDEC (macroblock decoder) state.
     #[serde(default)]
     pub mdec: Mdec,
+    // ---- identity metadata (added after v0.1; all `#[serde(default)]` so
+    // legacy `.ss` files written before identity metadata still load) --------
+    /// Emulator core version (`CARGO_PKG_VERSION`) that wrote the snapshot.
+    /// Empty for a legacy snapshot that predates identity metadata.
+    #[serde(default)]
+    pub core_version: String,
+    /// Identity hash of the BIOS image loaded when the snapshot was taken
+    /// (`None` = no BIOS, or a legacy snapshot). Validated on
+    /// [`PsxCore::load_state_checked`].
+    #[serde(default)]
+    pub bios_hash: Option<u64>,
+    /// Identity hash of the disc image mounted when the snapshot was taken
+    /// (`None` = no disc, or a legacy snapshot). Validated on
+    /// [`PsxCore::load_state_checked`].
+    #[serde(default)]
+    pub disc_hash: Option<u64>,
 }
+
+/// Outcome of a successful [`PsxCore::load_state_checked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStateOk {
+    /// The snapshot's identity metadata matched the loaded BIOS/disc and it was
+    /// applied.
+    Loaded,
+    /// The snapshot carried no identity metadata (a legacy `.ss` file written
+    /// before identity was added). It was applied **without** validation — the
+    /// frontend may wish to surface this.
+    LoadedLegacy,
+}
+
+/// Typed failure from [`PsxCore::load_state_checked`]. On any of these the
+/// snapshot is **not** applied — the running machine is left untouched — so the
+/// frontend can present the mismatch and decide what to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadStateError {
+    /// The snapshot's BIOS identity differs from the currently loaded BIOS.
+    /// `expected` is the snapshot's hash, `actual` the running core's.
+    BiosMismatch {
+        /// BIOS hash recorded in the snapshot.
+        expected: Option<u64>,
+        /// BIOS hash of the currently loaded image.
+        actual: Option<u64>,
+    },
+    /// The snapshot's disc identity differs from the currently mounted disc.
+    /// `expected` is the snapshot's hash, `actual` the running core's.
+    DiscMismatch {
+        /// Disc hash recorded in the snapshot.
+        expected: Option<u64>,
+        /// Disc hash of the currently mounted disc.
+        actual: Option<u64>,
+    },
+    /// The snapshot was written by a different core version. The serialized
+    /// format is still compatible (deserialization already succeeded), so a
+    /// frontend may choose to force-load via [`PsxCore::load_state`].
+    VersionMismatch {
+        /// Core version that wrote the snapshot.
+        expected: String,
+        /// This build's core version.
+        actual: String,
+    },
+}
+
+impl fmt::Display for LoadStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BiosMismatch { expected, actual } => write!(
+                f,
+                "save state was made with a different BIOS (snapshot {expected:?}, loaded {actual:?})"
+            ),
+            Self::DiscMismatch { expected, actual } => write!(
+                f,
+                "save state was made with a different disc (snapshot {expected:?}, loaded {actual:?})"
+            ),
+            Self::VersionMismatch { expected, actual } => write!(
+                f,
+                "save state was written by psoxide {expected} (this build is {actual})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LoadStateError {}
 
 /// Deserializes the RAM buffer, rejecting snapshots whose length is not the
 /// expected 2MB. Serialization uses serde's default `Vec<u8>` encoding.
@@ -1181,19 +1299,14 @@ impl PsxCore {
             Command::Reset => self.cpu.reset(),
             Command::StepCpu => self.step_cpu(),
             Command::StepFrame => {
-                // Pace by a CPU-cycle budget rather than a fixed instruction
-                // count: with wait-state timing an instruction costs a variable
-                // number of cycles, so a cycle budget keeps the frame duration
-                // stable. `step_cpu` always advances `cpu.cycles` by at least 1,
-                // so this loop always terminates.
-                let target = self.cpu.cycles.wrapping_add(CYCLES_PER_FRAME);
-                while self.cpu.cycles < target {
-                    self.step_cpu();
+                // Paused gates a normal frame advance: no machine progress and
+                // no VBlank while paused, so the frontend can call this every
+                // host frame without a pause guard of its own.
+                if !self.paused {
+                    self.advance_frame();
                 }
-                // Once per frame: advance the interlace field and raise VBlank.
-                self.gpu.field = !self.gpu.field;
-                self.irq.set(IrqLine::VBlank);
             }
+            Command::FrameStep => self.advance_frame(),
             Command::SetControllerState { port, buttons } => {
                 if let Some(slot) = self.controllers.get_mut(port as usize) {
                     *slot = buttons;
@@ -1260,7 +1373,30 @@ impl PsxCore {
                     large: 0,
                 },
             },
+            CoreQuery::AudioStatus => QueryResult::AudioStatus(AudioStatus {
+                queued_sample_pairs: self.spu.queued_sample_pairs(),
+                samples_produced: self.spu.samples_produced(),
+                samples_dropped: self.spu.samples_dropped(),
+                emulated_cycles: self.cpu.cycles,
+            }),
         }
+    }
+
+    /// Runs one frame's worth of CPU cycles and raises the once-per-frame
+    /// VBlank, ignoring the paused flag. Shared by [`Command::StepFrame`] (which
+    /// gates on paused) and [`Command::FrameStep`] (which does not).
+    fn advance_frame(&mut self) {
+        // Pace by a CPU-cycle budget rather than a fixed instruction count:
+        // with wait-state timing an instruction costs a variable number of
+        // cycles, so a cycle budget keeps the frame duration stable. `step_cpu`
+        // always advances `cpu.cycles` by at least 1, so this loop terminates.
+        let target = self.cpu.cycles.wrapping_add(CYCLES_PER_FRAME);
+        while self.cpu.cycles < target {
+            self.step_cpu();
+        }
+        // Once per frame: advance the interlace field and raise VBlank.
+        self.gpu.field = !self.gpu.field;
+        self.irq.set(IrqLine::VBlank);
     }
 
     /// Executes one CPU instruction (plus its device/interrupt bookkeeping),
@@ -1560,10 +1696,98 @@ impl PsxCore {
             cdrom: self.cdrom.clone(),
             spu: self.spu.clone(),
             mdec: self.mdec.clone(),
+            core_version: env!("CARGO_PKG_VERSION").to_string(),
+            bios_hash: self.bios_identity(),
+            disc_hash: self.disc_identity(),
         }
     }
 
-    /// Restores a previously captured save-state snapshot.
+    /// Cheap stable identity hash of a byte slice (deterministic across runs —
+    /// [`std::collections::hash_map::DefaultHasher`] is seeded with fixed keys),
+    /// so a hash saved into a snapshot compares equal in a later session.
+    fn hash_bytes(bytes: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    }
+
+    /// Identity hash of the loaded BIOS image (`None` when no BIOS is loaded).
+    #[must_use]
+    pub fn bios_identity(&self) -> Option<u64> {
+        if self.mem.bios.len() == BIOS_SIZE {
+            Some(Self::hash_bytes(&self.mem.bios))
+        } else {
+            None
+        }
+    }
+
+    /// Identity hash of the mounted disc image (`None` when no disc is mounted).
+    #[must_use]
+    pub fn disc_identity(&self) -> Option<u64> {
+        self.cdrom.disc_image().map(Self::hash_bytes)
+    }
+
+    /// Restores a snapshot after validating its identity metadata against the
+    /// currently loaded BIOS/disc and this build's core version.
+    ///
+    /// - A **legacy** snapshot (no identity metadata — e.g. a `.ss` file written
+    ///   before identity was added) is applied unvalidated and reported as
+    ///   [`LoadStateOk::LoadedLegacy`], so old save states keep working.
+    /// - A BIOS or disc identity mismatch returns [`LoadStateError::BiosMismatch`]
+    ///   / [`LoadStateError::DiscMismatch`] and **does not** apply the snapshot.
+    /// - A core-version difference returns [`LoadStateError::VersionMismatch`]
+    ///   (also without applying); the format is compatible, so a frontend may
+    ///   force it through the unvalidated [`Self::load_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LoadStateError`] (leaving the machine untouched) when the
+    /// snapshot's identity does not match the running core.
+    pub fn load_state_checked(
+        &mut self,
+        snap: &CoreSnapshot,
+    ) -> Result<LoadStateOk, LoadStateError> {
+        // Legacy snapshots carry no identity at all: empty version and both
+        // hashes absent. Accept them without validation for backward compat.
+        let legacy =
+            snap.core_version.is_empty() && snap.bios_hash.is_none() && snap.disc_hash.is_none();
+        if legacy {
+            self.load_state(snap);
+            return Ok(LoadStateOk::LoadedLegacy);
+        }
+
+        let bios_actual = self.bios_identity();
+        if snap.bios_hash != bios_actual {
+            return Err(LoadStateError::BiosMismatch {
+                expected: snap.bios_hash,
+                actual: bios_actual,
+            });
+        }
+        let disc_actual = self.disc_identity();
+        if snap.disc_hash != disc_actual {
+            return Err(LoadStateError::DiscMismatch {
+                expected: snap.disc_hash,
+                actual: disc_actual,
+            });
+        }
+        let current_version = env!("CARGO_PKG_VERSION");
+        if !snap.core_version.is_empty() && snap.core_version != current_version {
+            return Err(LoadStateError::VersionMismatch {
+                expected: snap.core_version.clone(),
+                actual: current_version.to_string(),
+            });
+        }
+
+        self.load_state(snap);
+        Ok(LoadStateOk::Loaded)
+    }
+
+    /// Restores a previously captured save-state snapshot **unconditionally**
+    /// (no identity validation). Prefer [`Self::load_state_checked`] in a
+    /// frontend so a mismatched game/BIOS is caught; this force-apply path
+    /// exists for tests and for a frontend that has already decided to override
+    /// a [`LoadStateError`].
     pub fn load_state(&mut self, snap: &CoreSnapshot) {
         self.paused = snap.paused;
         self.controllers = snap.controllers;
@@ -1894,6 +2118,176 @@ mod tests {
         assert!(core.irq.pending());
         core.execute(Command::StepCpu).unwrap();
         assert_eq!(core.pc(), 0x8000_0080, "interrupt should vector to handler");
+    }
+
+    #[test]
+    fn step_frame_is_noop_while_paused() {
+        let mut core = PsxCore::new();
+        core.execute(Command::Pause).unwrap();
+        let field_before = core.gpu.field;
+        let cycles_before = core.cpu.cycles;
+        let stat_before = core.irq.read_stat();
+        core.execute(Command::StepFrame).unwrap();
+        // Paused: no machine progress, no field flip, no VBlank raised.
+        assert_eq!(core.cpu.cycles, cycles_before, "cycles must not advance");
+        assert_eq!(core.gpu.field, field_before, "field must not flip");
+        assert_eq!(core.irq.read_stat(), stat_before, "VBlank must not be set");
+    }
+
+    #[test]
+    fn frame_step_advances_one_frame_while_paused() {
+        let mut core = PsxCore::new();
+        core.execute(Command::Pause).unwrap();
+        let field_before = core.gpu.field;
+        let cycles_before = core.cpu.cycles;
+        core.execute(Command::FrameStep).unwrap();
+        assert!(core.cpu.cycles > cycles_before, "cycles should advance");
+        assert_ne!(core.gpu.field, field_before, "field should flip");
+        assert_ne!(core.irq.read_stat() & 0x1, 0, "VBlank should be set");
+        // FrameStep leaves the pause state itself untouched.
+        assert!(core.is_paused(), "still paused after a frame-step");
+    }
+
+    #[test]
+    fn step_frame_advances_when_not_paused() {
+        let mut core = PsxCore::new();
+        let cycles_before = core.cpu.cycles;
+        core.execute(Command::StepFrame).unwrap();
+        assert!(core.cpu.cycles > cycles_before);
+    }
+
+    #[test]
+    fn audio_status_query_reports_counters() {
+        let mut core = PsxCore::new();
+        // Fresh core: nothing produced/dropped/queued, zero cycles.
+        let QueryResult::AudioStatus(s0) = core.query(CoreQuery::AudioStatus) else {
+            panic!("expected AudioStatus");
+        };
+        assert_eq!(s0.queued_sample_pairs, 0);
+        assert_eq!(s0.samples_produced, 0);
+        assert_eq!(s0.samples_dropped, 0);
+        assert_eq!(s0.emulated_cycles, 0);
+        // Run a frame: the SPU produces samples and the cycle counter advances.
+        core.execute(Command::StepFrame).unwrap();
+        let QueryResult::AudioStatus(s1) = core.query(CoreQuery::AudioStatus) else {
+            panic!("expected AudioStatus");
+        };
+        assert!(s1.emulated_cycles > 0, "cycles advanced");
+        assert!(s1.samples_produced > 0, "SPU produced samples");
+        assert!(
+            s1.queued_sample_pairs > 0,
+            "produced samples are queued until drained"
+        );
+        // Draining empties the queue but leaves the monotonic counter.
+        let _ = core.drain_audio();
+        let QueryResult::AudioStatus(s2) = core.query(CoreQuery::AudioStatus) else {
+            panic!("expected AudioStatus");
+        };
+        assert_eq!(s2.queued_sample_pairs, 0, "queue drained");
+        assert_eq!(
+            s2.samples_produced, s1.samples_produced,
+            "produced counter is monotonic across a drain"
+        );
+    }
+
+    #[test]
+    fn load_state_checked_accepts_matching_identity() {
+        let mut bios = vec![0u8; BIOS_SIZE];
+        bios[0] = 0xAB;
+        let mut core = PsxCore::new();
+        core.execute(Command::LoadBios(bios.clone())).unwrap();
+        let snap = core.save_state();
+        assert!(snap.bios_hash.is_some());
+        assert_eq!(snap.core_version, env!("CARGO_PKG_VERSION"));
+
+        let mut other = PsxCore::new();
+        other.execute(Command::LoadBios(bios)).unwrap();
+        assert_eq!(
+            other.load_state_checked(&snap),
+            Ok(LoadStateOk::Loaded),
+            "matching BIOS identity should load"
+        );
+    }
+
+    #[test]
+    fn load_state_checked_rejects_bios_mismatch() {
+        let mut bios_a = vec![0u8; BIOS_SIZE];
+        bios_a[0] = 0x11;
+        let mut core = PsxCore::new();
+        core.execute(Command::LoadBios(bios_a)).unwrap();
+        let snap = core.save_state();
+
+        let mut other = PsxCore::new();
+        let mut bios_b = vec![0u8; BIOS_SIZE];
+        bios_b[0] = 0x22;
+        other.execute(Command::LoadBios(bios_b)).unwrap();
+        let before = other.pc();
+        match other.load_state_checked(&snap) {
+            Err(LoadStateError::BiosMismatch { expected, actual }) => {
+                assert_eq!(expected, snap.bios_hash);
+                assert_eq!(actual, other.bios_identity());
+            }
+            other => panic!("expected BiosMismatch, got {other:?}"),
+        }
+        assert_eq!(other.pc(), before, "machine left untouched on mismatch");
+    }
+
+    #[test]
+    fn load_state_checked_accepts_legacy_snapshot() {
+        // Simulate an old `.ss` file: identity fields at their serde defaults.
+        let mut core = PsxCore::new();
+        core.memory_mut().write8(0x40, 0x5A);
+        let mut snap = core.save_state();
+        snap.core_version = String::new();
+        snap.bios_hash = None;
+        snap.disc_hash = None;
+
+        let mut other = PsxCore::new();
+        assert_eq!(
+            other.load_state_checked(&snap),
+            Ok(LoadStateOk::LoadedLegacy),
+            "legacy snapshot loads without validation"
+        );
+        assert_eq!(other.memory().read8(0x40), 0x5A);
+    }
+
+    #[test]
+    fn load_state_checked_reports_version_mismatch() {
+        let mut core = PsxCore::new();
+        let mut snap = core.save_state();
+        // A snapshot from a different core version (but no BIOS/disc, so those
+        // match): the version mismatch is surfaced.
+        snap.core_version = "9.9.9".to_string();
+        let mut other = PsxCore::new();
+        match other.load_state_checked(&snap) {
+            Err(LoadStateError::VersionMismatch { expected, actual }) => {
+                assert_eq!(expected, "9.9.9");
+                assert_eq!(actual, env!("CARGO_PKG_VERSION"));
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_json_without_metadata_deserializes() {
+        // A CoreSnapshot JSON that predates the identity fields must still
+        // deserialize (the new fields are `#[serde(default)]`).
+        let mut core = PsxCore::new();
+        let snap = core.save_state();
+        let mut value: serde_json::Value = serde_json::to_value(&snap).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("core_version");
+        obj.remove("bios_hash");
+        obj.remove("disc_hash");
+        // Also strip the SPU counter fields to mimic a truly old snapshot.
+        if let Some(spu) = obj.get_mut("spu").and_then(|s| s.as_object_mut()) {
+            spu.remove("samples_produced");
+            spu.remove("samples_dropped");
+        }
+        let back: CoreSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(back.core_version, "");
+        assert_eq!(back.bios_hash, None);
+        assert_eq!(back.disc_hash, None);
     }
 
     #[test]

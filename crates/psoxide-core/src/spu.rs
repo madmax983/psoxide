@@ -409,6 +409,15 @@ pub struct Spu {
     last_reverb_r: i16,
     /// CD-audio input frames (44.1 kHz stereo) fed by the CD-ROM controller.
     cd_queue: VecDeque<(i16, i16)>,
+    /// Monotonic count of stereo sample-pairs generated since power-on (a HUD /
+    /// pacing counter). `#[serde(default)]` so legacy snapshots deserialize.
+    #[serde(default)]
+    samples_produced: u64,
+    /// Monotonic count of stereo sample-pairs dropped because the output queue
+    /// saturated (i.e. the frontend fell behind draining) — the core-side
+    /// audio-pacing / overrun signal. `#[serde(default)]` for legacy snapshots.
+    #[serde(default)]
+    samples_dropped: u64,
 }
 
 impl Default for Spu {
@@ -441,7 +450,29 @@ impl Spu {
             last_reverb_l: 0,
             last_reverb_r: 0,
             cd_queue: VecDeque::new(),
+            samples_produced: 0,
+            samples_dropped: 0,
         }
+    }
+
+    /// Number of interleaved-stereo sample-pairs currently queued for the
+    /// frontend to drain (the output-buffer fill level).
+    #[must_use]
+    pub fn queued_sample_pairs(&self) -> usize {
+        self.samples.len() / 2
+    }
+
+    /// Monotonic count of stereo sample-pairs generated since power-on.
+    #[must_use]
+    pub fn samples_produced(&self) -> u64 {
+        self.samples_produced
+    }
+
+    /// Monotonic count of stereo sample-pairs dropped because the output queue
+    /// saturated (the frontend did not drain fast enough).
+    #[must_use]
+    pub fn samples_dropped(&self) -> u64 {
+        self.samples_dropped
     }
 
     /// Returns `true` if `phys` falls in the SPU register window.
@@ -1122,9 +1153,11 @@ impl Spu {
     fn push_sample(&mut self, left: i16, right: i16) {
         self.samples.push_back(left);
         self.samples.push_back(right);
+        self.samples_produced = self.samples_produced.saturating_add(1);
         while self.samples.len() > MAX_QUEUED {
             self.samples.pop_front();
             self.samples.pop_front();
+            self.samples_dropped = self.samples_dropped.saturating_add(1);
         }
     }
 }
