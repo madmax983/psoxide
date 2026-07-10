@@ -66,6 +66,14 @@ pub enum Button {
     L1,
     /// R1 shoulder.
     R1,
+    /// L2 trigger.
+    L2,
+    /// R2 trigger.
+    R2,
+    /// L3 (left analog-stick click; DualShock only).
+    L3,
+    /// R3 (right analog-stick click; DualShock only).
+    R3,
     /// Start button.
     Start,
     /// Select button.
@@ -78,11 +86,15 @@ impl Button {
     pub fn bit_mask(self) -> u16 {
         match self {
             Self::Select => 1 << 0,
+            Self::L3 => 1 << 1,
+            Self::R3 => 1 << 2,
             Self::Start => 1 << 3,
             Self::Up => 1 << 4,
             Self::Right => 1 << 5,
             Self::Down => 1 << 6,
             Self::Left => 1 << 7,
+            Self::L2 => 1 << 8,
+            Self::R2 => 1 << 9,
             Self::L1 => 1 << 10,
             Self::R1 => 1 << 11,
             Self::Triangle => 1 << 12,
@@ -91,6 +103,17 @@ impl Button {
             Self::Square => 1 << 15,
         }
     }
+}
+
+/// The kind of controller device attached to a port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerKind {
+    /// No controller plugged in.
+    Disconnected,
+    /// A standard digital pad (SCPH-1080).
+    Digital,
+    /// A DualShock / DualAnalog pad (SCPH-1200).
+    Analog,
 }
 
 /// Commands that drive [`PsxCore`] state.
@@ -136,6 +159,30 @@ pub enum Command {
         /// Pressed-button bitfield.
         buttons: u16,
     },
+    /// Set the kind of controller attached to a port (digital / analog /
+    /// disconnected), preserving the held buttons across the change.
+    SetControllerType {
+        /// Controller port index (0 or 1).
+        port: u8,
+        /// Device kind to attach.
+        kind: ControllerKind,
+    },
+    /// Update a controller's analog-stick axes (`0x80` = centre). Promotes a
+    /// non-analog port to an analog pad.
+    SetControllerSticks {
+        /// Controller port index (0 or 1).
+        port: u8,
+        /// Right stick `(x, y)`.
+        right: (u8, u8),
+        /// Left stick `(x, y)`.
+        left: (u8, u8),
+    },
+    /// Simulate a press of the pad's physical "Analog" toggle button, flipping
+    /// analog mode unless the host has locked it. A no-op for a non-analog port.
+    SetControllerAnalogButton {
+        /// Controller port index (0 or 1).
+        port: u8,
+    },
     /// Pause emulation stepping.
     Pause,
     /// Resume emulation stepping.
@@ -162,6 +209,11 @@ pub enum CoreQuery {
     MemoryCard {
         /// Slot index (0 or 1).
         slot: u8,
+    },
+    /// Return the analog pad's small/large rumble-motor actuation for a port.
+    ControllerRumble {
+        /// Controller port index (0 or 1).
+        port: u8,
     },
 }
 
@@ -198,6 +250,16 @@ pub enum QueryResult {
         data: Vec<u8>,
         /// Whether the card has unsaved modifications.
         dirty: bool,
+    },
+    /// [`CoreQuery::ControllerRumble`] response. `present` is `false` (with
+    /// `small`/`large` both 0) when the port holds no analog pad.
+    ControllerRumble {
+        /// Whether the queried port holds an analog pad.
+        present: bool,
+        /// Small-motor actuation last latched from a poll.
+        small: u8,
+        /// Large-motor actuation last latched from a poll.
+        large: u8,
     },
 }
 
@@ -840,6 +902,15 @@ impl PsxCore {
                 // them out. `set_buttons` ignores out-of-range ports.
                 self.sio0.set_buttons(port as usize, buttons);
             }
+            Command::SetControllerType { port, kind } => {
+                self.sio0.set_controller_type(port as usize, kind);
+            }
+            Command::SetControllerSticks { port, right, left } => {
+                self.sio0.set_sticks(port as usize, right, left);
+            }
+            Command::SetControllerAnalogButton { port } => {
+                self.sio0.press_analog_button(port as usize);
+            }
             Command::Pause => self.paused = true,
             Command::Resume => self.paused = false,
         }
@@ -875,6 +946,18 @@ impl PsxCore {
                     present: false,
                     data: Vec::new(),
                     dirty: false,
+                },
+            },
+            CoreQuery::ControllerRumble { port } => match self.sio0.motor_state(port as usize) {
+                Some((small, large)) => QueryResult::ControllerRumble {
+                    present: true,
+                    small,
+                    large,
+                },
+                None => QueryResult::ControllerRumble {
+                    present: false,
+                    small: 0,
+                    large: 0,
                 },
             },
         }
