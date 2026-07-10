@@ -165,8 +165,25 @@ impl Counter {
     fn tick(&mut self, index: usize, cycles: u32, irq: &mut Irq, line: IrqLine) {
         let div = self.clock_source(index);
         self.accumulator += cycles;
-        let ticks = self.accumulator / div;
-        self.accumulator %= div;
+        // Divider math, preserved exactly. The full-system-clock source
+        // (`div == 1`) is the reset-state configuration of all three counters
+        // and is ticked once per CPU cycle, so the `accumulator / div` +
+        // `accumulator %= div` divide/modulo runs on every instruction for every
+        // counter — the single hottest cost in `Timers::tick`. For `div == 1`
+        // the accumulator is invariantly 0 on entry (the clock source only
+        // changes via a mode write, and `write_mode` zeroes the accumulator), so
+        // `accumulator / 1 == accumulator` and `accumulator %= 1 == 0`: take that
+        // branch without an actual hardware division. This is byte-for-byte
+        // equivalent to the divide/modulo (see `batched_tick_matches_per_cycle`).
+        let ticks = if div == 1 {
+            let t = self.accumulator;
+            self.accumulator = 0;
+            t
+        } else {
+            let t = self.accumulator / div;
+            self.accumulator %= div;
+            t
+        };
         for _ in 0..ticks {
             self.step_one(irq, line);
         }
@@ -469,5 +486,103 @@ mod tests {
         // Rewriting mode re-arms bit 10.
         t.write16(T0_MODE, 1 << 4);
         assert_ne!(t.counters[0].mode & (1 << 10), 0);
+    }
+
+    /// Equivalence guard for the `Counter::tick` divider fast path: advancing a
+    /// counter with a single `tick(N)` must land on byte-identical state (value,
+    /// mode/flags, target, accumulator, one-shot latch) *and* identical IRQ
+    /// delivery as advancing an identical counter with `N` separate `tick(1)`
+    /// calls — across a matrix of modes, targets, start values, clock sources,
+    /// and counts (including spans that cross multiple target hits and the
+    /// 0xFFFF overflow). This proves the `div == 1` shortcut and the
+    /// accumulator/modulo handling stay consistent with per-cycle stepping.
+    #[test]
+    fn batched_tick_matches_per_cycle() {
+        fn fresh(mode: u16, target: u16, start: u16) -> Counter {
+            Counter {
+                value: start,
+                mode,
+                target,
+                accumulator: 0,
+                irq_fired: false,
+            }
+        }
+
+        // Event-relevant mode bits: reset-on-target(3), irq-on-target(4),
+        // irq-on-overflow(5), irq-repeat(6), in the combinations that matter.
+        let modes = [
+            0u16,
+            1 << 3,
+            1 << 4,
+            (1 << 4) | (1 << 3),
+            (1 << 4) | (1 << 3) | (1 << 6),
+            1 << 5,
+            (1 << 5) | (1 << 6),
+            (1 << 4) | (1 << 5),
+            (1 << 4) | (1 << 5) | (1 << 6),
+        ];
+        let targets = [0u16, 1, 2, 3, 0x00FF, 0xFFFE, 0xFFFF];
+        let starts = [0u16, 1, 0x00FE, 0xFFFD, 0xFFFF];
+
+        // (index, clock-source-select-bits) pairs covering every divisor the
+        // three counters can select: 1 (sysclk), 6 (dotclock), 2172 (hblank),
+        // 8 (sysclk/8).
+        let sources = [
+            (0usize, 0u16),   // div 1
+            (0usize, 1 << 8), // div 6
+            (1usize, 1 << 8), // div 2172
+            (2usize, 2 << 8), // div 8
+            (2usize, 0u16),   // div 1
+        ];
+
+        // Small counts exercise event/divisor handling for every source cheaply.
+        let small_counts = [0u32, 1, 2, 3, 7, 8, 9, 16, 17, 100, 200, 4344];
+        // Large counts (that cross the 0xFFFF overflow) are only feasible to
+        // check per-cycle for the sysclk (div 1) sources.
+        let big_counts = [0xFFFEu32, 0xFFFF, 0x1_0000, 0x1_0001, 0x1_0003, 0x2_0007];
+
+        let run = |index: usize, mode: u16, target: u16, start: u16, total: u32| {
+            // Batched: one tick(total).
+            let mut ca = fresh(mode, target, start);
+            let mut ia = Irq::new();
+            ca.tick(index, total, &mut ia, Timers::line(index));
+
+            // Per-cycle: total × tick(1).
+            let mut cb = fresh(mode, target, start);
+            let mut ib = Irq::new();
+            for _ in 0..total {
+                cb.tick(index, 1, &mut ib, Timers::line(index));
+            }
+
+            assert_eq!(
+                ca, cb,
+                "state mismatch idx={index} mode={mode:#06x} target={target} start={start} total={total}"
+            );
+            assert_eq!(
+                ia.read_stat(),
+                ib.read_stat(),
+                "irq mismatch idx={index} mode={mode:#06x} target={target} start={start} total={total}"
+            );
+        };
+
+        for &(index, sel) in &sources {
+            for &base in &modes {
+                let mode = base | sel;
+                for &target in &targets {
+                    for &start in &starts {
+                        for &total in &small_counts {
+                            run(index, mode, target, start, total);
+                        }
+                        // Overflow-spanning counts: sysclk (div 1) sources only.
+                        let div = fresh(mode, target, start).clock_source(index);
+                        if div == 1 {
+                            for &total in &big_counts {
+                                run(index, mode, target, start, total);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
