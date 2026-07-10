@@ -51,6 +51,9 @@ pub struct DesktopConfig {
     /// Last memory-card image path used (remembered across runs).
     #[serde(default)]
     pub last_memcard: String,
+    /// Attach a Multitap (4-player adapter) on port 0 at startup.
+    #[serde(default)]
+    pub multitap: bool,
 }
 
 impl Default for DesktopConfig {
@@ -63,6 +66,7 @@ impl Default for DesktopConfig {
             last_bios: String::new(),
             last_disc: String::new(),
             last_memcard: String::new(),
+            multitap: false,
         }
     }
 }

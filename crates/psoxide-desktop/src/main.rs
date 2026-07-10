@@ -75,6 +75,11 @@ enum CliCommand {
         /// Start in fullscreen (overrides the config's `fullscreen`).
         #[arg(long)]
         fullscreen: bool,
+        /// Attach a Multitap (4-player adapter) on port 0. Player 1 (keyboard /
+        /// gamepad) drives sub-slot A; sub-slots B/C/D can be driven by the core
+        /// API (extra-gamepad mapping is a follow-up).
+        #[arg(long)]
+        multitap: bool,
         /// Config file path.
         #[arg(long, default_value = "psoxide.toml")]
         config: PathBuf,
@@ -96,6 +101,7 @@ fn main() -> Result<()> {
             memcard,
             scale,
             fullscreen,
+            multitap,
             config,
         } => cmd_run(
             &bios,
@@ -104,6 +110,7 @@ fn main() -> Result<()> {
             memcard,
             scale,
             fullscreen,
+            multitap,
             &config,
         ),
         CliCommand::Info { bios } => cmd_info(&bios),
@@ -134,6 +141,7 @@ fn cmd_run(
     memcard: Option<PathBuf>,
     scale: Option<u32>,
     fullscreen: bool,
+    multitap: bool,
     config_path: &Path,
 ) -> Result<()> {
     let mut config = PsxConfig::load(config_path).unwrap_or_default();
@@ -142,6 +150,7 @@ fn cmd_run(
         .unwrap_or(config.desktop.window_scale)
         .clamp(MIN_SCALE, MAX_SCALE);
     let fullscreen = fullscreen || config.desktop.fullscreen;
+    let multitap = multitap || config.desktop.multitap;
     // Resolve the runtime keybindings once (config strings → winit KeyCodes,
     // falling back to the built-in default for any unrecognised name).
     let keys = Keys::from_config(&config.keybindings);
@@ -209,17 +218,37 @@ fn cmd_run(
         }
     };
 
+    // Attach a Multitap on port 0 when requested. Player 1 (keyboard / the first
+    // gamepad) drives sub-slot A; sub-slots B/C/D start empty and can be driven
+    // via the core `SetMultitap*` API (mapping extra gilrs gamepads to B/C/D is
+    // a follow-up — the current event loop aggregates all pads into port 0).
+    if multitap {
+        let _ = core.execute(Command::SetMultitap {
+            port: 0,
+            enabled: true,
+        });
+    }
+
     // If a gamepad is already connected at startup, attach a DualShock (analog)
-    // pad to port 0 so the sticks are live immediately. Keyboard-only sessions
-    // keep the default digital pad (see the input-mapping doc comment below).
+    // pad to port 0 (or the tap's sub-slot A) so the sticks are live
+    // immediately. Keyboard-only sessions keep the default digital pad (see the
+    // input-mapping doc comment below).
     let mut analog_attached = false;
     if let Some(gilrs) = &gilrs
         && gilrs.gamepads().any(|(_, gp)| gp.is_connected())
     {
-        let _ = core.execute(Command::SetControllerType {
-            port: 0,
-            kind: ControllerKind::Analog,
-        });
+        if multitap {
+            let _ = core.execute(Command::SetMultitapControllerType {
+                port: 0,
+                slot: 0,
+                kind: ControllerKind::Analog,
+            });
+        } else {
+            let _ = core.execute(Command::SetControllerType {
+                port: 0,
+                kind: ControllerKind::Analog,
+            });
+        }
         analog_attached = true;
     }
 
@@ -235,6 +264,7 @@ fn cmd_run(
     }
     config.desktop.window_scale = scale;
     config.desktop.fullscreen = fullscreen;
+    config.desktop.multitap = multitap;
 
     print_controls_banner(&config.keybindings);
 
@@ -251,6 +281,7 @@ fn cmd_run(
         audio: AudioOutput::try_new(),
         gilrs,
         memcard_path: memcard,
+        multitap,
         analog_attached,
         analog_lx: 0x80,
         analog_ly: 0x80,
@@ -305,6 +336,10 @@ struct App {
     /// Slot-0 memory-card file to persist to (`None` when `--memcard` was not
     /// passed, in which case no card is inserted and none is written).
     memcard_path: Option<PathBuf>,
+    /// Whether a Multitap is attached on port 0. When set, player-1 (keyboard /
+    /// gamepad) input is routed to the tap's sub-slot A instead of the port's
+    /// single pad.
+    multitap: bool,
     /// Whether a DualShock (analog) pad has been attached to port 0 for the
     /// gamepad. Set once, on first gamepad presence/connect, to avoid re-sending
     /// `SetControllerType` every frame.
@@ -458,6 +493,59 @@ fn axis_f32_to_u8(value: f32) -> u8 {
 }
 
 impl App {
+    /// Pushes the player-1 button bitfield to the core, routing to the tap's
+    /// sub-slot A when a Multitap is attached on port 0, else the port's pad.
+    fn send_player1_buttons(&mut self, buttons: u16) {
+        let cmd = if self.multitap {
+            Command::SetMultitapControllerState {
+                port: 0,
+                slot: 0,
+                buttons,
+            }
+        } else {
+            Command::SetControllerState { port: 0, buttons }
+        };
+        let _ = self.core.execute(cmd);
+    }
+
+    /// Pushes the player-1 analog-stick axes to the core, routing to the tap's
+    /// sub-slot A when a Multitap is attached on port 0, else the port's pad.
+    fn send_player1_sticks(&mut self, right: (u8, u8), left: (u8, u8)) {
+        let cmd = if self.multitap {
+            Command::SetMultitapControllerSticks {
+                port: 0,
+                slot: 0,
+                right,
+                left,
+            }
+        } else {
+            Command::SetControllerSticks {
+                port: 0,
+                right,
+                left,
+            }
+        };
+        let _ = self.core.execute(cmd);
+    }
+
+    /// Attaches a DualShock (analog) pad for player 1, routing to the tap's
+    /// sub-slot A when a Multitap is attached on port 0, else the port's pad.
+    fn attach_player1_analog(&mut self) {
+        let cmd = if self.multitap {
+            Command::SetMultitapControllerType {
+                port: 0,
+                slot: 0,
+                kind: ControllerKind::Analog,
+            }
+        } else {
+            Command::SetControllerType {
+                port: 0,
+                kind: ControllerKind::Analog,
+            }
+        };
+        let _ = self.core.execute(cmd);
+    }
+
     /// Flushes the slot-0 memory card to its configured file if it is dirty.
     ///
     /// Persistence policy: flush on dirty each frame + on exit. Querying the
@@ -807,10 +895,7 @@ impl ApplicationHandler for App {
                         } else {
                             self.buttons &= !button.bit_mask();
                         }
-                        let _ = self.core.execute(Command::SetControllerState {
-                            port: 0,
-                            buttons: self.buttons,
-                        });
+                        self.send_player1_buttons(self.buttons);
                     } else if key == self.keys.fast_forward {
                         // Fast-forward is a hold: track both edges.
                         self.fast_forward = pressed;
@@ -886,24 +971,17 @@ impl ApplicationHandler for App {
             // Attach a DualShock (analog) pad to port 0 on the first gamepad
             // connect, so hotplugged pads get live sticks too.
             if newly_connected && !self.analog_attached {
-                let _ = self.core.execute(Command::SetControllerType {
-                    port: 0,
-                    kind: ControllerKind::Analog,
-                });
+                self.attach_player1_analog();
                 self.analog_attached = true;
             }
             if buttons_changed {
-                let _ = self.core.execute(Command::SetControllerState {
-                    port: 0,
-                    buttons: self.buttons,
-                });
+                self.send_player1_buttons(self.buttons);
             }
             if sticks_changed {
-                let _ = self.core.execute(Command::SetControllerSticks {
-                    port: 0,
-                    right: (self.analog_rx, self.analog_ry),
-                    left: (self.analog_lx, self.analog_ly),
-                });
+                self.send_player1_sticks(
+                    (self.analog_rx, self.analog_ry),
+                    (self.analog_lx, self.analog_ly),
+                );
             }
 
             // Log-only rumble readback: report the analog pad's motor state when

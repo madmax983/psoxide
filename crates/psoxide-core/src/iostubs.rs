@@ -492,6 +492,77 @@ impl AnalogPad {
     }
 }
 
+/// A Sony analog joystick / flightstick (device ID `0x53`, halfword `0x5A53`).
+///
+/// Reports the "analog stick" ID (`0x53`) and the **same** six-byte poll payload
+/// as a DualShock analog pad in analog mode — buttons (active-low) plus both
+/// analog sticks — but is a **fixed** analog device: no digital/analog toggle,
+/// no configuration mode, and no rumble. Every `0x42` poll therefore returns the
+/// ID halfword `0x5A53` followed by the two button bytes and the four axis bytes
+/// (RX, RY, LX, LY). The outgoing `tx` bytes are ignored (there is no rumble or
+/// configuration state to drive), so the pad shares the common `exchange`
+/// signature without acting on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlightStick {
+    /// Pressed-button bitfield (active-high, PSX bit layout incl. L3/R3).
+    pub buttons: u16,
+    /// Right analog stick X (`0x00` left … `0x80` centre … `0xFF` right).
+    pub rx: u8,
+    /// Right analog stick Y (`0x00` up … `0x80` centre … `0xFF` down).
+    pub ry: u8,
+    /// Left analog stick X.
+    pub lx: u8,
+    /// Left analog stick Y.
+    pub ly: u8,
+}
+
+impl Default for FlightStick {
+    fn default() -> Self {
+        Self {
+            buttons: 0,
+            rx: 0x80,
+            ry: 0x80,
+            lx: 0x80,
+            ly: 0x80,
+        }
+    }
+}
+
+impl FlightStick {
+    /// The six poll data bytes emitted after the `0x5A` ID-high header: buttons
+    /// low/high (active-low) followed by the four axis bytes (RX, RY, LX, LY).
+    fn poll_bytes(&self) -> [u8; 6] {
+        let inv = !self.buttons; // active-low on the wire
+        [
+            (inv & 0xFF) as u8,
+            (inv >> 8) as u8,
+            self.rx,
+            self.ry,
+            self.lx,
+            self.ly,
+        ]
+    }
+
+    /// Full-duplex byte exchange indexed by the transfer `phase`. Returns
+    /// `(response, ack)`; the final (sixth) data byte does not ACK.
+    fn exchange(&mut self, phase: u8, _tx: u8) -> (u8, bool) {
+        match phase {
+            // Address byte (0x01) acknowledged.
+            0 => (0xFF, true),
+            // Command byte (expect 0x42 "read"): low byte of the ID 0x5A53.
+            1 => (0x53, true),
+            // High byte of the ID.
+            2 => (0x5A, true),
+            // Six poll data bytes; the last (idx 5) does not ACK.
+            3..=8 => {
+                let idx = (phase - 3) as usize;
+                (self.poll_bytes()[idx], idx < 5)
+            }
+            _ => (0xFF, false),
+        }
+    }
+}
+
 /// Size of a PSX memory card in bytes: 1024 sectors × 128 bytes = 128 KB.
 pub const MEMCARD_SIZE: usize = 1024 * 128;
 /// Bytes per memory-card sector (frame).
@@ -761,6 +832,8 @@ pub enum PadDevice {
     Digital(DigitalPad),
     /// A DualShock / DualAnalog pad.
     Analog(AnalogPad),
+    /// A fixed analog joystick / flightstick (device ID `0x53`).
+    FlightStick(FlightStick),
     /// No device in this slot.
     Disconnected,
 }
@@ -778,8 +851,224 @@ impl PadDevice {
         match self {
             PadDevice::Digital(pad) => pad.exchange(phase, tx),
             PadDevice::Analog(pad) => pad.exchange(phase, tx),
+            PadDevice::FlightStick(pad) => pad.exchange(phase, tx),
             // Nothing on the bus: pad answers open-bus and never ACKs.
             PadDevice::Disconnected => (0xFF, false),
+        }
+    }
+
+    /// The eight bytes (four 16-bit halfwords) this slot contributes to a
+    /// Multitap Method-1 burst: the device's poll response (ID halfword + poll
+    /// payload) padded to four halfwords with `0xFF`. Devices that use fewer
+    /// than four halfwords (digital pads) leave the trailing halfwords `0xFF`;
+    /// an empty slot is all-`0xFF` (matching PSX-SPX's `FFFFh` fill).
+    fn burst_bytes(&self) -> [u8; 8] {
+        let mut out = [0xFFu8; 8];
+        match self {
+            PadDevice::Digital(pad) => {
+                let inv = !pad.buttons;
+                out[0] = 0x41; // digital ID low (5A41)
+                out[1] = 0x5A;
+                out[2] = (inv & 0xFF) as u8;
+                out[3] = (inv >> 8) as u8;
+                // Halfwords 2-3 (analog inputs) stay 0xFF: a digital pad has none.
+            }
+            PadDevice::Analog(pad) => {
+                let inv = !pad.buttons;
+                // An analog pad in digital mode reports the digital ID and only
+                // two halfwords (buttons); in analog mode the analog ID plus the
+                // two stick halfwords.
+                out[0] = if pad.analog_mode { 0x73 } else { 0x41 };
+                out[1] = 0x5A;
+                out[2] = (inv & 0xFF) as u8;
+                out[3] = (inv >> 8) as u8;
+                if pad.analog_mode {
+                    out[4] = pad.rx;
+                    out[5] = pad.ry;
+                    out[6] = pad.lx;
+                    out[7] = pad.ly;
+                }
+            }
+            PadDevice::FlightStick(pad) => {
+                out[0] = 0x53; // analog-stick ID low (5A53)
+                out[1] = 0x5A;
+                out[2..8].copy_from_slice(&pad.poll_bytes());
+            }
+            // Empty slot: all four halfwords 0xFF.
+            PadDevice::Disconnected => {}
+        }
+        out
+    }
+}
+
+/// The `PadDevice` for a [`ControllerKind`], carrying the held `buttons` across
+/// the change. Promoting to an analog pad or flightstick power-on-resets the
+/// stick axes to centre.
+fn pad_device_for(kind: ControllerKind, buttons: u16) -> PadDevice {
+    match kind {
+        ControllerKind::Disconnected => PadDevice::Disconnected,
+        ControllerKind::Digital => PadDevice::Digital(DigitalPad { buttons }),
+        ControllerKind::Analog => PadDevice::Analog(AnalogPad {
+            buttons,
+            ..AnalogPad::default()
+        }),
+        ControllerKind::FlightStick => PadDevice::FlightStick(FlightStick {
+            buttons,
+            ..FlightStick::default()
+        }),
+    }
+}
+
+/// The held-button bitfield of a slot device (0 for an empty slot).
+fn pad_device_buttons(dev: &PadDevice) -> u16 {
+    match dev {
+        PadDevice::Digital(pad) => pad.buttons,
+        PadDevice::Analog(pad) => pad.buttons,
+        PadDevice::FlightStick(pad) => pad.buttons,
+        PadDevice::Disconnected => 0,
+    }
+}
+
+/// Updates the analog-stick axes on a slot device in place. A digital or
+/// disconnected slot is promoted to an analog pad (preserving buttons); a
+/// flightstick keeps its kind and just updates its axes.
+fn set_pad_device_sticks(dev: &mut PadDevice, right: (u8, u8), left: (u8, u8)) {
+    if !matches!(dev, PadDevice::Analog(_) | PadDevice::FlightStick(_)) {
+        *dev = PadDevice::Analog(AnalogPad {
+            buttons: pad_device_buttons(dev),
+            ..AnalogPad::default()
+        });
+    }
+    match dev {
+        PadDevice::Analog(pad) => {
+            pad.rx = right.0;
+            pad.ry = right.1;
+            pad.lx = left.0;
+            pad.ly = left.1;
+        }
+        PadDevice::FlightStick(pad) => {
+            pad.rx = right.0;
+            pad.ry = right.1;
+            pad.lx = left.0;
+            pad.ly = left.1;
+        }
+        _ => {}
+    }
+}
+
+/// A Sony Multitap (SCPH-1070) 4-player adapter — adapter ID halfword `0x5A80`.
+///
+/// The tap plugs into **one** physical controller port and fans it out to four
+/// sub-slots (A/B/C/D), each holding an independent [`PadDevice`] and an
+/// optional [`MemoryCard`]. It implements **Method 1 ("burst")** access — the
+/// mode real games use — where a single poll returns the adapter ID followed by
+/// all four slots' poll data back-to-back (35 bytes total: a Hi-Z byte, the
+/// `0x5A80` adapter ID, then four slots × four halfwords). See
+/// [`Multitap::exchange_pad`].
+///
+/// The long burst is armed the way hardware does it: sending `0x01` as the
+/// **third** command byte does not change the current response, but requests
+/// that the **next** poll return the burst. Games therefore do two accesses in
+/// a row — a short Slot-A poll carrying the request, then the long A–D poll.
+///
+/// Memory cards behind the tap are addressed per-slot with address bytes
+/// `0x81`..`0x84` (`0x81` = Slot A … `0x84` = Slot D), reusing the standard
+/// [`MemoryCard`] serial protocol verbatim.
+///
+/// **Deliberately not implemented** (documented in the PR): Method 2
+/// slot-at-a-time pad addressing (`0n 42 ..`, `n` = 1..4); the exact "garbage"
+/// response hardware returns when the request bit is held across the long burst
+/// (we return a normal Slot-A poll instead); and IRQ10 lightgun wiring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Multitap {
+    /// The four sub-slot controllers (A/B/C/D).
+    pads: [PadDevice; 4],
+    /// The four sub-slot memory cards (A/B/C/D), or `None` when empty.
+    #[serde(default = "no_tap_cards")]
+    cards: [Option<MemoryCard>; 4],
+    /// Long-response latch: set when a poll's third command byte (the request
+    /// bit) was `0x01`, arming the **next** poll to return the four-slot burst.
+    #[serde(default)]
+    long_armed: bool,
+    /// Whether the in-progress poll is emitting the long (A–D) burst. Reset at
+    /// the start of every poll from `long_armed`.
+    #[serde(default)]
+    long_active: bool,
+}
+
+/// serde default for [`Multitap::cards`]: all four slots empty.
+fn no_tap_cards() -> [Option<MemoryCard>; 4] {
+    [None, None, None, None]
+}
+
+impl Default for Multitap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Multitap {
+    /// Creates a tap with a digital pad in Slot A (so the adapter responds) and
+    /// Slots B/C/D empty, no memory cards.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pads: [
+                PadDevice::default(),
+                PadDevice::Disconnected,
+                PadDevice::Disconnected,
+                PadDevice::Disconnected,
+            ],
+            cards: no_tap_cards(),
+            long_armed: false,
+            long_active: false,
+        }
+    }
+
+    /// Pad-side byte exchange (address byte `0x01` selected this tap). A short
+    /// (request-clear) poll is transparent to the Slot-A controller; a poll
+    /// armed by the previous request returns the four-slot burst.
+    fn exchange_pad(&mut self, phase: u8, tx: u8) -> (u8, bool) {
+        if phase == 0 {
+            // The tap only responds if Slot A holds a controller (hardware
+            // aborts a Slot-A access after the first byte when it is empty).
+            if matches!(self.pads[0], PadDevice::Disconnected) {
+                self.long_active = false;
+                self.long_armed = false;
+                return (0xFF, false);
+            }
+            // This poll's response kind was decided by the previous poll's
+            // request bit; consume the arm.
+            self.long_active = self.long_armed;
+            self.long_armed = false;
+        }
+        if self.long_active {
+            self.exchange_long(phase)
+        } else {
+            // A short poll is transparent to the Slot-A controller. Watch the
+            // third command byte (the request bit) to arm the next burst.
+            if phase == 2 && tx == 0x01 {
+                self.long_armed = true;
+            }
+            self.pads[0].exchange(phase, tx)
+        }
+    }
+
+    /// The 35-byte Method-1 burst: a Hi-Z byte, the `0x5A80` adapter ID, then
+    /// the four sub-slots (A–D) each contributing four halfwords (8 bytes).
+    fn exchange_long(&self, phase: u8) -> (u8, bool) {
+        match phase {
+            0 => (0xFF, true), // Hi-Z (the 0x01 address byte was already consumed)
+            1 => (0x80, true), // Multitap ID low (5A80)
+            2 => (0x5A, true), // Multitap ID high
+            3..=34 => {
+                let i = (phase - 3) as usize; // 0..=31
+                let slot = i / 8; // 0..=3 → A..D
+                let byte = i % 8;
+                // The final byte (Slot D, byte 7 → phase 34) does not ACK.
+                (self.pads[slot].burst_bytes()[byte], phase < 34)
+            }
+            _ => (0xFF, false),
         }
     }
 }
@@ -791,10 +1080,15 @@ pub enum TransferTarget {
     /// No transfer in progress / no device addressed.
     #[default]
     None,
-    /// Controller addressed (address byte 0x01).
+    /// Controller addressed (address byte 0x01) on a port with no multitap.
     Pad,
-    /// Memory card addressed (address byte 0x81).
+    /// Memory card addressed (address byte 0x81) on a port with no multitap.
     MemoryCard,
+    /// Controller addressed (address byte 0x01) on a port holding a multitap.
+    TapPad,
+    /// A multitap sub-slot memory card addressed (address bytes 0x81..=0x84);
+    /// the payload is the sub-slot index (0..=3 → A..D).
+    TapCard(u8),
 }
 
 /// SIO0 (controller / memory-card serial port) with a real digital-pad
@@ -840,6 +1134,16 @@ pub struct Sio0 {
     /// The memory card in each slot (0 / 1), or `None` when the slot is empty.
     #[serde(default = "no_cards")]
     cards: [Option<MemoryCard>; 2],
+    /// An optional multitap on each physical port (0 / 1). When present, pad
+    /// address `0x01` and memory-card addresses `0x81`..`0x84` on that port
+    /// route to the tap instead of the port's single pad / card.
+    #[serde(default = "no_taps")]
+    taps: [Option<Multitap>; 2],
+}
+
+/// serde default for [`Sio0::taps`]: no multitap on either port.
+fn no_taps() -> [Option<Multitap>; 2] {
+    [None, None]
 }
 
 /// serde default for [`Sio0::cards`]: both slots empty. (`[None, None]` cannot
@@ -891,6 +1195,7 @@ impl Sio0 {
             active: TransferTarget::None,
             pads: [PadDevice::default(), PadDevice::default()],
             cards: [None, None],
+            taps: [None, None],
         }
     }
 
@@ -941,6 +1246,7 @@ impl Sio0 {
             match dev {
                 PadDevice::Digital(pad) => pad.buttons = buttons,
                 PadDevice::Analog(pad) => pad.buttons = buttons,
+                PadDevice::FlightStick(pad) => pad.buttons = buttons,
                 PadDevice::Disconnected => {
                     *dev = PadDevice::Digital(DigitalPad { buttons });
                 }
@@ -951,11 +1257,7 @@ impl Sio0 {
     /// Returns the buttons currently held on the pad in `slot` (0 for an empty
     /// slot / out-of-range index).
     fn slot_buttons(&self, slot: usize) -> u16 {
-        match self.pads.get(slot) {
-            Some(PadDevice::Digital(pad)) => pad.buttons,
-            Some(PadDevice::Analog(pad)) => pad.buttons,
-            _ => 0,
-        }
+        self.pads.get(slot).map_or(0, pad_device_buttons)
     }
 
     /// Sets the device kind attached to `slot` (0 or 1), preserving the held
@@ -965,14 +1267,7 @@ impl Sio0 {
     pub fn set_controller_type(&mut self, slot: usize, kind: ControllerKind) {
         let buttons = self.slot_buttons(slot);
         if let Some(dev) = self.pads.get_mut(slot) {
-            *dev = match kind {
-                ControllerKind::Disconnected => PadDevice::Disconnected,
-                ControllerKind::Digital => PadDevice::Digital(DigitalPad { buttons }),
-                ControllerKind::Analog => PadDevice::Analog(AnalogPad {
-                    buttons,
-                    ..AnalogPad::default()
-                }),
-            };
+            *dev = pad_device_for(kind, buttons);
         }
     }
 
@@ -981,20 +1276,112 @@ impl Sio0 {
     /// to an analog pad** (preserving buttons) so a frontend that reports stick
     /// motion always gets analog behaviour. Out-of-range slots are ignored.
     pub fn set_sticks(&mut self, slot: usize, right: (u8, u8), left: (u8, u8)) {
-        let buttons = self.slot_buttons(slot);
         if let Some(dev) = self.pads.get_mut(slot) {
-            if !matches!(dev, PadDevice::Analog(_)) {
-                *dev = PadDevice::Analog(AnalogPad {
-                    buttons,
-                    ..AnalogPad::default()
-                });
+            set_pad_device_sticks(dev, right, left);
+        }
+    }
+
+    /// Attaches a fresh multitap (digital pad in Slot A, Slots B/C/D empty, no
+    /// memory cards) on physical `port` (0 or 1) when `enabled`, or detaches any
+    /// tap when not. Out-of-range ports are ignored.
+    pub fn set_multitap(&mut self, port: usize, enabled: bool) {
+        if let Some(slot) = self.taps.get_mut(port) {
+            *slot = enabled.then(Multitap::new);
+        }
+    }
+
+    /// Returns `true` if a multitap is attached on physical `port`.
+    #[must_use]
+    pub fn has_multitap(&self, port: usize) -> bool {
+        matches!(self.taps.get(port), Some(Some(_)))
+    }
+
+    /// Mutable access to a tap sub-slot device on `port`, or `None` when no tap
+    /// is present or the indices are out of range.
+    fn tap_pad_mut(&mut self, port: usize, sub: usize) -> Option<&mut PadDevice> {
+        match self.taps.get_mut(port) {
+            Some(Some(tap)) => tap.pads.get_mut(sub),
+            _ => None,
+        }
+    }
+
+    /// Replaces the pressed-button bitfield for tap sub-slot `sub` (0..=3 = A..D)
+    /// on `port`. A disconnected sub-slot becomes a digital pad. A no-op when no
+    /// tap is present or the indices are out of range.
+    pub fn set_multitap_buttons(&mut self, port: usize, sub: usize, buttons: u16) {
+        if let Some(dev) = self.tap_pad_mut(port, sub) {
+            match dev {
+                PadDevice::Digital(pad) => pad.buttons = buttons,
+                PadDevice::Analog(pad) => pad.buttons = buttons,
+                PadDevice::FlightStick(pad) => pad.buttons = buttons,
+                PadDevice::Disconnected => *dev = PadDevice::Digital(DigitalPad { buttons }),
             }
-            if let PadDevice::Analog(pad) = dev {
-                pad.rx = right.0;
-                pad.ry = right.1;
-                pad.lx = left.0;
-                pad.ly = left.1;
-            }
+        }
+    }
+
+    /// Sets the device kind attached to tap sub-slot `sub` (0..=3) on `port`,
+    /// preserving the held buttons. A no-op when no tap is present.
+    pub fn set_multitap_controller_type(&mut self, port: usize, sub: usize, kind: ControllerKind) {
+        if let Some(dev) = self.tap_pad_mut(port, sub) {
+            *dev = pad_device_for(kind, pad_device_buttons(dev));
+        }
+    }
+
+    /// Updates the analog-stick axes for tap sub-slot `sub` (0..=3) on `port`.
+    /// A non-analog sub-slot is promoted to an analog pad. A no-op when no tap
+    /// is present.
+    pub fn set_multitap_sticks(
+        &mut self,
+        port: usize,
+        sub: usize,
+        right: (u8, u8),
+        left: (u8, u8),
+    ) {
+        if let Some(dev) = self.tap_pad_mut(port, sub) {
+            set_pad_device_sticks(dev, right, left);
+        }
+    }
+
+    /// Simulates a press of the "Analog" button on tap sub-slot `sub` (0..=3) of
+    /// `port`, toggling that sub-slot's analog mode. A no-op unless the sub-slot
+    /// holds an analog pad.
+    pub fn press_multitap_analog_button(&mut self, port: usize, sub: usize) {
+        if let Some(PadDevice::Analog(pad)) = self.tap_pad_mut(port, sub) {
+            pad.press_analog_button();
+        }
+    }
+
+    /// Inserts a memory card built from `data` (padded/truncated to 128 KB) into
+    /// tap sub-slot `sub` (0..=3) on `port`. A no-op when no tap is present or
+    /// the indices are out of range.
+    pub fn insert_multitap_card(&mut self, port: usize, sub: usize, data: Vec<u8>) {
+        if let Some(Some(tap)) = self.taps.get_mut(port)
+            && let Some(c) = tap.cards.get_mut(sub)
+        {
+            *c = Some(MemoryCard::from_data(data));
+        }
+    }
+
+    /// Ejects the memory card in tap sub-slot `sub` (0..=3) on `port`, if any.
+    pub fn eject_multitap_card(&mut self, port: usize, sub: usize) {
+        if let Some(Some(tap)) = self.taps.get_mut(port)
+            && let Some(c) = tap.cards.get_mut(sub)
+        {
+            *c = None;
+        }
+    }
+
+    /// Returns the image + dirty flag of the memory card in tap sub-slot `sub`
+    /// on `port`, or `None` when no card is inserted.
+    #[must_use]
+    pub fn multitap_card_image(&self, port: usize, sub: usize) -> Option<(Vec<u8>, bool)> {
+        match self.taps.get(port) {
+            Some(Some(tap)) => tap
+                .cards
+                .get(sub)
+                .and_then(|c| c.as_ref())
+                .map(MemoryCard::image),
+            _ => None,
         }
     }
 
@@ -1089,15 +1476,20 @@ impl Sio0 {
             // No transfer without TX enable + Select asserted; drop the write.
             return;
         }
+        let slot = ((self.ctrl >> 13) & 1) as usize;
         if self.phase == 0 {
-            // The first byte of a transfer selects the device.
-            self.active = match tx {
-                0x01 => TransferTarget::Pad,
-                0x81 => TransferTarget::MemoryCard,
+            // The first byte of a transfer selects the device. When a multitap
+            // is present on the selected port, pad address 0x01 and per-slot
+            // memory-card addresses 0x81..0x84 route into the tap.
+            let has_tap = matches!(self.taps.get(slot), Some(Some(_)));
+            self.active = match (tx, has_tap) {
+                (0x01, true) => TransferTarget::TapPad,
+                (0x01, false) => TransferTarget::Pad,
+                (0x81, false) => TransferTarget::MemoryCard,
+                (0x81..=0x84, true) => TransferTarget::TapCard(tx - 0x81),
                 _ => TransferTarget::None,
             };
         }
-        let slot = ((self.ctrl >> 13) & 1) as usize;
         let (resp, ack) = match self.active {
             TransferTarget::Pad => self.pads[slot].exchange(self.phase, tx),
             TransferTarget::MemoryCard => match self.cards[slot].as_mut() {
@@ -1105,6 +1497,17 @@ impl Sio0 {
                 Some(card) => card.exchange(self.phase, tx),
                 // No card in this slot: answer open-bus and never ACK, so a
                 // BIOS/game probe (address 0x81) sees "no card" and moves on.
+                None => (0xFF, false),
+            },
+            TransferTarget::TapPad => match self.taps[slot].as_mut() {
+                Some(tap) => tap.exchange_pad(self.phase, tx),
+                None => (0xFF, false),
+            },
+            TransferTarget::TapCard(sub) => match self.taps[slot]
+                .as_mut()
+                .and_then(|tap| tap.cards[sub as usize].as_mut())
+            {
+                Some(card) => card.exchange(self.phase, tx),
                 None => (0xFF, false),
             },
             TransferTarget::None => (0xFF, false),
@@ -1926,5 +2329,287 @@ mod tests {
         let mut irq = Irq::new();
         sio.write16(0x1F80_104A, 0x1003);
         assert_eq!(pad_exchange(&mut sio, &mut irq, 0x01), 0xFF);
+    }
+
+    // ── Flightstick (analog joystick, ID 0x53) tests ────────────────────────
+
+    #[test]
+    fn flightstick_poll_sequence() {
+        // A flightstick reports ID 0x5A53 and the same 6-byte payload as an
+        // analog pad in analog mode: buttons (active-low) + RX, RY, LX, LY.
+        let mut sio = Sio0::new();
+        let mut irq = Irq::new();
+        sio.set_controller_type(0, ControllerKind::FlightStick);
+        sio.set_sticks(0, (0x12, 0x34), (0x56, 0x78));
+        // Cross (bit14) + Triangle (bit12) held.
+        let mask: u16 = (1 << 14) | (1 << 12);
+        sio.set_buttons(0, mask);
+        sio.write16(0x1F80_104A, 0x1003);
+        let resp = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0, 0, 0, 0, 0, 0, 0]);
+        let inv = !mask;
+        assert_eq!(
+            resp,
+            vec![
+                0xFF,
+                0x53,
+                0x5A,
+                (inv & 0xFF) as u8,
+                (inv >> 8) as u8,
+                0x12,
+                0x34,
+                0x56,
+                0x78
+            ],
+            "flightstick 0x42 poll: ID 0x53 + analog payload"
+        );
+    }
+
+    #[test]
+    fn flightstick_ignores_config_command() {
+        // A flightstick is a fixed analog device: it has no config mode, so it
+        // always answers with the analog-stick ID + poll payload regardless of
+        // the command byte (0x43 here does not toggle anything).
+        let mut sio = Sio0::new();
+        let mut irq = Irq::new();
+        sio.set_controller_type(0, ControllerKind::FlightStick);
+        sio.write16(0x1F80_104A, 0x1003);
+        let r = analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]);
+        assert_eq!(r[1], 0x53, "still reports the analog-stick ID");
+        // A follow-up poll is unaffected (no config mode was entered).
+        let poll = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(poll[1], 0x53, "no config mode; ID unchanged");
+    }
+
+    // ── Multitap (4-player adapter) tests ───────────────────────────────────
+
+    /// Attaches a multitap on port 0 with JOY_CTRL = TXEN | /DTR | ack-IEN and
+    /// Slot A a digital pad (so the tap responds), Slots B/C/D empty.
+    fn tap_sio() -> (Sio0, Irq) {
+        let mut sio = Sio0::new();
+        let irq = Irq::new();
+        sio.set_multitap(0, true);
+        sio.write16(0x1F80_104A, 0x1003);
+        (sio, irq)
+    }
+
+    #[test]
+    fn multitap_short_poll_is_transparent_to_slot_a() {
+        // With the request bit clear, a poll returns the Slot-A controller's own
+        // response (here a digital pad), exactly as if no tap were present.
+        let (mut sio, mut irq) = tap_sio();
+        sio.set_multitap_buttons(0, 0, 0x0000);
+        let resp = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0x00, 0x00, 0x00]);
+        assert_eq!(resp, vec![0xFF, 0x41, 0x5A, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn multitap_burst_mixed_devices() {
+        let (mut sio, mut irq) = tap_sio();
+        // Slot A: digital pad, Select (bit0) held.
+        sio.set_multitap_controller_type(0, 0, ControllerKind::Digital);
+        let a_mask: u16 = 1 << 0;
+        sio.set_multitap_buttons(0, 0, a_mask);
+        // Slot B: analog pad in analog mode, Square (bit15) held, distinct sticks.
+        sio.set_multitap_controller_type(0, 1, ControllerKind::Analog);
+        sio.press_multitap_analog_button(0, 1);
+        let b_mask: u16 = 1 << 15;
+        sio.set_multitap_buttons(0, 1, b_mask);
+        sio.set_multitap_sticks(0, 1, (0x11, 0x22), (0x33, 0x44));
+        // Slot C: flightstick, Cross (bit14) held, distinct sticks.
+        sio.set_multitap_controller_type(0, 2, ControllerKind::FlightStick);
+        let c_mask: u16 = 1 << 14;
+        sio.set_multitap_buttons(0, 2, c_mask);
+        sio.set_multitap_sticks(0, 2, (0xAA, 0xBB), (0xCC, 0xDD));
+        // Slot D: left empty (disconnected).
+        sio.set_multitap_controller_type(0, 3, ControllerKind::Disconnected);
+
+        // First (short) poll carries the request bit as the third command byte;
+        // it returns normal Slot-A data and arms the next poll for the burst.
+        let short = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0x01, 0x00, 0x00]);
+        let a_inv = !a_mask;
+        assert_eq!(
+            short,
+            vec![0xFF, 0x41, 0x5A, (a_inv & 0xFF) as u8, (a_inv >> 8) as u8],
+            "request-carrying poll returns normal Slot-A data"
+        );
+
+        // Second poll returns the full 35-byte A-D burst.
+        let mut tx = vec![0u8; 35];
+        tx[0] = 0x01;
+        tx[1] = 0x42;
+        let burst = analog_cmd(&mut sio, &mut irq, &tx);
+
+        let b_inv = !b_mask;
+        let c_inv = !c_mask;
+        let mut expected = vec![0xFF, 0x80, 0x5A]; // Hi-Z + Multitap ID 5A80
+        // Slot A: digital -> 2 halfwords + FFFF padding.
+        expected.extend_from_slice(&[
+            0x41,
+            0x5A,
+            (a_inv & 0xFF) as u8,
+            (a_inv >> 8) as u8,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+        ]);
+        // Slot B: analog in analog mode -> ID + buttons + both sticks.
+        expected.extend_from_slice(&[
+            0x73,
+            0x5A,
+            (b_inv & 0xFF) as u8,
+            (b_inv >> 8) as u8,
+            0x11,
+            0x22,
+            0x33,
+            0x44,
+        ]);
+        // Slot C: flightstick -> ID 0x53 + buttons + both sticks.
+        expected.extend_from_slice(&[
+            0x53,
+            0x5A,
+            (c_inv & 0xFF) as u8,
+            (c_inv >> 8) as u8,
+            0xAA,
+            0xBB,
+            0xCC,
+            0xDD,
+        ]);
+        // Slot D: empty -> all four halfwords 0xFF.
+        expected.extend_from_slice(&[0xFF; 8]);
+        assert_eq!(burst.len(), 35, "burst is 35 bytes");
+        assert_eq!(burst, expected, "full multitap A-D burst byte-for-byte");
+    }
+
+    #[test]
+    fn multitap_request_toggles_short_and_long() {
+        // Toggling the request bit alternates between normal Slot-A and burst.
+        let (mut sio, mut irq) = tap_sio();
+        sio.set_multitap_buttons(0, 0, 0x0000);
+        let mut long_tx = vec![0u8; 35];
+        long_tx[0] = 0x01;
+        long_tx[1] = 0x42;
+
+        // Poll 1 with request set: short Slot-A response (5 bytes), arms burst.
+        let p1 = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0x01, 0x00, 0x00]);
+        assert_eq!(p1[1], 0x41, "poll 1 is normal Slot-A (digital ID)");
+        // Poll 2: the armed burst (adapter ID 0x80).
+        let p2 = analog_cmd(&mut sio, &mut irq, &long_tx);
+        assert_eq!(p2[1], 0x80, "poll 2 is the burst (Multitap ID)");
+        // Poll 3 with request clear: back to a short Slot-A response.
+        let p3 = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0x00, 0x00, 0x00]);
+        assert_eq!(p3[1], 0x41, "poll 3 is normal Slot-A again");
+    }
+
+    #[test]
+    fn multitap_empty_slot_a_does_not_respond() {
+        // If Slot A is empty the tap aborts after the address byte (no ACK).
+        let (mut sio, mut irq) = tap_sio();
+        sio.set_multitap_controller_type(0, 0, ControllerKind::Disconnected);
+        let r = pad_exchange(&mut sio, &mut irq, 0x01);
+        assert_eq!(r, 0xFF, "empty Slot A: open-bus");
+        assert!(!irq.pending(), "empty Slot A does not ACK");
+    }
+
+    #[test]
+    fn multitap_memory_card_addressing() {
+        // A card behind the tap is addressed by 0x81..0x84 (Slot A..D). Insert a
+        // card in Slot C (0x83); a Get-ID there must reach it, while empty Slot B
+        // (0x82) answers open-bus.
+        let (mut sio, mut irq) = tap_sio();
+        sio.insert_multitap_card(0, 2, vec![0u8; MEMCARD_SIZE]);
+
+        // Slot C Get-ID (address 0x83): full 10-byte sequence.
+        let tx = [0x83u8, 0x53, 0, 0, 0, 0, 0, 0, 0, 0];
+        let resp = card_command(&mut sio, &mut irq, &tx);
+        assert_eq!(
+            resp,
+            vec![0xFF, 0x08, 0x5A, 0x5D, 0x5C, 0x5D, 0x04, 0x00, 0x00, 0x80],
+            "Get-ID reaches the card in tap Slot C"
+        );
+
+        // Slot B (0x82) is empty: address byte answers open-bus, no ACK.
+        let r = pad_exchange(&mut sio, &mut irq, 0x82);
+        assert_eq!(r, 0xFF, "empty tap Slot B card: open-bus");
+        assert!(!irq.pending(), "empty tap card slot does not ACK");
+    }
+
+    #[test]
+    fn multitap_card_write_read_round_trip() {
+        // Full write-then-read of a memory card in tap Slot D (address 0x84).
+        let (mut sio, mut irq) = tap_sio();
+        sio.insert_multitap_card(0, 3, vec![0u8; MEMCARD_SIZE]);
+        let addr = 0x0007u16;
+        let mut sector = [0u8; 128];
+        for (i, b) in sector.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x3C;
+        }
+        let chk = checksum(addr, &sector);
+
+        let mut wtx = write_tx(addr, &sector, chk);
+        wtx[0] = 0x84; // re-address to tap Slot D instead of the single-card 0x81
+        let wresp = card_command(&mut sio, &mut irq, &wtx);
+        assert_eq!(
+            *wresp.last().unwrap(),
+            0x47,
+            "good write to tap Slot D card"
+        );
+
+        let mut rtx = read_tx(addr);
+        rtx[0] = 0x84;
+        let rresp = card_command(&mut sio, &mut irq, &rtx);
+        assert_eq!(
+            &rresp[10..138],
+            &sector[..],
+            "tap Slot D read matches write"
+        );
+        assert_eq!(rresp[139], 0x47, "good read end byte");
+        // Confirm the image reflects the write.
+        let (image, dirty) = sio.multitap_card_image(0, 3).unwrap();
+        assert!(dirty, "tap card marked dirty after write");
+        assert_eq!(
+            &image[addr as usize * 128..addr as usize * 128 + 128],
+            &sector[..]
+        );
+    }
+
+    #[test]
+    fn multitap_serde_round_trip() {
+        // Full tap state — per-slot devices AND per-slot memory cards — survives
+        // a snapshot save/load.
+        let (mut sio, _irq) = tap_sio();
+        sio.set_multitap_controller_type(0, 1, ControllerKind::Analog);
+        sio.press_multitap_analog_button(0, 1);
+        sio.set_multitap_buttons(0, 1, 0x1234);
+        sio.set_multitap_sticks(0, 1, (0x11, 0x22), (0x33, 0x44));
+        sio.set_multitap_controller_type(0, 2, ControllerKind::FlightStick);
+        sio.set_multitap_sticks(0, 2, (0xAA, 0xBB), (0xCC, 0xDD));
+        // Insert cards in two sub-slots with distinctive data so the per-slot
+        // card image (and its flag/dirty state) is proven to serialize.
+        let mut card_a = vec![0u8; MEMCARD_SIZE];
+        for (i, b) in card_a.iter_mut().take(256).enumerate() {
+            *b = (i as u8) ^ 0x5A;
+        }
+        sio.insert_multitap_card(0, 0, card_a.clone());
+        sio.insert_multitap_card(0, 3, vec![0xC3u8; MEMCARD_SIZE]);
+
+        let json = serde_json::to_string(&sio).unwrap();
+        let back: Sio0 = serde_json::from_str(&json).unwrap();
+        assert_eq!(sio, back, "tap state (devices + cards) round-trips");
+        // The restored cards still hold their images.
+        let (image_a, _) = back.multitap_card_image(0, 0).unwrap();
+        assert_eq!(
+            &image_a[..256],
+            &card_a[..256],
+            "Slot A card image survives"
+        );
+        assert!(
+            back.multitap_card_image(0, 3).is_some(),
+            "Slot D card survives"
+        );
+        assert!(
+            back.multitap_card_image(0, 1).is_none(),
+            "empty slot stays empty"
+        );
     }
 }
