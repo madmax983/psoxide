@@ -269,6 +269,15 @@ impl Cdrom {
         self.cd_audio.drain(..).collect()
     }
 
+    /// Returns `true` if any decoded CD-audio frames are queued. Callers use
+    /// this to avoid the per-instruction `take_cd_audio` Vec allocation when the
+    /// drive has produced nothing (the common idle case).
+    #[inline]
+    #[must_use]
+    pub fn has_cd_audio(&self) -> bool {
+        !self.cd_audio.is_empty()
+    }
+
     /// Returns `true` if `phys` falls in the CD-ROM register window.
     #[must_use]
     pub fn contains(phys: u32) -> bool {
@@ -1113,6 +1122,16 @@ impl Cdrom {
     /// responses and raising [`IrqLine::CdRom`] when an enabled interrupt
     /// latches.
     pub fn tick(&mut self, cycles: u32, irq: &mut Irq) {
+        // Idle fast path. `tick_one` only mutates state when the drive is
+        // reading (advancing `read_timer` / `process_read_sector`), playing
+        // (CD-DA sector cadence), or has a queued `pending` response (delay
+        // countdown + latch). When none of those hold it is a pure no-op, and
+        // nothing in `tick_one` starts a read/play or enqueues a response, so
+        // the predicate stays true for the whole `cycles` window. Skipping the
+        // per-cycle loop is therefore exactly equivalent to running it.
+        if !self.reading && !self.playing && self.pending.is_empty() {
+            return;
+        }
         for _ in 0..cycles {
             self.tick_one(irq);
         }

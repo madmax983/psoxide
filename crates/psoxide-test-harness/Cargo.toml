@@ -12,3 +12,12 @@ serde_json = "1"
 # The CUE/BIN disc-image parser (`disc` module) lives in psoxide-config; the
 # CD-ROM integration test drives it directly.
 psoxide-config = { path = "../psoxide-config" }
+# Criterion powers the `benches/hot_loop.rs` perf-baseline suite. `harness =
+# false` on the [[bench]] below keeps it out of `cargo test` (it only compiles
+# under `cargo bench`). default-features off + only `cargo_bench_support` avoids
+# pulling optional plotting/html deps that can break on newer toolchains.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "hot_loop"
+harness = false
