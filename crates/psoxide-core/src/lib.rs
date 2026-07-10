@@ -24,8 +24,8 @@ pub mod timers;
 pub mod timing;
 
 pub use api::{
-    BIOS_IMAGE_SIZE, Button, Command, CoreError, CoreQuery, CoreSnapshot, EmulatorState,
-    FRAME_HEIGHT, FRAME_RGBA_BYTES, FRAME_WIDTH, Memory, PsxCore, QueryResult,
+    BIOS_IMAGE_SIZE, Button, Command, ControllerKind, CoreError, CoreQuery, CoreSnapshot,
+    EmulatorState, FRAME_HEIGHT, FRAME_RGBA_BYTES, FRAME_WIDTH, Memory, PsxCore, QueryResult,
 };
 pub use bus::{BusRegion, map_region, mask_region};
 pub use cdrom::{Cdrom, Disc, DiscTrack};

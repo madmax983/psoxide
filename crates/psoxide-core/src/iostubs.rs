@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
+use crate::api::ControllerKind;
 use crate::irq::{Irq, IrqLine};
 use crate::timing::MemTiming;
 
@@ -170,8 +171,10 @@ impl DigitalPad {
     /// Digital-pad byte exchange indexed by transfer `phase`. Returns the
     /// response byte the pad shifts back and whether it asserts `/ACK` (which
     /// requests the next byte). The final data byte (phase 4) does **not** ACK,
-    /// ending the transfer.
-    fn exchange(&self, phase: u8) -> (u8, bool) {
+    /// ending the transfer. The outgoing `tx` byte is unused by a digital pad
+    /// (it has no configurable/rumble state) but is accepted so every pad
+    /// variant shares one `exchange` signature.
+    fn exchange(&mut self, phase: u8, _tx: u8) -> (u8, bool) {
         let inv = !self.buttons; // active-low on the wire
         match phase {
             // Address byte (0x01) acknowledged: pad answers idle, requests more.
@@ -186,6 +189,305 @@ impl DigitalPad {
             4 => ((inv >> 8) as u8, false),
             // Past the end of a digital exchange: nothing more to send.
             _ => (0xFF, false),
+        }
+    }
+}
+
+/// A Sony DualShock / DualAnalog (SCPH-1200) controller.
+///
+/// The pad implements the Nocash PSX-SPX serial protocol byte-for-byte through
+/// [`AnalogPad::exchange`], which — like [`MemoryCard::exchange`] — is called
+/// once per transfer byte with the transfer `phase` and the CPU's outgoing `tx`
+/// byte and returns `(response, ack)`.
+///
+/// Two orthogonal mode bits shape every transaction:
+/// - `analog_mode`: when clear the pad reports the digital ID `0x41` and a
+///   2-byte (buttons-only) poll, identical to a [`DigitalPad`]; when set it
+///   reports the analog ID `0x73` and a 6-byte poll (buttons + both sticks).
+/// - `config_mode` (a.k.a. escape mode): entered/left with command `0x43`.
+///   While set, the pad reports the config ID `0xF3`, every command runs the
+///   9-byte config framing, and the `0x44`..`0x4D` config command set is
+///   honoured.
+///
+/// The ID reported in the header (phases 1–2) reflects the mode at the **start**
+/// of the transaction, so a `0x43`-enter shows the previous-mode ID and only
+/// flips `config_mode` when the argument byte arrives at phase 3.
+///
+/// Rumble: while polling in analog/config mode the CPU's outgoing bytes are
+/// motor actuations. `vib_map` (set by `0x4D`) routes each of the six poll
+/// bytes to a motor — map value `0x00` drives the small motor, `0x01` the large
+/// motor, `0xFF` (the default) ignores the byte — and the last routed value is
+/// latched into `motor_small` / `motor_large` for the frontend to read.
+///
+/// The physical "Analog" toggle button on the real pad flips `analog_mode`
+/// unless the host has locked it via a `0x44 .. BB=02` command; see
+/// [`AnalogPad::press_analog_button`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalogPad {
+    /// Pressed-button bitfield (active-high, PSX bit layout incl. L2/R2/L3/R3).
+    pub buttons: u16,
+    /// Right analog stick X (0x00 left … 0x80 centre … 0xFF right).
+    pub rx: u8,
+    /// Right analog stick Y (0x00 up … 0x80 centre … 0xFF down).
+    pub ry: u8,
+    /// Left analog stick X.
+    pub lx: u8,
+    /// Left analog stick Y.
+    pub ly: u8,
+    /// Analog mode: `false` → digital ID/poll, `true` → analog ID/poll.
+    pub analog_mode: bool,
+    /// Analog lock: set by `0x44 .. BB=02` (physical Analog button "disabled").
+    /// We have no physical button beyond [`Self::press_analog_button`]; when
+    /// locked that helper is a no-op. The flag is stored and reported verbatim.
+    pub analog_locked: bool,
+    /// Escape / config mode (entered/left via `0x43`).
+    pub config_mode: bool,
+    /// `0x4D` vibration byte→motor mapping for the six poll bytes. Default all
+    /// `0xFF` (every byte ignored).
+    pub vib_map: [u8; 6],
+    /// Last small-motor actuation routed from a poll's motor bytes.
+    pub motor_small: u8,
+    /// Last large-motor actuation routed from a poll's motor bytes.
+    pub motor_large: u8,
+    /// Command byte latched at phase 1 (transient; reset each transfer).
+    #[serde(skip)]
+    cmd: u8,
+    /// First argument byte latched at phase 3 for commands whose later response
+    /// bytes depend on it (`0x46` / `0x4C`). Transient; reset each transfer.
+    #[serde(skip)]
+    arg: u8,
+}
+
+impl Default for AnalogPad {
+    fn default() -> Self {
+        Self {
+            buttons: 0,
+            rx: 0x80,
+            ry: 0x80,
+            lx: 0x80,
+            ly: 0x80,
+            analog_mode: false,
+            analog_locked: false,
+            config_mode: false,
+            vib_map: [0xFF; 6],
+            motor_small: 0,
+            motor_large: 0,
+            cmd: 0,
+            arg: 0,
+        }
+    }
+}
+
+impl AnalogPad {
+    /// The header ID-low byte for a transaction, reflecting the mode at its
+    /// start: `0xF3` in config mode, else `0x73` in analog mode, else `0x41`.
+    fn id_low(&self) -> u8 {
+        if self.config_mode {
+            0xF3
+        } else if self.analog_mode {
+            0x73
+        } else {
+            0x41
+        }
+    }
+
+    /// Number of data bytes after the `0x5A` header byte. A plain digital poll
+    /// (`0x42` while neither analog nor config mode) sends two (buttons only);
+    /// every other command — analog/config poll, `0x43`, and the config command
+    /// set — sends six.
+    fn data_len(&self) -> u8 {
+        if self.cmd == 0x42 && !self.analog_mode && !self.config_mode {
+            2
+        } else {
+            6
+        }
+    }
+
+    /// Simulates the physical "Analog" toggle button: flips `analog_mode` unless
+    /// the host has locked analog control via `0x44 .. BB=02`. Real pads latch a
+    /// button press here; we expose it as an explicit host action since the core
+    /// has no physical button.
+    pub fn press_analog_button(&mut self) {
+        if !self.analog_locked {
+            self.analog_mode = !self.analog_mode;
+        }
+    }
+
+    /// One byte of the poll response (`0x42`), data index `idx` (0-based, i.e.
+    /// phase `3 + idx`). In analog/config mode the six outgoing `tx` bytes are
+    /// motor actuations routed through `vib_map`.
+    fn poll_byte(&mut self, idx: u8, tx: u8) -> u8 {
+        // Route the outgoing motor byte for this slot (only the 6-byte analog/
+        // config poll carries motor bytes; the 2-byte digital poll does not).
+        if self.analog_mode || self.config_mode {
+            match self.vib_map.get(idx as usize).copied().unwrap_or(0xFF) {
+                0x00 => self.motor_small = tx,
+                0x01 => self.motor_large = tx,
+                _ => {}
+            }
+        }
+        let inv = !self.buttons; // active-low on the wire
+        match idx {
+            0 => (inv & 0xFF) as u8,
+            1 => (inv >> 8) as u8,
+            2 => self.rx,
+            3 => self.ry,
+            4 => self.lx,
+            5 => self.ly,
+            _ => 0xFF,
+        }
+    }
+
+    /// One data byte (after the `0x5A` header) for the latched command, data
+    /// index `idx` (phase `3 + idx`) with the CPU's outgoing `tx` byte. This is
+    /// also where command side effects (mode toggles, arg latching, motor
+    /// routing, vib-map programming) are applied.
+    ///
+    /// Config-mode-only commands (`0x44`..`0x4D`) are honoured **only** while
+    /// `config_mode` is set; issued outside config mode they fall through to the
+    /// unknown-command arm, which returns all-zero data with the current-mode
+    /// header (a safe no-op ACKed for the full 6-byte config framing).
+    fn data_byte(&mut self, idx: u8, tx: u8) -> u8 {
+        match self.cmd {
+            // Poll: buttons (+ sticks in analog/config mode).
+            0x42 => self.poll_byte(idx, tx),
+            // Enter/exit config: arg at phase 3 toggles config mode.
+            0x43 => {
+                if idx == 0 {
+                    match tx {
+                        0x01 => self.config_mode = true,
+                        0x00 => self.config_mode = false,
+                        _ => {}
+                    }
+                }
+                0x00
+            }
+            // Set analog mode / LED (config only).
+            0x44 if self.config_mode => {
+                match idx {
+                    0 => match tx {
+                        0x00 => self.analog_mode = false,
+                        0x01 => self.analog_mode = true,
+                        _ => {}
+                    },
+                    1 => match tx {
+                        0x02 => self.analog_locked = true,
+                        0x03 => self.analog_locked = false,
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                0x00
+            }
+            // Get LED status (config only): 01 02 LL 02 01 00.
+            0x45 if self.config_mode => match idx {
+                0 => 0x01,
+                1 => 0x02,
+                2 => u8::from(self.analog_mode),
+                3 => 0x02,
+                4 => 0x01,
+                _ => 0x00,
+            },
+            // Constant query with arg at phase 3 (config only).
+            0x46 if self.config_mode => {
+                if idx == 0 {
+                    self.arg = tx;
+                }
+                // arg 00 => 00 00 01 02 00 0A ; arg 01 => 00 00 01 01 01 14.
+                match idx {
+                    0 | 1 => 0x00,
+                    2 => 0x01,
+                    3 => {
+                        if self.arg == 0x00 {
+                            0x02
+                        } else {
+                            0x01
+                        }
+                    }
+                    4 => {
+                        if self.arg == 0x00 {
+                            0x00
+                        } else {
+                            0x01
+                        }
+                    }
+                    _ => {
+                        if self.arg == 0x00 {
+                            0x0A
+                        } else {
+                            0x14
+                        }
+                    }
+                }
+            }
+            // Constant query (config only): 00 00 02 00 01 00.
+            0x47 if self.config_mode => match idx {
+                2 => 0x02,
+                4 => 0x01,
+                _ => 0x00,
+            },
+            // Constant query with arg at phase 3 (config only).
+            0x4C if self.config_mode => {
+                if idx == 0 {
+                    self.arg = tx;
+                }
+                // arg 00 => 00 00 00 04 00 00 ; arg 01 => 00 00 00 07 00 00.
+                if idx == 3 {
+                    if self.arg == 0x00 { 0x04 } else { 0x07 }
+                } else {
+                    0x00
+                }
+            }
+            // Set vibration mapping (config only): responds with the OLD map,
+            // stores the new six bytes.
+            0x4D if self.config_mode => {
+                let i = idx as usize;
+                let old = self.vib_map.get(i).copied().unwrap_or(0xFF);
+                if let Some(slot) = self.vib_map.get_mut(i) {
+                    *slot = tx;
+                }
+                old
+            }
+            // Unknown command (or a config command outside config mode): a safe
+            // all-zero no-op ACKed for the full framing.
+            _ => 0x00,
+        }
+    }
+
+    /// Full-duplex byte exchange indexed by the transfer `phase` with the CPU's
+    /// outgoing `tx` byte. Returns `(response, ack)`; `ack == false` ends the
+    /// transfer.
+    fn exchange(&mut self, phase: u8, tx: u8) -> (u8, bool) {
+        match phase {
+            // Address byte (0x01) selected this pad; reset per-command scratch.
+            0 => {
+                self.cmd = 0;
+                self.arg = 0;
+                (0xFF, true)
+            }
+            // Latch the command byte; answer the mode-dependent ID-low byte.
+            1 => {
+                self.cmd = tx;
+                (self.id_low(), true)
+            }
+            // ID-high byte.
+            2 => (0x5A, true),
+            // Data bytes; the final one does not ACK.
+            _ => {
+                let idx = phase - 3;
+                let last = self.data_len().saturating_sub(1);
+                let resp = self.data_byte(idx, tx);
+                let ack = idx < last;
+                if !ack {
+                    // Transaction complete: clear the transient scratch so the
+                    // post-transaction pad state is canonical (matters for the
+                    // `#[serde(skip)]` fields' round-trip and for a clean start
+                    // of the next transfer).
+                    self.cmd = 0;
+                    self.arg = 0;
+                }
+                (resp, ack)
+            }
         }
     }
 }
@@ -457,6 +759,8 @@ impl MemoryCard {
 pub enum PadDevice {
     /// A standard digital pad.
     Digital(DigitalPad),
+    /// A DualShock / DualAnalog pad.
+    Analog(AnalogPad),
     /// No device in this slot.
     Disconnected,
 }
@@ -468,10 +772,12 @@ impl Default for PadDevice {
 }
 
 impl PadDevice {
-    /// One byte of the slot device's exchange. Returns `(response, ack)`.
-    fn exchange(&self, phase: u8) -> (u8, bool) {
+    /// One byte of the slot device's exchange with the CPU's outgoing `tx`
+    /// byte. Returns `(response, ack)`.
+    fn exchange(&mut self, phase: u8, tx: u8) -> (u8, bool) {
         match self {
-            PadDevice::Digital(pad) => pad.exchange(phase),
+            PadDevice::Digital(pad) => pad.exchange(phase, tx),
+            PadDevice::Analog(pad) => pad.exchange(phase, tx),
             // Nothing on the bus: pad answers open-bus and never ACKs.
             PadDevice::Disconnected => (0xFF, false),
         }
@@ -628,15 +934,86 @@ impl Sio0 {
     }
 
     /// Replaces the pressed-button bitfield for `slot` (0 or 1). A slot that was
-    /// disconnected becomes a digital pad. Out-of-range slots are ignored.
+    /// disconnected becomes a digital pad; an analog pad keeps its analog state.
+    /// Out-of-range slots are ignored.
     pub fn set_buttons(&mut self, slot: usize, buttons: u16) {
         if let Some(dev) = self.pads.get_mut(slot) {
             match dev {
                 PadDevice::Digital(pad) => pad.buttons = buttons,
+                PadDevice::Analog(pad) => pad.buttons = buttons,
                 PadDevice::Disconnected => {
                     *dev = PadDevice::Digital(DigitalPad { buttons });
                 }
             }
+        }
+    }
+
+    /// Returns the buttons currently held on the pad in `slot` (0 for an empty
+    /// slot / out-of-range index).
+    fn slot_buttons(&self, slot: usize) -> u16 {
+        match self.pads.get(slot) {
+            Some(PadDevice::Digital(pad)) => pad.buttons,
+            Some(PadDevice::Analog(pad)) => pad.buttons,
+            _ => 0,
+        }
+    }
+
+    /// Sets the device kind attached to `slot` (0 or 1), preserving the held
+    /// buttons across the change. Promoting to [`ControllerKind::Analog`]
+    /// power-on-resets the analog state (digital mode, centred sticks).
+    /// Out-of-range slots are ignored.
+    pub fn set_controller_type(&mut self, slot: usize, kind: ControllerKind) {
+        let buttons = self.slot_buttons(slot);
+        if let Some(dev) = self.pads.get_mut(slot) {
+            *dev = match kind {
+                ControllerKind::Disconnected => PadDevice::Disconnected,
+                ControllerKind::Digital => PadDevice::Digital(DigitalPad { buttons }),
+                ControllerKind::Analog => PadDevice::Analog(AnalogPad {
+                    buttons,
+                    ..AnalogPad::default()
+                }),
+            };
+        }
+    }
+
+    /// Updates the analog-stick axes for `slot` (right = `(x, y)`, left =
+    /// `(x, y)`; `0x80` is centre). A digital or disconnected slot is **promoted
+    /// to an analog pad** (preserving buttons) so a frontend that reports stick
+    /// motion always gets analog behaviour. Out-of-range slots are ignored.
+    pub fn set_sticks(&mut self, slot: usize, right: (u8, u8), left: (u8, u8)) {
+        let buttons = self.slot_buttons(slot);
+        if let Some(dev) = self.pads.get_mut(slot) {
+            if !matches!(dev, PadDevice::Analog(_)) {
+                *dev = PadDevice::Analog(AnalogPad {
+                    buttons,
+                    ..AnalogPad::default()
+                });
+            }
+            if let PadDevice::Analog(pad) = dev {
+                pad.rx = right.0;
+                pad.ry = right.1;
+                pad.lx = left.0;
+                pad.ly = left.1;
+            }
+        }
+    }
+
+    /// Simulates a press of the pad's physical "Analog" button on `slot`,
+    /// toggling analog mode unless the host has locked it. A no-op for a
+    /// non-analog or out-of-range slot.
+    pub fn press_analog_button(&mut self, slot: usize) {
+        if let Some(PadDevice::Analog(pad)) = self.pads.get_mut(slot) {
+            pad.press_analog_button();
+        }
+    }
+
+    /// Returns the `(small, large)` motor actuation last latched by the analog
+    /// pad in `slot`, or `None` when the slot holds no analog pad.
+    #[must_use]
+    pub fn motor_state(&self, slot: usize) -> Option<(u8, u8)> {
+        match self.pads.get(slot) {
+            Some(PadDevice::Analog(pad)) => Some((pad.motor_small, pad.motor_large)),
+            _ => None,
         }
     }
 
@@ -706,7 +1083,7 @@ impl Sio0 {
         }
         let slot = ((self.ctrl >> 13) & 1) as usize;
         let (resp, ack) = match self.active {
-            TransferTarget::Pad => self.pads[slot].exchange(self.phase),
+            TransferTarget::Pad => self.pads[slot].exchange(self.phase, tx),
             TransferTarget::MemoryCard => match self.cards[slot].as_mut() {
                 // A card is present: run the serial protocol byte exchange.
                 Some(card) => card.exchange(self.phase, tx),
@@ -1217,5 +1594,293 @@ mod tests {
 
         let long = MemoryCard::from_data(vec![0xCD; MEMCARD_SIZE + 100]);
         assert_eq!(long.image().0.len(), MEMCARD_SIZE, "long image truncated");
+    }
+
+    // ── Analog (DualShock) pad tests ────────────────────────────────────────
+
+    /// A fresh SIO0 with an analog pad in slot 0 and JOY_CTRL = TXEN | /DTR |
+    /// ack-IEN.
+    fn analog_sio() -> (Sio0, Irq) {
+        let mut sio = Sio0::new();
+        let irq = Irq::new();
+        sio.set_controller_type(0, ControllerKind::Analog);
+        sio.write16(0x1F80_104A, 0x1003);
+        (sio, irq)
+    }
+
+    /// Drives one full analog-pad transaction through the SIO0 register file,
+    /// returning the device's per-byte responses.
+    fn analog_cmd(sio: &mut Sio0, irq: &mut Irq, tx: &[u8]) -> Vec<u8> {
+        tx.iter().map(|&b| pad_exchange(sio, irq, b)).collect()
+    }
+
+    #[test]
+    fn analog_pad_poll_digital_id() {
+        // An analog pad with analog_mode == false polls exactly like a digital
+        // pad: 0x41 ID and a 2-byte (buttons-only) response.
+        let (mut sio, mut irq) = analog_sio();
+        let resp = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0x00, 0x00, 0x00]);
+        assert_eq!(resp, vec![0xFF, 0x41, 0x5A, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn analog_pad_poll_analog_mode() {
+        let (mut sio, mut irq) = analog_sio();
+        // Distinct stick values, then enable analog mode via the physical button.
+        sio.set_sticks(0, (0x12, 0x34), (0x56, 0x78));
+        sio.press_analog_button(0);
+        // 9-byte analog poll: FF 73 5A BL BH RX RY LX LY.
+        let resp = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            resp,
+            vec![0xFF, 0x73, 0x5A, 0xFF, 0xFF, 0x12, 0x34, 0x56, 0x78]
+        );
+    }
+
+    #[test]
+    fn analog_pad_poll_analog_mode_with_buttons() {
+        let (mut sio, mut irq) = analog_sio();
+        sio.set_sticks(0, (0x10, 0x20), (0x30, 0x40));
+        sio.press_analog_button(0);
+        // L3 (bit1) + R2 (bit9) held — buttons only reachable with an analog pad.
+        let mask: u16 = (1 << 1) | (1 << 9);
+        sio.set_buttons(0, mask);
+        let resp = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0, 0, 0, 0, 0, 0, 0]);
+        let inv = !mask;
+        assert_eq!(resp[3], (inv & 0xFF) as u8, "buttons low byte");
+        assert_eq!(resp[4], (inv >> 8) as u8, "buttons high byte");
+    }
+
+    #[test]
+    fn analog_enter_config_returns_f3() {
+        let (mut sio, mut irq) = analog_sio();
+        // 0x43 enter (arg 0x01). The header ID reflects the *old* mode (0x41).
+        let enter = analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            enter,
+            vec![0xFF, 0x41, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        // A follow-up transaction now reports the config ID 0xF3.
+        let follow = analog_cmd(&mut sio, &mut irq, &[0x01, 0x45, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(follow[1], 0xF3, "config-mode header ID");
+    }
+
+    #[test]
+    fn analog_exit_config() {
+        let (mut sio, mut irq) = analog_sio();
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]); // enter
+        // 0x43 exit (arg 0x00). The header still shows 0xF3 (mode at start).
+        let exit = analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x00, 0, 0, 0, 0, 0]);
+        assert_eq!(exit[1], 0xF3, "exit header still config-mode ID");
+        // Back to normal: a poll reports the digital ID 0x41 again.
+        let poll = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0, 0, 0]);
+        assert_eq!(poll, vec![0xFF, 0x41, 0x5A, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn config_0x44_set_analog() {
+        let (mut sio, mut irq) = analog_sio();
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]); // enter config
+        // 0x44 AA=01 (analog on), BB=02 (lock analog).
+        let r = analog_cmd(
+            &mut sio,
+            &mut irq,
+            &[0x01, 0x44, 0x00, 0x01, 0x02, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            r,
+            vec![0xFF, 0xF3, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        // Exit config: analog mode is now on (0x73 poll).
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x00, 0, 0, 0, 0, 0]);
+        let poll = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(poll[1], 0x73, "analog on after 0x44 AA=01");
+        // The analog toggle is locked: the physical button is a no-op.
+        sio.press_analog_button(0);
+        let poll2 = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(poll2[1], 0x73, "locked: analog button ignored");
+
+        // 0x44 AA=00 turns analog back off (unlock first with BB=03).
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]);
+        analog_cmd(
+            &mut sio,
+            &mut irq,
+            &[0x01, 0x44, 0x00, 0x00, 0x03, 0, 0, 0, 0],
+        );
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x00, 0, 0, 0, 0, 0]);
+        let poll3 = analog_cmd(&mut sio, &mut irq, &[0x01, 0x42, 0, 0, 0]);
+        assert_eq!(poll3[1], 0x41, "analog off after 0x44 AA=00");
+    }
+
+    #[test]
+    fn config_0x45_led_status() {
+        let (mut sio, mut irq) = analog_sio();
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]); // enter config
+        // Analog off: LL == 0x00.
+        let off = analog_cmd(&mut sio, &mut irq, &[0x01, 0x45, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            off,
+            vec![0xFF, 0xF3, 0x5A, 0x01, 0x02, 0x00, 0x02, 0x01, 0x00]
+        );
+        // Turn analog on, then LL == 0x01.
+        analog_cmd(
+            &mut sio,
+            &mut irq,
+            &[0x01, 0x44, 0x00, 0x01, 0x00, 0, 0, 0, 0],
+        );
+        let on = analog_cmd(&mut sio, &mut irq, &[0x01, 0x45, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            on,
+            vec![0xFF, 0xF3, 0x5A, 0x01, 0x02, 0x01, 0x02, 0x01, 0x00]
+        );
+    }
+
+    #[test]
+    fn config_0x46_constant() {
+        let (mut sio, mut irq) = analog_sio();
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]); // enter config
+        let a0 = analog_cmd(&mut sio, &mut irq, &[0x01, 0x46, 0x00, 0x00, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            a0,
+            vec![0xFF, 0xF3, 0x5A, 0x00, 0x00, 0x01, 0x02, 0x00, 0x0A]
+        );
+        let a1 = analog_cmd(&mut sio, &mut irq, &[0x01, 0x46, 0x00, 0x01, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            a1,
+            vec![0xFF, 0xF3, 0x5A, 0x00, 0x00, 0x01, 0x01, 0x01, 0x14]
+        );
+    }
+
+    #[test]
+    fn config_0x47_constant() {
+        let (mut sio, mut irq) = analog_sio();
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]); // enter config
+        let r = analog_cmd(&mut sio, &mut irq, &[0x01, 0x47, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            r,
+            vec![0xFF, 0xF3, 0x5A, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00]
+        );
+    }
+
+    #[test]
+    fn config_0x4c_constant() {
+        let (mut sio, mut irq) = analog_sio();
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]); // enter config
+        let a0 = analog_cmd(&mut sio, &mut irq, &[0x01, 0x4C, 0x00, 0x00, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            a0,
+            vec![0xFF, 0xF3, 0x5A, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00]
+        );
+        let a1 = analog_cmd(&mut sio, &mut irq, &[0x01, 0x4C, 0x00, 0x01, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            a1,
+            vec![0xFF, 0xF3, 0x5A, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn config_0x4d_vibration_map() {
+        let (mut sio, mut irq) = analog_sio();
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]); // enter config
+        // First 0x4D: response carries the DEFAULT map (all 0xFF); stores the
+        // new map [00 01 FF FF FF FF]. Motor bytes are at tx phases 3..8.
+        let first = analog_cmd(
+            &mut sio,
+            &mut irq,
+            &[0x01, 0x4D, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF],
+        );
+        assert_eq!(
+            first,
+            vec![0xFF, 0xF3, 0x5A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            "old map = default all-0xFF"
+        );
+        // Second 0x4D: response now carries the previously-set map; stores a new
+        // one [02 03 04 05 06 07].
+        let second = analog_cmd(
+            &mut sio,
+            &mut irq,
+            &[0x01, 0x4D, 0x00, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07],
+        );
+        assert_eq!(
+            second,
+            vec![0xFF, 0xF3, 0x5A, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF],
+            "old map = previously-set [00 01 FF FF FF FF]"
+        );
+    }
+
+    #[test]
+    fn config_command_outside_config_mode_is_noop() {
+        // A config command (0x45) issued while NOT in config mode responds like
+        // an unknown command: current-mode header + all-zero data, no side
+        // effect. (Digital ID here since analog/config are both off.)
+        let (mut sio, mut irq) = analog_sio();
+        let r = analog_cmd(&mut sio, &mut irq, &[0x01, 0x45, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            r,
+            vec![0xFF, 0x41, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn analog_rumble_bytes_recorded() {
+        let (mut sio, mut irq) = analog_sio();
+        // Program a vib map routing poll byte 0 -> small motor, byte 1 -> large.
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]); // enter config
+        analog_cmd(
+            &mut sio,
+            &mut irq,
+            &[0x01, 0x4D, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF],
+        );
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x00, 0, 0, 0, 0, 0]); // exit config
+        sio.press_analog_button(0); // analog mode on
+
+        // No motor actuation recorded yet.
+        assert_eq!(sio.motor_state(0), Some((0x00, 0x00)));
+
+        // Poll: tx phase-3 byte (0xAA) -> small motor, phase-4 byte (0xBB) ->
+        // large motor. (tx index == phase; phase 2 byte is ignored.)
+        analog_cmd(
+            &mut sio,
+            &mut irq,
+            &[0x01, 0x42, 0x00, 0xAA, 0xBB, 0x00, 0x00, 0x00, 0x00],
+        );
+        assert_eq!(
+            sio.motor_state(0),
+            Some((0xAA, 0xBB)),
+            "motor bytes routed via vib_map"
+        );
+    }
+
+    #[test]
+    fn analog_pad_serde_round_trip() {
+        // Analog pad state (incl. modes + vib_map + motors) survives a snapshot.
+        let (mut sio, mut irq) = analog_sio();
+        analog_cmd(&mut sio, &mut irq, &[0x01, 0x43, 0x00, 0x01, 0, 0, 0, 0, 0]);
+        analog_cmd(
+            &mut sio,
+            &mut irq,
+            &[0x01, 0x44, 0x00, 0x01, 0x00, 0, 0, 0, 0],
+        );
+        analog_cmd(
+            &mut sio,
+            &mut irq,
+            &[0x01, 0x4D, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF],
+        );
+        let json = serde_json::to_string(&sio).unwrap();
+        let back: Sio0 = serde_json::from_str(&json).unwrap();
+        assert_eq!(sio, back);
+    }
+
+    #[test]
+    fn set_controller_type_preserves_buttons() {
+        let mut sio = Sio0::new();
+        sio.set_buttons(0, 0x00F0);
+        sio.set_controller_type(0, ControllerKind::Analog);
+        assert_eq!(sio.slot_buttons(0), 0x00F0, "buttons preserved on promote");
+        sio.set_controller_type(0, ControllerKind::Disconnected);
+        // A disconnected pad answers open-bus and never ACKs.
+        let mut irq = Irq::new();
+        sio.write16(0x1F80_104A, 0x1003);
+        assert_eq!(pad_exchange(&mut sio, &mut irq, 0x01), 0xFF);
     }
 }
