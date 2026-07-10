@@ -1037,6 +1037,22 @@ impl Sio0 {
         }
     }
 
+    /// Number of CPU cycles from the current state until the SIO0 controller
+    /// next raises its `/ACK` interrupt, or `None` when no ACK is scheduled, for
+    /// the lazy device scheduler.
+    ///
+    /// The ACK fires when the `ack_timer` countdown reaches zero: with
+    /// `ack_timer` cycles remaining, a `tick(ack_timer)` drives it to `<= 0` and
+    /// fires, so the deadline is exactly `ack_timer` (clamped to a minimum of 1).
+    #[must_use]
+    pub fn cycles_to_next_event(&self) -> Option<u64> {
+        if self.ack_timer < 0 {
+            None
+        } else {
+            Some((self.ack_timer as u64).max(1))
+        }
+    }
+
     /// Synthesizes JOY_STAT. Idle (empty RX, no pending IRQ) reads back 0x5.
     fn stat(&self) -> u32 {
         let mut s = (1 << 0) | (1 << 2); // TX ready flag 1 + TX ready flag 2
@@ -1342,6 +1358,34 @@ mod tests {
         // Response is open-bus and the transfer resets.
         assert_eq!(sio.read8(0x1F80_1040), 0xFF);
         assert_eq!(sio.read32(0x1F80_1044) & (1 << 9), 0, "no STAT.IRQ");
+    }
+
+    #[test]
+    fn cycles_to_next_event_predicts_ack() {
+        let mut sio = Sio0::new();
+        let mut irq = Irq::new();
+        // TXEN | /DTR | ack-interrupt-enable.
+        sio.write16(0x1F80_104A, 0x1003);
+
+        // Idle: no ACK scheduled.
+        assert_eq!(sio.cycles_to_next_event(), None);
+
+        sio.write8(0x1F80_1040, 0x01); // address the pad => schedules an ACK
+        let n = sio.cycles_to_next_event().expect("ACK scheduled");
+        assert_eq!(n, Sio0::ACK_DELAY_CYCLES as u64);
+
+        // No fire strictly before the predicted cycle; fires exactly at it.
+        for _ in 0..(n - 1) {
+            sio.tick(1, &mut irq);
+        }
+        assert_eq!(irq.read_stat(), 0, "no ACK before the predicted cycle");
+        sio.tick(1, &mut irq);
+        assert_ne!(
+            irq.read_stat() & (1 << 7),
+            0,
+            "ACK fires at predicted cycle"
+        );
+        assert_eq!(sio.cycles_to_next_event(), None, "ACK consumed");
     }
 
     #[test]

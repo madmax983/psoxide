@@ -2014,6 +2014,7 @@ name = "psoxide-test-harness"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "proptest",
  "psoxide-config",
  "psoxide-core",
  "serde",

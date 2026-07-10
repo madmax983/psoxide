@@ -1137,6 +1137,59 @@ impl Cdrom {
         }
     }
 
+    /// Number of CPU cycles from the current state until the CD-ROM controller
+    /// next performs an autonomous `I_STAT`-setting action (an INTn latch), for
+    /// the lazy device scheduler. Returns `None` when the drive is idle.
+    ///
+    /// This is deliberately **conservative** — it may return a value smaller
+    /// than the true next event, which only makes the scheduler catch the device
+    /// up more often, never less:
+    ///
+    /// * Idle (`!reading && !playing && pending empty`) → `None`.
+    /// * Producing CD audio (`playing`, or reading an XA-audio sector) → `Some(1)`
+    ///   so the CD→SPU frame bridge runs per cycle and stays ordered with the
+    ///   SPU's sample consumption (see [`Cdrom::is_cd_audio_active`]).
+    /// * Otherwise → the smaller of the sector `read_timer` (while reading) and
+    ///   the front pending response's `delay`, clamped to at least 1.
+    #[must_use]
+    pub fn cycles_to_next_event(&self) -> Option<u64> {
+        if !self.reading && !self.playing && self.pending.is_empty() {
+            return None;
+        }
+        if self.is_cd_audio_active() {
+            return Some(1);
+        }
+        let mut off = i64::MAX;
+        if self.reading {
+            off = off.min(self.read_timer);
+        }
+        if let Some(front) = self.pending.front() {
+            off = off.min(front.delay);
+        }
+        if off == i64::MAX {
+            off = 1;
+        }
+        Some(off.max(1) as u64)
+    }
+
+    /// `true` when the drive is (or is about to be) decoding CD audio into the
+    /// `cd_audio` queue: CD-DA playback, or reading a sector whose subheader
+    /// marks it XA-audio (Form-2 Audio). Such windows must catch the CD→SPU
+    /// bridge up cycle-by-cycle so decoded frames reach the SPU in the same
+    /// order the naive per-instruction loop delivered them.
+    pub(crate) fn is_cd_audio_active(&self) -> bool {
+        if self.playing {
+            return true;
+        }
+        if self.reading {
+            let off = self.lba as usize * SECTOR_RAW;
+            if let Some(info) = self.parse_xa(off) {
+                return info.audio && info.form2;
+            }
+        }
+        false
+    }
+
     fn tick_one(&mut self, irq: &mut Irq) {
         // While reading, process a sector each read period: XA-audio sectors are
         // decoded to `cd_audio` (no CPU data / INT1); data sectors deliver bytes
@@ -1285,6 +1338,41 @@ mod tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn cycles_to_next_event_predicts_first_response() {
+        let mut cd = Cdrom::new();
+        let mut irq = Irq::new();
+        cd.ie = 0x1F;
+        // Idle: no scheduled event.
+        assert_eq!(cd.cycles_to_next_event(), None);
+
+        // Getstat schedules an INT3 after FIRST_RESP_DELAY cycles.
+        cd.write8(0x1F80_1801, 0x01);
+        let n = cd
+            .cycles_to_next_event()
+            .expect("a response is now scheduled");
+        assert_eq!(n, FIRST_RESP_DELAY as u64);
+
+        // No INT latches strictly before the predicted cycle; it latches at it.
+        for _ in 0..(n - 1) {
+            cd.tick(1, &mut irq);
+        }
+        assert_eq!(cd.flag, 0, "no INT latched before the predicted cycle");
+        cd.tick(1, &mut irq);
+        assert_ne!(cd.flag, 0, "INT latched at the predicted cycle");
+    }
+
+    #[test]
+    fn cycles_to_next_event_is_one_while_playing() {
+        let mut cd = Cdrom::new();
+        cd.insert_disc(make_disc(4));
+        cd.playing = true;
+        cd.read_timer = READ_PERIOD_SINGLE;
+        // CD-DA playback produces audio frames, so the scheduler must catch the
+        // CD→SPU bridge up every cycle.
+        assert_eq!(cd.cycles_to_next_event(), Some(1));
     }
 
     #[test]
