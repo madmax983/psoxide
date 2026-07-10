@@ -356,6 +356,120 @@ impl Memory {
             _ => {}
         }
     }
+
+    /// Reads a little-endian half-word, resolving the region once and reading
+    /// both bytes from the backing slice. For an aligned access this is exactly
+    /// `u16::from_le_bytes([read8(virt), read8(virt+1)])`: RAM/scratchpad/BIOS
+    /// return their contiguous bytes and every other region returns 0 (matching
+    /// the byte path's `_ => 0`). Callers must only use this for non-I/O regions
+    /// (the bus routes I/O separately); word-alignment guarantees the two bytes
+    /// stay within one region so folding/masking are equivalent to the byte path.
+    #[must_use]
+    pub fn read16(&self, virt: u32) -> u16 {
+        let phys = mask_region(virt);
+        match map_region(phys) {
+            BusRegion::MainRam => {
+                let b = (phys & MAIN_RAM_MASK) as usize;
+                u16::from_le_bytes([self.ram[b], self.ram[b + 1]])
+            }
+            BusRegion::Scratchpad => {
+                let b = (phys & 0x3FF) as usize;
+                u16::from_le_bytes([self.scratchpad[b], self.scratchpad[b + 1]])
+            }
+            BusRegion::Bios => {
+                let o = (phys - 0x1FC0_0000) as usize;
+                u16::from_le_bytes([
+                    self.bios.get(o).copied().unwrap_or(0),
+                    self.bios.get(o + 1).copied().unwrap_or(0),
+                ])
+            }
+            _ => 0,
+        }
+    }
+
+    /// Reads a little-endian word; see [`Memory::read16`] for the equivalence
+    /// argument. Exactly `u32::from_le_bytes([read8(virt)..read8(virt+3)])` for
+    /// an aligned, non-I/O access.
+    #[must_use]
+    pub fn read32(&self, virt: u32) -> u32 {
+        let phys = mask_region(virt);
+        match map_region(phys) {
+            BusRegion::MainRam => {
+                let b = (phys & MAIN_RAM_MASK) as usize;
+                u32::from_le_bytes([
+                    self.ram[b],
+                    self.ram[b + 1],
+                    self.ram[b + 2],
+                    self.ram[b + 3],
+                ])
+            }
+            BusRegion::Scratchpad => {
+                let b = (phys & 0x3FF) as usize;
+                u32::from_le_bytes([
+                    self.scratchpad[b],
+                    self.scratchpad[b + 1],
+                    self.scratchpad[b + 2],
+                    self.scratchpad[b + 3],
+                ])
+            }
+            BusRegion::Bios => {
+                let o = (phys - 0x1FC0_0000) as usize;
+                u32::from_le_bytes([
+                    self.bios.get(o).copied().unwrap_or(0),
+                    self.bios.get(o + 1).copied().unwrap_or(0),
+                    self.bios.get(o + 2).copied().unwrap_or(0),
+                    self.bios.get(o + 3).copied().unwrap_or(0),
+                ])
+            }
+            _ => 0,
+        }
+    }
+
+    /// Writes a little-endian half-word, resolving the region once. Exactly
+    /// mirrors the byte path (`write8` twice): only RAM and scratchpad are
+    /// writable; BIOS/I/O/unmapped are ignored. For non-I/O callers with an
+    /// aligned address this is equivalent to two `write8` calls.
+    pub fn write16(&mut self, virt: u32, value: u16) {
+        let phys = mask_region(virt);
+        let bytes = value.to_le_bytes();
+        match map_region(phys) {
+            BusRegion::MainRam => {
+                let b = (phys & MAIN_RAM_MASK) as usize;
+                self.ram[b] = bytes[0];
+                self.ram[b + 1] = bytes[1];
+            }
+            BusRegion::Scratchpad => {
+                let b = (phys & 0x3FF) as usize;
+                self.scratchpad[b] = bytes[0];
+                self.scratchpad[b + 1] = bytes[1];
+            }
+            _ => {}
+        }
+    }
+
+    /// Writes a little-endian word; see [`Memory::write16`]. Equivalent to four
+    /// `write8` calls for an aligned, non-I/O access.
+    pub fn write32(&mut self, virt: u32, value: u32) {
+        let phys = mask_region(virt);
+        let bytes = value.to_le_bytes();
+        match map_region(phys) {
+            BusRegion::MainRam => {
+                let b = (phys & MAIN_RAM_MASK) as usize;
+                self.ram[b] = bytes[0];
+                self.ram[b + 1] = bytes[1];
+                self.ram[b + 2] = bytes[2];
+                self.ram[b + 3] = bytes[3];
+            }
+            BusRegion::Scratchpad => {
+                let b = (phys & 0x3FF) as usize;
+                self.scratchpad[b] = bytes[0];
+                self.scratchpad[b + 1] = bytes[1];
+                self.scratchpad[b + 2] = bytes[2];
+                self.scratchpad[b + 3] = bytes[3];
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Adapter that lets the CPU drive [`Memory`] and the memory-mapped peripherals
@@ -511,7 +625,7 @@ impl Bus for CoreBus<'_> {
         if Self::is_io(phys) {
             return self.io_read16(phys);
         }
-        u16::from_le_bytes([self.mem.read8(addr), self.mem.read8(addr.wrapping_add(1))])
+        self.mem.read16(addr)
     }
     fn load32(&mut self, addr: u32) -> u32 {
         let phys = mask_region(addr);
@@ -522,12 +636,7 @@ impl Bus for CoreBus<'_> {
         if phys == CACHE_CTRL_REG {
             return self.cache_ctrl.read32();
         }
-        u32::from_le_bytes([
-            self.mem.read8(addr),
-            self.mem.read8(addr.wrapping_add(1)),
-            self.mem.read8(addr.wrapping_add(2)),
-            self.mem.read8(addr.wrapping_add(3)),
-        ])
+        self.mem.read32(addr)
     }
     fn store8(&mut self, addr: u32, value: u8) {
         let phys = mask_region(addr);
@@ -545,9 +654,7 @@ impl Bus for CoreBus<'_> {
             self.io_write16(phys, value);
             return;
         }
-        let b = value.to_le_bytes();
-        self.mem.write8(addr, b[0]);
-        self.mem.write8(addr.wrapping_add(1), b[1]);
+        self.mem.write16(addr, value);
     }
     fn store32(&mut self, addr: u32, value: u32) {
         let phys = mask_region(addr);
@@ -560,11 +667,7 @@ impl Bus for CoreBus<'_> {
             self.cache_ctrl.write32(value);
             return;
         }
-        let b = value.to_le_bytes();
-        self.mem.write8(addr, b[0]);
-        self.mem.write8(addr.wrapping_add(1), b[1]);
-        self.mem.write8(addr.wrapping_add(2), b[2]);
-        self.mem.write8(addr.wrapping_add(3), b[3]);
+        self.mem.write32(addr, value);
     }
 
     #[inline]
