@@ -314,6 +314,13 @@ impl Cdrom {
         self.disc.is_some()
     }
 
+    /// Returns the raw image bytes of the mounted disc, if any. Used by the core
+    /// to derive a cheap disc-identity hash for save-state validation.
+    #[must_use]
+    pub fn disc_image(&self) -> Option<&[u8]> {
+        self.disc.as_ref().map(|d| d.data.as_slice())
+    }
+
     // ---- register access -------------------------------------------------
 
     /// Reads an 8-bit CD-ROM register. Some ports pop a FIFO, so this takes
