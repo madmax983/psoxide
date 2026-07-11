@@ -61,6 +61,7 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 
 - MIPS R3000A CPU @ ~33.8688 MHz (full MIPS I base ISA, little-endian)
 - Coprocessor 0 basics: SR/CAUSE/EPC/BadVaddr, exception path, RFE
+- GTE (cop2) — full geometry transformation engine (`gte.rs`): the Nocash-spec fixed-point datapath (RTPS/RTPT perspective transform, NCLIP/AVSZ, the colour/normal/depth-cue ops, MVMVA, GPF/GPL, SQR, OP), the flag register, and saturating arithmetic. Passes all 1150 JaCzekanski ps1-tests `gte/test-all` vectors bit-exact (always-on gate `gte_tests.rs`)
 - Hardware interrupt delivery: I_STAT/I_MASK controller drives cop0 CAUSE IP2;
   the interrupt exception is taken at instruction boundaries when SR enables it
 - Explicit branch delay and load delay slots
@@ -80,6 +81,7 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   sector words from the CD data FIFO), channel 4 (SPU: bidirectional block copy
   between main RAM and SPU sample RAM), and channel 6 (OTC) execute
   synchronously and raise the DMA interrupt via DICR
+- MDEC (`mdec.rs`): the Macroblock Decoder — RLE + inverse-DCT + colour-space conversion producing 16bpp/24bpp macroblocks from compressed input, with the quant/scale tables and the status/command register interface. Covered by the `mdec.rs` integration test
 - SPU (`spu.rs`): a real 24-voice audio engine at 0x1F80_1C00..0x1F80_1FFF with
   512KB sample RAM. ADPCM block decode (16-byte → 28-sample, shift + 4-tap
   filter, LoopStart/LoopEnd/LoopRepeat + ENDX), the integer PSX-SPX ADSR
@@ -149,7 +151,6 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
 
 ## Not Yet Implemented
 
-- GTE (cop2) — decoded but ignored
 - SPU volume-sweep envelopes (the `spu.rs` voice engine, reverb DSP, and CD
   mixing are all real — see "Hardware Emulated"): fixed-volume mode (register
   bit15 clear) is exact; sweep mode (bit15 set) is approximated to a
@@ -182,7 +183,7 @@ Sony PlayStation (PSX) emulator in Rust. Part of the oxide emulator family.
   their own instruction variants (mirrored in the Verus decoder spec,
   `crates/psoxide-proof/src/decode.rs`). Each raises Coprocessor Unusable with
   CAUSE.CE set to the coprocessor number when its `SR.CU{n}` bit is clear, and is
-  a no-op when usable (COP1/COP3 and the GTE datapath are absent). COP0 register
+  a no-op when usable (COP1/COP3 are absent; the GTE/COP2 datapath is implemented — see below). COP0 register
   ops (MFC0/MTC0) keep the kernel-mode usability exemption; the LWC0/SWC0
   coprocessor load/stores do **not** (they are gated purely by SR.CU0). No op
   decodes to `Illegal` / reserved-instruction (0x0A) any more except genuinely
