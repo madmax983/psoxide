@@ -114,6 +114,8 @@ pub enum ControllerKind {
     Digital,
     /// A DualShock / DualAnalog pad (SCPH-1200).
     Analog,
+    /// A fixed analog joystick / flightstick (device ID `0x53`).
+    FlightStick,
 }
 
 /// Commands that drive [`PsxCore`] state.
@@ -191,6 +193,60 @@ pub enum Command {
     SetControllerAnalogButton {
         /// Controller port index (0 or 1).
         port: u8,
+    },
+    /// Attach or detach a Multitap (4-player adapter) on a physical port. When
+    /// attached, the port fans out to four sub-slots (A/B/C/D), each addressable
+    /// via the `SetMultitap*` / `*MultitapMemoryCard` commands.
+    SetMultitap {
+        /// Physical controller port index (0 or 1).
+        port: u8,
+        /// Whether a multitap is attached.
+        enabled: bool,
+    },
+    /// Replace the button bitfield of a multitap sub-slot behind `port`.
+    SetMultitapControllerState {
+        /// Physical controller port index (0 or 1).
+        port: u8,
+        /// Sub-slot index (0..=3 = A..D).
+        slot: u8,
+        /// Pressed-button bitfield.
+        buttons: u16,
+    },
+    /// Set the device kind attached to a multitap sub-slot behind `port`.
+    SetMultitapControllerType {
+        /// Physical controller port index (0 or 1).
+        port: u8,
+        /// Sub-slot index (0..=3 = A..D).
+        slot: u8,
+        /// Device kind to attach.
+        kind: ControllerKind,
+    },
+    /// Update the analog-stick axes of a multitap sub-slot behind `port`.
+    SetMultitapControllerSticks {
+        /// Physical controller port index (0 or 1).
+        port: u8,
+        /// Sub-slot index (0..=3 = A..D).
+        slot: u8,
+        /// Right stick `(x, y)`.
+        right: (u8, u8),
+        /// Left stick `(x, y)`.
+        left: (u8, u8),
+    },
+    /// Insert a memory card into a multitap sub-slot behind `port`.
+    InsertMultitapMemoryCard {
+        /// Physical controller port index (0 or 1).
+        port: u8,
+        /// Sub-slot index (0..=3 = A..D).
+        slot: u8,
+        /// Card image bytes (128 KB expected; padded/truncated otherwise).
+        data: Vec<u8>,
+    },
+    /// Eject the memory card in a multitap sub-slot behind `port`, if any.
+    EjectMultitapMemoryCard {
+        /// Physical controller port index (0 or 1).
+        port: u8,
+        /// Sub-slot index (0..=3 = A..D).
+        slot: u8,
     },
     /// Pause emulation stepping.
     Pause,
@@ -1323,6 +1379,37 @@ impl PsxCore {
             }
             Command::SetControllerAnalogButton { port } => {
                 self.sio0.press_analog_button(port as usize);
+            }
+            Command::SetMultitap { port, enabled } => {
+                self.sio0.set_multitap(port as usize, enabled);
+            }
+            Command::SetMultitapControllerState {
+                port,
+                slot,
+                buttons,
+            } => {
+                self.sio0
+                    .set_multitap_buttons(port as usize, slot as usize, buttons);
+            }
+            Command::SetMultitapControllerType { port, slot, kind } => {
+                self.sio0
+                    .set_multitap_controller_type(port as usize, slot as usize, kind);
+            }
+            Command::SetMultitapControllerSticks {
+                port,
+                slot,
+                right,
+                left,
+            } => {
+                self.sio0
+                    .set_multitap_sticks(port as usize, slot as usize, right, left);
+            }
+            Command::InsertMultitapMemoryCard { port, slot, data } => {
+                self.sio0
+                    .insert_multitap_card(port as usize, slot as usize, data);
+            }
+            Command::EjectMultitapMemoryCard { port, slot } => {
+                self.sio0.eject_multitap_card(port as usize, slot as usize);
             }
             Command::Pause => self.paused = true,
             Command::Resume => self.paused = false,
